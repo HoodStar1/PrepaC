@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Posting</h2><p>Review packed jobs, start posting and watch live transfer state.</p></div></section>
+<section class="card">
+  <h2>Posting</h2>
+  <p>Scan eligible packed jobs and start posting.</p>
+  <div class="row">
+    <button type="button" onclick="scanPosting()">Scan packed jobs</button>
+    <button type="button" id="startPostingBtn" onclick="startSelectedPosting()" disabled>Start selected posting jobs</button>
+  </div>
+  <p class="muted">Packed archives root: <code>{{ settings['packing_output_root'] }}</code></p>
+  <div id="postingCandidates"><p class="muted">No scan run yet.</p></div>
+</section>
+
+<section class="card">
+  <h2>Active Posting Jobs</h2>
+  <div id="postingJobs"><p class="muted">Loading jobs...</p></div>
+</section>
+
+<script>
+let postingList = [];
+function gb(v){ return ((v||0)/(1024**3)).toFixed(2)+' GB'; }
+function renderPostingCandidates(){
+  const box = document.getElementById('postingCandidates');
+  if(!postingList.length){
+    box.innerHTML = '<p class="muted">No eligible packed jobs found.</p>';
+    document.getElementById('startPostingBtn').disabled = true;
+    return;
+  }
+  box.innerHTML = postingList.map((item, idx) => `
+    <article class="job">
+      <label class="checkbox"><input type="checkbox" class="posting-cand" value="${idx}"><span>Select</span></label>
+      <h3>${item.job_name}</h3>
+      <p><strong>Packed root:</strong> <code>${item.packed_root}</code></p>
+      <p><strong>Output files root:</strong> <code>${item.output_files_root}</code></p>
+      <p><strong>Template:</strong> <code>${item.template_path}</code></p>
+      <p><strong>Size:</strong> ${gb(item.size_bytes)}</p>
+      <p><strong>Header:</strong> <code>${item.header || ''}</code></p>
+      <p><strong>Password present:</strong> ${item.password_present ? 'Yes' : 'No'}</p>
+    </article>
+  `).join('');
+  document.getElementById('startPostingBtn').disabled = false;
+}
+async function scanPosting(){
+  const r = await fetch('/api/posting/scan', {method:'POST'});
+  const d = await r.json();
+  postingList = d.results || [];
+  renderPostingCandidates();
+}
+async function startSelectedPosting(){
+  const packed_roots = Array.from(document.querySelectorAll('.posting-cand:checked')).map(cb => postingList[parseInt(cb.value,10)].packed_root);
+  if(!packed_roots.length){ alert('Select at least one job'); return; }
+  await fetch('/api/posting/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({packed_roots})});
+  await refreshPostingJobs();
+  await scanPosting();
+}
+
+
+
+
+async function refreshPostingJobs(){
+  const r = await fetch('/api/posting/jobs');
+  const d = await r.json();
+  const jobs = (d.jobs || []).filter(j => ['queued','running'].includes(String(j.status || '').toLowerCase()));
+  const box = document.getElementById('postingJobs');
+
+  if(!jobs.length){
+    box.innerHTML = '<p class="muted">No active posting jobs right now. Finished jobs are in Posting History.</p>';
+    return;
+  }
+
+  const existingIds = new Set(Array.from(box.querySelectorAll('[data-job-id]')).map(el => String(el.dataset.jobId)));
+  const incomingIds = new Set(jobs.map(j => String(j.id)));
+
+  // remove cards no longer active
+  Array.from(box.querySelectorAll('[data-job-id]')).forEach(el => {
+    if(!incomingIds.has(String(el.dataset.jobId))) el.remove();
+  });
+
+  // if placeholder text exists, clear once
+  if(box.querySelector('p.muted')) box.innerHTML = '';
+
+  for(const job of jobs){
+    let card = box.querySelector(`[data-job-id="${job.id}"]`);
+    if(!card){
+      card = document.createElement('article');
+      card.className = 'job';
+      card.dataset.jobId = String(job.id);
+      card.innerHTML = `
+        <h3 class="job-name"></h3>
+        <p><strong>Status:</strong> <span class="job-status"></span></p>
+        <p><strong>Current step:</strong> <span class="job-phase"></span></p>
+        <p><strong>Live stage:</strong> <span class="job-message"></span></p>
+        <p><strong>Overall progress:</strong> <span class="job-percent"></span></p>
+        <div class="progress"><div class="bar"></div></div>
+        <p><strong>Provider:</strong> <span class="job-provider"></span></p>
+        <p><strong>Header:</strong> <code class="job-header"></code></p>
+        <p><strong>Groups:</strong> <code class="job-groups"></code></p>
+        <p><strong>From:</strong> <code class="job-from"></code></p>
+        <p><strong>NZB:</strong> <code class="job-nzb"></code></p>
+                <p><strong>Transfer rate:</strong> <span class="job-rate"></span></p>
+        <p><strong>Transferred:</strong> <span class="job-transferred"></span></p>
+        <p><strong>Estimated time left:</strong> <span class="job-eta"></span></p>
+        
+      `;
+      box.appendChild(card);
+    }
+
+    card.querySelector('.job-name').textContent = job.job_name || '';
+    card.querySelector('.job-status').textContent = job.status || '';
+    card.querySelector('.job-phase').textContent = job.phase || '';
+    card.querySelector('.job-percent').textContent = job.percent == null ? '' : `${job.percent}%`;
+    card.querySelector('.bar').style.width = `${job.percent || 0}%`;
+    card.querySelector('.job-provider').textContent = job.provider_used || '';
+    card.querySelector('.job-header').textContent = job.header_value || '';
+    card.querySelector('.job-groups').textContent = job.groups_csv || '';
+    card.querySelector('.job-from').textContent = job.from_header || '';
+    card.querySelector('.job-nzb').textContent = job.nzb_path || '';
+    card.querySelector('.job-message').textContent = job.message || '';
+    card.querySelector('.job-rate').textContent = job.runtime_stats?.transfer_rate || '';
+    card.querySelector('.job-transferred').textContent = job.runtime_stats?.percent_transferred || '';
+    card.querySelector('.job-eta').textContent = job.runtime_stats?.eta || '';
+
+  }
+}
+refreshPostingJobs();
+let postingStream = null;
+function startPostingStream(){
+  if(postingStream) postingStream.close();
+  postingStream = new EventSource('/api/posting/jobs/stream');
+  postingStream.onmessage = (event) => {
+    const d = JSON.parse(event.data || '{}');
+    const jobs = (d.jobs || []).filter(j => ['queued','running'].includes(String(j.status || '').toLowerCase()));
+    const box = document.getElementById('postingJobs');
+
+    if(!jobs.length){
+      box.innerHTML = '<p class="muted">No active posting jobs right now. Finished jobs are in Posting History.</p>';
+      return;
+    }
+
+    box.innerHTML = jobs.map(job => `
+      <article class="job">
+        <h3>${job.job_name || ''}</h3>
+        <p><strong>Status:</strong> ${job.status || ''}</p>
+        <p><strong>Current step:</strong> ${job.phase || ''}</p>
+        <p><strong>Live stage:</strong> ${job.message || ''}</p>
+        <p><strong>Overall progress:</strong> ${job.percent == null ? '' : `${job.percent}%`}</p>
+        <div class="progress"><div class="bar" style="width:${job.percent||0}%"></div></div>
+        <p><strong>Provider:</strong> ${job.provider_used || ''}</p>
+        <p><strong>Header:</strong> <code>${job.header_value || ''}</code></p>
+        <p><strong>Groups:</strong> <code>${job.groups_csv || ''}</code></p>
+        <p><strong>From:</strong> <code>${job.from_header || ''}</code></p>
+        <p><strong>NZB:</strong> <code>${job.nzb_path || ''}</code></p>
+        <p><strong>Transfer rate:</strong> ${job.runtime_stats?.transfer_rate || ''}</p>
+        <p><strong>Transferred:</strong> ${job.runtime_stats?.percent_transferred || ''}</p>
+        <p><strong>Estimated time left:</strong> ${job.runtime_stats?.eta || ''}</p>
+      </article>
+    `).join('');
+  };
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){
+    if(postingStream) postingStream.close();
+  } else {
+    startPostingStream();
+  }
+});
+startPostingStream();
+</script>
+{% endblock %}

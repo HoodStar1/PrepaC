@@ -1,0 +1,34 @@
+services:
+  prepac:
+    build: .
+    container_name: prepac
+    ports:
+      - "1234:1234"
+    volumes:
+      - /mnt/user/Systems/appdata/prepac:/config
+      - /mnt/user/TV Shows:/media/tv
+      - /mnt/user/Movies:/media/movies
+      - /mnt/user/Youtube Downloads:/media/youtube
+      - /mnt/user/TBP/Jobs:/media/dest
+      - /mnt:/host_mnt
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+# Optional secret sources (choose either env vars or bind-mounted files under /run/secrets)
+# environment:
+#   PREPAC_POSTING_PROVIDER1_PASSWORD: "your-provider1-password"
+#   PREPAC_POSTING_PROVIDER2_PASSWORD: "your-provider2-password"
+#   PREPAC_PLEX_TOKEN: "your-plex-token"
+#   PREPAC_PACKING_FREEIMAGE_API_KEY: "your-freeimage-api-key"
+#
+# volumes:
+#   - /path/to/prepac_posting_provider1_password:/run/secrets/prepac_posting_provider1_password:ro
+#   - /path/to/prepac_posting_provider2_password:/run/secrets/prepac_posting_provider2_password:ro
+#   - /path/to/prepac_plex_token:/run/secrets/prepac_plex_token:ro
+#   - /path/to/prepac_packing_freeimage_api_key:/run/secrets/prepac_packing_freeimage_api_key:ro
+

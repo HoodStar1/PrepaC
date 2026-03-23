@@ -1,0 +1,13 @@
+services:
+  prepac:
+    build: .
+    container_name: prepac
+    ports:
+      - "1234:1234"
+    volumes:
+      - ./config:/config
+      - ./data/tv:/media/tv
+      - ./data/movies:/media/movies
+      - ./data/youtube:/media/youtube
+      - ./data/destination:/media/dest
+    restart: unless-stopped

@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Packing</h2><p>Review eligible items, pack them and monitor active work.</p></div></section>
+<section class="card">
+  <h2>Packing</h2>
+  <p>Scan eligible items and start packing.</p>
+  <div class="row">
+    <button type="button" onclick="scanPacking()">Scan watched folder</button>
+    <button type="button" id="startPackingBtn" onclick="startSelectedPacking()" disabled>Start selected packing jobs</button>
+  </div>
+  <p class="muted">Watch folder: <code>{{ settings['packing_watch_root'] }}</code></p>
+  <div id="packingCandidates"><p class="muted">No scan run yet.</p></div>
+</section>
+
+<section class="card">
+  <h2>Active Packing Jobs</h2>
+  <div id="packingJobs"><p class="muted">Loading jobs...</p></div>
+</section>
+
+<section class="card">
+  <h2>Recent Completed Packing Summaries</h2>
+  <div id="packingCompleted"><p class="muted">Loading completed packing summaries...</p></div>
+</section>
+
+<script>
+let packingList = [];
+function gb(v){ return ((v||0)/(1024**3)).toFixed(2)+' GB'; }
+function formatDuration(s){ s = Number(s||0); if(s < 60) return `${s}s`; const m = Math.floor(s/60); const sec = s % 60; return `${m}m ${sec}s`; }
+
+function renderPackingCandidates(){
+  const box = document.getElementById('packingCandidates');
+  if (!packingList.length){
+    box.innerHTML = '<p class="muted">No eligible jobs found.</p>';
+    document.getElementById('startPackingBtn').disabled = true;
+    return;
+  }
+  box.innerHTML = packingList.map((item, idx) => `
+    <article class="job">
+      <label class="checkbox"><input type="checkbox" class="packing-cand" value="${idx}"><span>Select</span></label>
+      <h3>${item.job_name}</h3>
+      <p><strong>Source:</strong> <code>${item.source_path}</code></p>
+      <p><strong>Size:</strong> ${gb(item.size_bytes)}</p>
+      <p><strong>Largest video:</strong> <code>${item.largest_video || ''}</code></p>
+      <p><strong>Chosen bracket:</strong> <code>${item.chosen_bracket || ''}</code></p>
+      <p><strong>Estimated RAR parts:</strong> ${item.estimated_parts}</p>
+      <p><strong>Estimated PAR2 %:</strong> ${item.estimated_par2_percent}%</p>
+      ${item.largest_video ? `<details><summary>Detected tags</summary><pre>${JSON.stringify(item.detected_tags || {}, null, 2)}</pre></details>` : ''}
+    </article>
+  `).join('');
+  document.getElementById('startPackingBtn').disabled = false;
+}
+
+async function scanPacking(){
+  const r = await fetch('/api/packing/scan', {method:'POST'});
+  const d = await r.json();
+  packingList = d.results || [];
+  renderPackingCandidates();
+}
+
+async function startSelectedPacking(){
+  const source_paths = Array.from(document.querySelectorAll('.packing-cand:checked')).map(cb => packingList[parseInt(cb.value,10)].source_path);
+  if (!source_paths.length){
+    alert('Select at least one job');
+    return;
+  }
+  const r = await fetch('/api/packing/start', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({source_paths})
+  });
+  const d = await r.json();
+  await refreshPackingJobs();
+  await scanPacking();
+}
+
+async function refreshPackingJobs(){
+  const r = await fetch('/api/packing/jobs');
+  const d = await r.json();
+  const jobs = (d.jobs || []).filter(j => ['queued','running'].includes(String(j.status || '').toLowerCase()));
+  const box = document.getElementById('packingJobs');
+  if (!jobs.length){
+    box.innerHTML = '<p class="muted">No active packing jobs right now. Finished jobs are in Packing History.</p>';
+    return;
+  }
+  box.innerHTML = jobs.map(job => `
+    <article class="job">
+      <h3>${job.job_name}</h3>
+      <p><strong>Status:</strong> ${job.status || ''}</p>
+      <p><strong>Current step:</strong> ${job.phase || ''}</p>
+      <p><strong>Overall progress:</strong> ${job.percent == null ? '' : job.percent + '%'}</p>
+      <div class="progress"><div class="bar" style="width:${job.percent||0}%"></div></div>
+      <p><strong>Step detail:</strong> ${job.message || ''}</p>
+      <p><strong>Archive token:</strong> <code>${job.archive_token || ''}</code></p>
+      <p><strong>RAR estimate:</strong> ${job.rar_parts_estimate || 0} parts</p>
+      <p><strong>PAR2 %:</strong> ${job.par2_percent || 0}%</p>
+      <p><strong>Output root:</strong> <code>${job.output_root || ''}</code></p>
+      <p><strong>Output files root:</strong> <code>${job.output_files_root || ''}</code></p>
+      ${job.imgbox_url ? `<p><strong>Thumbnail host:</strong> <code>${job.imgbox_url}</code></p>` : ''}
+    </article>
+  `).join('');
+}
+
+async function refreshPackingCompleted(){
+  const r = await fetch('/api/packing/completed');
+  const d = await r.json();
+  const jobs = d.jobs || [];
+  const box = document.getElementById('packingCompleted');
+  if(!jobs.length){
+    box.innerHTML = '<p class="muted">No completed packing jobs yet.</p>';
+    return;
+  }
+  box.innerHTML = jobs.map(job => `
+    <article class="job">
+      <h3>${job.job_name}</h3>
+      <p><strong>RAR size:</strong> ${((job.rar_size_bytes||0)/(1024**3) >= 1024 ? (((job.rar_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.rar_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
+      <p><strong>RAR parts:</strong> ${job.rar_parts_actual || job.rar_parts_estimate || 0}</p>
+      <p><strong>RAR time:</strong> ${formatDuration(job.rar_time_seconds || 0)}</p>
+      <p><strong>PAR2 size:</strong> ${((job.par2_size_bytes||0)/(1024**3) >= 1024 ? (((job.par2_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.par2_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
+      <p><strong>PAR2 time:</strong> ${formatDuration(job.par2_time_seconds || 0)}</p>
+    </article>
+  `).join('');
+}
+refreshPackingJobs();
+refreshPackingCompleted();
+
+let packingJobsStream = null;
+let packingCompletedStream = null;
+
+function startPackingStreams(){
+  if(packingJobsStream) packingJobsStream.close();
+  if(packingCompletedStream) packingCompletedStream.close();
+
+  packingJobsStream = new EventSource('/api/packing/jobs/stream');
+  packingJobsStream.onmessage = (event) => {
+    const d = JSON.parse(event.data || '{}');
+    const jobs = (d.jobs || []).filter(j => ['queued','running'].includes(String(j.status || '').toLowerCase()));
+    const box = document.getElementById('packingJobs');
+    if (!jobs.length){
+      box.innerHTML = '<p class="muted">No active packing jobs right now. Finished jobs are in Packing History.</p>';
+      return;
+    }
+    box.innerHTML = jobs.map(job => `
+      <article class="job">
+        <h3>${job.job_name}</h3>
+        <p><strong>Status:</strong> ${job.status || ''}</p>
+        <p><strong>Current step:</strong> ${job.phase || ''}</p>
+        <p><strong>Overall progress:</strong> ${job.percent == null ? '' : job.percent + '%'}</p>
+        <div class="progress"><div class="bar" style="width:${job.percent||0}%"></div></div>
+        <p><strong>Step detail:</strong> ${job.message || ''}</p>
+        <p><strong>Archive token:</strong> <code>${job.archive_token || ''}</code></p>
+        <p><strong>RAR estimate:</strong> ${job.rar_parts_estimate || 0} parts</p>
+        <p><strong>PAR2 %:</strong> ${job.par2_percent || 0}%</p>
+        <p><strong>Output root:</strong> <code>${job.output_root || ''}</code></p>
+        <p><strong>Output files root:</strong> <code>${job.output_files_root || ''}</code></p>
+        ${job.imgbox_url ? `<p><strong>Thumbnail host:</strong> <code>${job.imgbox_url}</code></p>` : ''}
+      </article>
+    `).join('');
+  };
+
+  packingCompletedStream = new EventSource('/api/packing/completed/stream');
+  packingCompletedStream.onmessage = (event) => {
+    const d = JSON.parse(event.data || '{}');
+    const jobs = d.jobs || [];
+    const box = document.getElementById('packingCompleted');
+    if(!jobs.length){
+      box.innerHTML = '<p class="muted">No completed packing jobs yet.</p>';
+      return;
+    }
+    box.innerHTML = jobs.map(job => `
+      <article class="job">
+        <h3>${job.job_name}</h3>
+        <p><strong>RAR size:</strong> ${((job.rar_size_bytes||0)/(1024**3) >= 1024 ? (((job.rar_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.rar_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
+        <p><strong>RAR parts:</strong> ${job.rar_parts_actual || job.rar_parts_estimate || 0}</p>
+        <p><strong>RAR time:</strong> ${formatDuration(job.rar_time_seconds || 0)}</p>
+        <p><strong>PAR2 size:</strong> ${((job.par2_size_bytes||0)/(1024**3) >= 1024 ? (((job.par2_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.par2_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
+        <p><strong>PAR2 time:</strong> ${formatDuration(job.par2_time_seconds || 0)}</p>
+      </article>
+    `).join('');
+  };
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){
+    if(packingJobsStream) packingJobsStream.close();
+    if(packingCompletedStream) packingCompletedStream.close();
+  } else {
+    startPackingStreams();
+  }
+});
+startPackingStreams();
+</script>
+{% endblock %}

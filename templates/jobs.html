@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Jobs</h2>
+  <p>Live prepare job state and recent events.</p>
+  <div id="jobsBox"></div>
+</section>
+<script>
+async function refreshJobs(){
+  const r = await fetch('/api/jobs');
+  const d = await r.json();
+  const box = document.getElementById('jobsBox');
+  if(!d.jobs.length){ box.innerHTML = '<p>No jobs yet.</p>'; return; }
+  box.innerHTML = d.jobs.map(j => `
+    <article class="job">
+      <h3>#${j.id} — ${j.media_type} — ${j.status}</h3>
+      <p><strong>Source:</strong> <code>${j.source_path || ''}</code></p>
+      <p><strong>Destination:</strong> <code>${j.dest_path || ''}</code></p>
+      <p><strong>Phase:</strong> ${j.phase || ''}</p>
+      <p><strong>Message:</strong> ${j.message || ''}</p>
+      <p><strong>Percent:</strong> ${j.percent ?? ''}</p>
+      <details><summary>Recent events</summary><pre>${JSON.stringify(j.events, null, 2)}</pre></details>
+    </article>`).join('');
+}
+refreshJobs();
+let jobsStream = null;
+function startJobsStream(){
+  if(jobsStream) jobsStream.close();
+  jobsStream = new EventSource('/api/jobs/stream');
+  jobsStream.onmessage = (event) => {
+    const d = JSON.parse(event.data || '{}');
+    const box = document.getElementById('jobsBox');
+    if(!d.jobs.length){ box.innerHTML = '<p>No jobs yet.</p>'; return; }
+    box.innerHTML = d.jobs.map(j => `
+      <article class="job">
+        <h3>#${j.id} — ${j.media_type} — ${j.status}</h3>
+        <p><strong>Source:</strong> <code>${j.source_path || ''}</code></p>
+        <p><strong>Destination:</strong> <code>${j.dest_path || ''}</code></p>
+        <p><strong>Phase:</strong> ${j.phase || ''}</p>
+        <p><strong>Message:</strong> ${j.message || ''}</p>
+        <p><strong>Percent:</strong> ${j.percent ?? ''}</p>
+      </article>`).join('');
+  };
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){
+    if(jobsStream) jobsStream.close();
+  } else {
+    startJobsStream();
+  }
+});
+startJobsStream();
+</script>
+{% endblock %}

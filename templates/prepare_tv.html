@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Prepare TV</h2>
+  <p>Search shows, select one or more shows, then select one or more seasons for each show. PrepaC still creates one destination folder and one job per season.</p>
+  <div class="row">
+    <input id="q" type="text" placeholder="Type part of a TV show name">
+    <button onclick="searchShows()">Search</button>
+  </div>
+  <p id="searchStatus" class="muted">Idle.</p>
+
+  <div class="selection-summary">
+    <div><strong>Selected shows:</strong> <span id="selectedShowsLabel">None</span></div>
+    <div><strong>Selected seasons:</strong> <span id="selectedSeasonsLabel">None</span></div>
+  </div>
+
+  <div class="grid two">
+    <div>
+      <h3>Shows</h3>
+      <div id="shows" class="poster-grid"></div>
+    </div>
+    <div>
+      <h3>Seasons for <span id="activeShowLabel">no show selected</span></h3>
+      <ul id="seasons" class="plain selectable-list"></ul>
+    </div>
+  </div>
+
+  <section class="card inset-card">
+    <h3>Queued combinations</h3>
+    <div id="queueBox"><p class="muted">Nothing selected yet.</p></div>
+  </section>
+
+  <label><span>Bracket Override (optional, applied to all selected jobs)</span><input id="bracketOverride" type="text" placeholder="[WEBDL-1080p][AAC 2.0]"></label>
+  <button id="previewBtn" onclick="previewBatch()" disabled>Build Batch Preview</button>
+</section>
+
+<section class="card">
+  <h2>Batch Preview</h2>
+  <pre id="previewBox">No preview yet.</pre>
+  <button id="startBtn" onclick="startBatchJobs()" disabled>Start Batch TV Prepare Jobs</button>
+</section>
+
+<script>
+let foundShows = [];
+let selectedShows = new Map(); // showName -> { poster_url, seasons:Set, loadedSeasons:Array }
+let activeShow = null;
+let previewData = [];
+
+function selectedShowNames() {
+  return Array.from(selectedShows.keys());
+}
+
+function updateSummary() {
+  const shows = selectedShowNames();
+  const seasonCount = Array.from(selectedShows.values()).reduce((sum, x) => sum + x.seasons.size, 0);
+  document.getElementById('selectedShowsLabel').textContent = shows.length ? shows.join(', ') : 'None';
+  document.getElementById('selectedSeasonsLabel').textContent = seasonCount ? `${seasonCount} selected` : 'None';
+  document.getElementById('previewBtn').disabled = seasonCount === 0;
+  renderQueue();
+}
+
+function renderQueue() {
+  const box = document.getElementById('queueBox');
+  const rows = [];
+  for (const [show, data] of selectedShows.entries()) {
+    if (data.seasons.size === 0) continue;
+    rows.push(`<div class="queue-group"><strong>${show}</strong><ul>` +
+      Array.from(data.seasons).sort().map(season => `<li>${season} <button type="button" class="mini-remove tv-remove" data-show="${encodeURIComponent(show)}" data-season="${encodeURIComponent(season)}">Remove</button></li>`).join('') +
+      `</ul></div>`);
+  }
+  box.innerHTML = rows.length ? rows.join('') : '<p class="muted">Nothing selected yet.</p>';
+}
+
+
+function removeTvQueueItem(showName, seasonName) {
+  if (!selectedShows.has(showName)) return;
+  const data = selectedShows.get(showName);
+  data.seasons.delete(seasonName);
+  previewData = [];
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('previewBox').textContent = 'No preview yet.';
+  if (activeShow === showName) renderSeasons(showName);
+  updateSummary();
+}
+
+function markShowStates() {
+  document.querySelectorAll('#shows .linkbtn').forEach(btn => {
+    btn.classList.remove('selected-item', 'active-item');
+    const showName = btn.dataset.showName;
+    if (selectedShows.has(showName)) btn.classList.add('selected-item');
+    if (activeShow === showName) btn.classList.add('active-item');
+  });
+}
+
+function renderSeasons(showName) {
+  const seasonsEl = document.getElementById('seasons');
+  const activeLabel = document.getElementById('activeShowLabel');
+  seasonsEl.innerHTML = '';
+  activeLabel.textContent = showName || 'no show selected';
+  if (!showName || !selectedShows.has(showName)) return;
+
+  const data = selectedShows.get(showName);
+  (data.loadedSeasons || []).forEach(season => {
+    const li = document.createElement('li');
+    li.innerHTML = `<button class="linkbtn ${data.seasons.has(season) ? 'selected-item' : ''}">${season}</button>`;
+    const btn = li.querySelector('button');
+    btn.onclick = () => {
+      if (data.seasons.has(season)) {
+        data.seasons.delete(season);
+        btn.classList.remove('selected-item');
+      } else {
+        data.seasons.add(season);
+        btn.classList.add('selected-item');
+      }
+      previewData = [];
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('previewBox').textContent = 'No preview yet.';
+      updateSummary();
+    };
+    seasonsEl.appendChild(li);
+  });
+}
+
+async function loadSeasonsForShow(showName) {
+  const status = document.getElementById('searchStatus');
+  status.textContent = 'Loading seasons...';
+  const rs = await fetch(`/api/prepare/tv/seasons?show=${encodeURIComponent(showName)}`);
+  const ds = await rs.json();
+  const data = selectedShows.get(showName);
+  if (data) data.loadedSeasons = ds.results || [];
+  status.textContent = (data && data.loadedSeasons && data.loadedSeasons.length) ? 'Select one or more seasons.' : 'No seasons found.';
+  renderSeasons(showName);
+}
+
+async function searchShows() {
+  const q = document.getElementById('q').value;
+  const status = document.getElementById('searchStatus');
+  const list = document.getElementById('shows');
+
+  list.innerHTML = '';
+  activeShow = null;
+  previewData = [];
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('previewBox').textContent = 'No preview yet.';
+  document.getElementById('activeShowLabel').textContent = 'no show selected';
+  document.getElementById('seasons').innerHTML = '';
+  status.textContent = 'Searching...';
+
+  const r = await fetch(`/api/prepare/tv/search?q=${encodeURIComponent(q)}`);
+  const d = await r.json();
+  foundShows = d.results || [];
+  if (!foundShows.length) {
+    status.textContent = 'No results found.';
+    return;
+  }
+
+  status.textContent = `${foundShows.length} result(s) found. Click a show to select it, then choose seasons.`;
+  foundShows.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'poster-card';
+    card.innerHTML = `
+      ${item.poster_url ? `<img src="${item.poster_url}" alt="">` : `<div class="poster-placeholder">No image</div>`}
+      <button class="linkbtn" data-show-name="${item.name}">${item.name}</button>
+    `;
+    const btn = card.querySelector('button');
+    btn.onclick = async () => {
+      const showName = item.name;
+      if (!selectedShows.has(showName)) {
+        selectedShows.set(showName, { poster_url: item.poster_url || '', seasons: new Set(), loadedSeasons: [] });
+      } else if (activeShow !== showName) {
+        // keep selection; just make it active for season editing
+      } else {
+        // toggle active show off is not useful, keep active state
+      }
+      activeShow = showName;
+      markShowStates();
+      if (!(selectedShows.get(showName).loadedSeasons || []).length) {
+        await loadSeasonsForShow(showName);
+      } else {
+        renderSeasons(showName);
+        status.textContent = 'Select one or more seasons.';
+      }
+      updateSummary();
+    };
+    list.appendChild(card);
+  });
+  markShowStates();
+  updateSummary();
+}
+
+async function previewBatch() {
+  const bracket_override = document.getElementById('bracketOverride').value;
+  const combinations = [];
+  for (const [showName, data] of selectedShows.entries()) {
+    for (const seasonName of data.seasons) {
+      combinations.push({ show_name: showName, season_name: seasonName, bracket_override });
+    }
+  }
+  if (!combinations.length) return;
+
+  document.getElementById('previewBox').textContent = 'Building batch preview...';
+  previewData = [];
+  for (const combo of combinations) {
+    const r = await fetch('/api/prepare/tv/preview', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(combo)
+    });
+    const item = await r.json();
+    previewData.push(item);
+  }
+
+  document.getElementById('previewBox').textContent = JSON.stringify(previewData, null, 2);
+  document.getElementById('startBtn').disabled = previewData.length === 0;
+}
+
+async function startBatchJobs() {
+  for (const item of previewData) {
+    await fetch('/api/prepare/tv/start', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(item)
+    });
+  }
+  window.location.href = '/jobs';
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.tv-remove');
+  if (!btn) return;
+  removeTvQueueItem(decodeURIComponent(btn.dataset.show), decodeURIComponent(btn.dataset.season));
+});
+
+updateSummary();
+</script>
+{% endblock %}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PrepaC</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="app-shell">
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <div class="brand">
+        <div class="brand-mark">P</div>
+        <div class="brand-copy">
+          <h1>PrepaC</h1>
+          <span class="brand-subtitle">Preparation, Packing, Posting and Cleaning Workflow</span>
+        </div>
+      </div>
+      <nav class="main-nav">
+        <a class="{{ 'active' if request.path == '/' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a class="{{ 'active' if request.path.startswith('/prepare') else '' }}" href="{{ url_for('prepare_page') }}">Prepare</a>
+        <a class="{{ 'active' if request.path.startswith('/packing') else '' }}" href="{{ url_for('packing_page') }}">Packing</a>
+        <a class="{{ 'active' if request.path.startswith('/posting') else '' }}" href="{{ url_for('posting_page') }}">Posting</a>
+        <a class="{{ 'active' if request.path.startswith('/clean') else '' }}" href="{{ url_for('clean_page') }}">Clean</a>
+        <a class="{{ 'active' if request.path.startswith('/jobs') else '' }}" href="{{ url_for('jobs_page') }}">Jobs</a>
+        <a class="{{ 'active' if request.path.startswith('/history') else '' }}" href="{{ url_for('history_page') }}">History</a>
+        <a class="{{ 'active' if request.path.startswith('/settings') or request.path.startswith('/plex') or request.path.startswith('/setup') else '' }}" href="{{ url_for('settings_page') }}">Settings</a>
+        <a class="{{ 'active' if request.path.startswith('/help') else '' }}" href="{{ url_for('help_page') }}">Help</a>
+        {% if session.get("auth_ok") %}
+          <span class="session-pill">Signed in as {{ session.get("auth_user") }}</span>
+          <a href="{{ url_for('logout_page') }}">Logout</a>
+        {% endif %}
+      
+
+</nav>
+    </div>
+  </header>
+  <main class="wrap page-shell">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <section class="flash-stack">
+        {% for category, msg in messages %}
+          <div class="flash {{ category }}">{{ msg }}</div>
+        {% endfor %}
+        </section>
+      {% endif %}
+    {% endwith %}
+
+{% set live_settings = settings if settings is defined else none %}
+{% if live_settings %}
+  {% if not live_settings.get("tv_root") or not live_settings.get("movie_root") or not live_settings.get("dest_root") %}
+    <section class="flash-stack"><div class="flash info">⚠️ Paths not configured — some features will not work yet.</div></section>
+  {% endif %}
+  {% if not live_settings.get("plex_token") %}
+    <section class="flash-stack"><div class="flash info">ℹ️ Plex not connected — posters, watched status and cleanup detection are limited.</div></section>
+  {% endif %}
+{% endif %}
+
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="app-footer">
+    <div class="wrap footer-inner">
+      <span class="footer-version">{{ display_version }}</span>
+      <div class="bmc-container">
+        <a href="https://www.buymeacoffee.com/HoodStar" target="_blank" rel="noopener">
+          <img src="https://img.buymeacoffee.com/button-api/?text=Buy me a juice&emoji=🧃&slug=HoodStar&button_colour=ff0000&font_colour=ffffff&font_family=Cookie&outline_colour=ffffff&coffee_colour=FFDD00" alt="Buy me a juice">
+        </a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card" style="max-width: 460px; margin: 2rem auto;">
+  <h2>Sign In</h2>
+  <form method="post" action="{{ url_for('login_page') }}">
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <div class="form-grid">
+      <label><span>Username</span><input type="text" name="username" required></label>
+      <label><span>Password</span><input type="password" name="password" required></label>
+    </div>
+    <div class="row" style="margin-top:1rem;">
+      <button type="submit">Sign In</button>
+      <a href="{{ url_for('reset_password_page') }}">Forgot password?</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Clean</h2><p>Review Plex-based and prepare-based cleanup candidates before deleting.</p></div></section>
+<section class="card">
+  <h2>Clean</h2>
+  <div class="grid two">
+    <label><span>Reason Filter</span>
+      <select id="reason">
+        <option value="both">Both</option>
+        <option value="played">Fully Played</option>
+        <option value="prepared">Previously Prepared</option>
+      </select>
+    </label>
+    <label><span>Type Filter</span>
+      <select id="type">
+        <option value="all">All</option>
+        <option value="tv">TV</option>
+        <option value="movie">Movie</option>
+        <option value="youtube">YouTube</option>
+      </select>
+    </label>
+  </div>
+  <div class="grid two">
+    <label><span>Search</span><input id="search" type="text" placeholder="Search title or target path"></label>
+    <label><span>Sort By</span>
+      <select id="sortBy">
+        <option value="title">Title</option>
+        <option value="size_desc">Size Desc</option>
+        <option value="size_asc">Size Asc</option>
+      </select>
+    </label>
+  </div>
+  <label class="checkbox">
+    <input type="checkbox" id="dryRun" {% if settings.clean_dry_run == 'true' %}checked{% endif %}>
+    <span>Dry Run</span>
+  </label>
+  <label class="checkbox">
+    <input type="checkbox" id="useRecycleBin" {% if settings.clean_use_recycle_bin == 'true' %}checked{% endif %}>
+    <span>Use Recycle Bin on real clean actions</span>
+  </label>
+  <div class="row">
+    <button onclick="runScan()">Run Clean Scan</button>
+    <input id="confirm" type="text" placeholder="Type DELETE to process selected">
+    <button id="deleteBtn" onclick="runDelete()">Process Selected</button>
+  </div>
+</section>
+<section class="card">
+  <h2>Results</h2>
+  <div id="resultsBox"><p>No scan yet.</p></div><p id="cleanStatus" class="muted"></p>
+</section>
+<script>
+let currentResults = [];
+function renderResults(list){
+  const box = document.getElementById('resultsBox');
+  if(!list.length){ box.innerHTML = '<p>No candidates found.</p>'; return; }
+  box.innerHTML = list.map((item, idx) => `
+    <article class="job">
+      <label class="checkbox"><input type="checkbox" class="cand" value="${idx}"><span>Select</span></label>
+      ${item.poster_url ? `<img class="clean-poster" src="${item.poster_url}" alt="">` : `<div class="poster-placeholder small">No image</div>`}
+      <h3>${item.title}</h3>
+      <p><strong>Type:</strong> ${item.media_type}</p>
+      <p><strong>Reason:</strong> ${item.reason}</p>
+      <p><strong>Target Kind:</strong> ${item.target_kind}</p>
+      <p><strong>Target Path:</strong> <code>${item.target_path}</code></p>
+      <p><strong>Estimated Delete Size:</strong> ${(item.size_bytes/1024/1024).toFixed(2)} MB</p>
+      ${item.details && item.details.will_also_remove_show_folder ? `<p class="clean-extra-note"><strong>Additional action:</strong> This will also remove the show folder.</p>` : `<p class="clean-extra-note"></p>`}
+      <details><summary>Storage Breakdown</summary><pre>${JSON.stringify(item.breakdown, null, 2)}</pre></details>
+      <details><summary>Details</summary><pre>${JSON.stringify(item.details, null, 2)}</pre></details>
+    </article>
+  `).join('');
+}
+function applyClientFilters(){
+  const q = document.getElementById('search').value.toLowerCase().trim();
+  const sortBy = document.getElementById('sortBy').value;
+  let list = [...currentResults];
+  if(q){
+    list = list.filter(item => (item.title || '').toLowerCase().includes(q) || (item.target_path || '').toLowerCase().includes(q));
+  }
+  if(sortBy === 'size_desc') list.sort((a,b) => (b.size_bytes||0) - (a.size_bytes||0));
+  else if(sortBy === 'size_asc') list.sort((a,b) => (a.size_bytes||0) - (b.size_bytes||0));
+  else list.sort((a,b) => (a.title||'').localeCompare(b.title||''));
+  renderResults(list);
+}
+function refreshCleanSelectionContext(){
+  const cards = Array.from(document.querySelectorAll('#resultsBox .job'));
+  const groups = new Map();
+
+  cards.forEach(card => {
+    const cb = card.querySelector('.cand');
+    const idx = Number(cb?.value ?? -1);
+    const item = currentResults[idx];
+    if(!cb || !item) return;
+    const details = item.details || {};
+    const showPath = details.season_parent_show_path;
+    const seasonNames = details.season_folder_names_in_show || [];
+    if(item.media_type === 'tv' && showPath && seasonNames.length){
+      if(!groups.has(showPath)){
+        groups.set(showPath, {all: new Set(seasonNames), cards: []});
+      }
+      groups.get(showPath).cards.push({card, item, checked: cb.checked});
+    }
+  });
+
+  cards.forEach(card => {
+    const note = card.querySelector('.clean-extra-note');
+    if(note && !note.innerHTML.includes('Additional action:')){
+      note.innerHTML = '';
+    }
+  });
+
+  groups.forEach(group => {
+    const selectedNames = new Set(group.cards.filter(x => x.checked).map(x => {
+      const parts = String(x.item.target_path || '').split(/[\\/]/);
+      return parts[parts.length - 1];
+    }));
+    const allSelected = group.all.size > 0 && Array.from(group.all).every(name => selectedNames.has(name));
+    if(allSelected){
+      group.cards.filter(x => x.checked).forEach(x => {
+        const note = x.card.querySelector('.clean-extra-note');
+        if(note){
+          note.innerHTML = '<strong>Additional action:</strong> All season folders for this show are selected. The show folder will also be deleted.';
+        }
+      });
+    }
+  });
+}
+
+async function runScan(){
+  const reason = document.getElementById('reason').value;
+  const type = document.getElementById('type').value;
+  const box = document.getElementById('resultsBox');
+  box.innerHTML = '<p>Scanning...</p>';
+  const r = await fetch(`/api/clean/preview?reason=${encodeURIComponent(reason)}&type=${encodeURIComponent(type)}`);
+  const d = await r.json();
+  if(d.error){ box.innerHTML = `<p><strong>Error:</strong> ${d.error}</p>`; return; }
+  currentResults = d.results || [];
+  applyClientFilters();
+  refreshCleanSelectionContext();
+}
+async function runDelete(){
+  const status = document.getElementById('cleanStatus');
+  const btn = document.getElementById('deleteBtn');
+  const selected = Array.from(document.querySelectorAll('.cand:checked')).map(cb => currentResults[parseInt(cb.value,10)]).filter(Boolean);
+  const confirmation = document.getElementById('confirm').value;
+  const dry_run = document.getElementById('dryRun').checked;
+  const use_recycle_bin = document.getElementById('useRecycleBin').checked;
+
+  if(!selected.length){
+    alert('Select at least one candidate.');
+    return;
+  }
+  if(confirmation !== 'DELETE'){
+    alert('Type DELETE to continue.');
+    return;
+  }
+  if(dry_run){
+    status.textContent = 'Dry Run is enabled. A preview action will be logged, but files will not be deleted.';
+  } else {
+    status.textContent = 'Processing clean request...';
+  }
+  btn.disabled = true;
+  try{
+    const r = await fetch('/api/clean/delete', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({candidates:selected, confirmation, dry_run, use_recycle_bin})
+    });
+    const raw = await r.text();
+    let d = {};
+    try {
+      d = JSON.parse(raw);
+    } catch (_e) {
+      const shortBody = raw.slice(0, 300);
+      const msg = `Clean returned a non-JSON response. ${shortBody}`;
+      status.textContent = msg;
+      alert(msg);
+      return;
+    }
+    if(!d.ok){ 
+      const failed = (d.results || []).filter(x => !x.success).map(x => `${x.target_path}: ${x.message}`).join('\n');
+      const err = d.error || failed || 'Delete failed';
+      alert(err);
+      status.textContent = err;
+      return; 
+    }
+    const refreshed = d.plex_refresh && d.plex_refresh.refreshed ? d.plex_refresh.refreshed.length : 0;
+    const payload = {
+      processed_count: (d.results || []).length,
+      refreshed_count: refreshed,
+      results: d.results || []
+    };
+    sessionStorage.setItem('prepac_clean_result', JSON.stringify(payload));
+    window.location.href = '/clean/result';
+  } catch (e){
+    status.textContent = `Clean failed: ${e}`;
+    alert(`Clean failed: ${e}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.addEventListener('input', e => { if(e.target.id === 'search') applyClientFilters(); });
+
+
+document.addEventListener('change', e => {
+  if(e.target.id === 'sortBy') applyClientFilters();
+  if(e.target.id === 'sortBy' || (e.target.classList && e.target.classList.contains('cand'))) refreshCleanSelectionContext();
+});
+</script>
+{% endblock %}

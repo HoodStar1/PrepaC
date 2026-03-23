@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>History</h2>
+  <p>Browse completed work and previous actions.</p>
+  <div class="history-grid">
+    <a class="card history-choice" href="{{ url_for('history_prepare_page') }}">
+      <h3>Prepare History</h3>
+      <p>Prepared jobs.</p>
+    </a>
+    <a class="card history-choice" href="{{ url_for('history_clean_page') }}">
+      <h3>Clean History</h3>
+      <p>Cleaning actions.</p>
+    </a>
+    <a class="card history-choice" href="{{ url_for('history_packing_page') }}">
+      <h3>Packing History</h3>
+      <p>Packed jobs.</p>
+    </a>
+      <a class="card history-choice" href="{{ url_for('history_posting_page') }}">
+      <h3>Posting History</h3>
+      <p>Posted jobs.</p>
+    </a>
+</div>
+</section>
+{% endblock %}

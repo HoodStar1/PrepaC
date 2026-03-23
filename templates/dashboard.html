@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Dashboard</h2><p>Operational overview.</p></div></section>
+<section class="card">
+  <h2>Overview of Currently Running</h2>
+  <div id="runningOverview">
+  {% if current_running %}
+    {% for item in current_running %}
+      <article class="job">
+        <h3>{{ item.kind }}</h3>
+        <p><strong>Item:</strong> <code>{{ item.title }}</code></p>
+        <p><strong>Phase:</strong> {{ item.phase }}</p>
+        <p><strong>Progress:</strong> {{ item.percent if item.percent is not none else '' }}{% if item.percent is not none %}%{% endif %}</p>
+        <p><strong>Message:</strong> {{ item.message }}</p>
+      </article>
+    {% endfor %}
+  {% else %}
+    <p>No jobs are currently running.</p>
+  {% endif %}
+  </div>
+</section>
+
+<div class="grid two">
+  <section class="card">
+    <h2>Prepare Stats</h2>
+    <p><strong>Total Prepare Jobs:</strong> {{ prepare_summary.total_prepare_jobs }}</p>
+    <p><strong>Total Prepared Items:</strong> {{ prepare_summary.total_prepared_items }}</p>
+    <p><strong>Prepared TV Items:</strong> {{ prepare_summary.tv_items }}</p>
+    <p><strong>Prepared Movie Items:</strong> {{ prepare_summary.movie_items }}</p>
+    <p><strong>Total Source Bytes Prepared:</strong> {{ prepare_summary.source_bytes_total|humansize }}</p>
+    <p><strong>Total Destination Bytes Prepared:</strong> {{ prepare_summary.dest_bytes_total|humansize }}</p>
+  </section>
+  <section class="card">
+    <h2>Packing Stats</h2>
+    <p><strong>Total Packed Jobs:</strong> {{ packing_summary.total_jobs }}</p>
+    <p><strong>Total Packed Data:</strong> {{ packing_summary.total_bytes|humansize }}</p>
+    <p><strong>Largest Packed Job:</strong> {{ packing_summary.largest_bytes|humansize }}</p>
+    <p><strong>Average Packing Time:</strong> {{ packing_summary.avg_seconds|humanduration }}</p>
+  </section>
+</div>
+
+<div class="grid two">
+  <section class="card">
+    <h2>Posting Stats</h2>
+    <p><strong>Total Posted Jobs:</strong> {{ posting_summary.total_jobs }}</p>
+    <p><strong>Total Posted Data:</strong> {{ posting_summary.total_bytes|humansize }}</p>
+    <p><strong>Largest Posted Job:</strong> {{ posting_summary.largest_bytes|humansize }}</p>
+    <p><strong>Average Posting Time:</strong> {{ posting_summary.avg_seconds|humanduration }}</p>
+    <p><strong>Provider 1 Jobs:</strong> {{ posting_summary.provider1_jobs }}</p>
+    <p><strong>Provider 2 Jobs:</strong> {{ posting_summary.provider2_jobs }}</p>
+  </section>
+  <section class="card">
+    <h2>Clean Stats</h2>
+    <p><strong>Total Clean Actions Logged:</strong> {{ clean_summary.total_actions }}</p>
+    <p><strong>Dry Runs:</strong> {{ clean_summary.dry_runs }}</p>
+    <p><strong>Real Runs:</strong> {{ clean_summary.real_runs }}</p>
+    <p><strong>Successes:</strong> {{ clean_summary.successes }}</p>
+    <p><strong>Failures:</strong> {{ clean_summary.failures }}</p>
+    <p><strong>Recycle Actions:</strong> {{ clean_summary.recycle_actions }}</p>
+    <p><strong>Total Bytes Processed:</strong> {{ clean_summary.bytes_total|humansize }}</p>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Quick Exports</h2>
+  <p><a href="{{ url_for('api_history_export') }}">Download Prepared History CSV</a></p>
+  <p><a href="{{ url_for('api_clean_logs_export') }}">Download Clean Logs CSV</a></p>
+  <p><a href="{{ url_for('api_packing_history_export') }}">Download Packing History CSV</a></p>
+  <p><a href="{{ url_for('api_posting_history_export') }}">Download Posting History CSV</a></p>
+</section>
+
+<section class="card">
+  <h2>Recent Actions</h2>
+  {% if recent_actions %}
+  <table>
+    <tr><th>Time</th><th>Kind</th><th>Media</th><th>Status</th><th>Item</th><th>Details</th></tr>
+    {% for a in recent_actions %}
+    <tr>
+      <td>{{ a.time }}</td>
+      <td>{{ a.kind }}</td>
+      <td>{{ a.media_type }}</td>
+      <td>{{ a.status }}</td>
+      <td><code>{{ a.title }}</code></td>
+      <td>{{ a.details }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No recent actions yet.</p>
+  {% endif %}
+</section>
+
+<script>
+let dashboardStream = null;
+function startDashboardStream(){
+  if(dashboardStream) dashboardStream.close();
+  dashboardStream = new EventSource('/api/dashboard/running/stream');
+  dashboardStream.onmessage = (event) => {
+    const d = JSON.parse(event.data || '{}');
+    const box = document.getElementById('runningOverview');
+    const items = d.running || [];
+    if(!items.length){
+      box.innerHTML = '<p>No jobs are currently running.</p>';
+      return;
+    }
+    box.innerHTML = items.map(item => `
+      <article class="job">
+        <h3>${item.kind || ''}</h3>
+        <p><strong>Item:</strong> <code>${item.title || ''}</code></p>
+        <p><strong>Phase:</strong> ${item.phase || ''}</p>
+        <p><strong>Progress:</strong> ${item.percent == null ? '' : item.percent + '%'}</p>
+        <p><strong>Message:</strong> ${item.message || ''}</p>
+      </article>
+    `).join('');
+  };
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){
+    if(dashboardStream) dashboardStream.close();
+  } else {
+    startDashboardStream();
+  }
+});
+startDashboardStream();
+</script>
+{% endblock %}

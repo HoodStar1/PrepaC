@@ -1,0 +1,244 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Settings</h2><p>Application configuration.</p></div></section>
+<section class="card">
+  <h2>Settings</h2>
+  <p>Manage application settings.</p>
+
+  <form method="post" action="{{ url_for('api_settings_save') }}" class="form-grid">
+    <label>
+      <span>TV Root <small class="muted">Real path: /mnt/user/TV Shows</small></span>
+      <input type="text" name="tv_root" value="{{ settings['tv_root'] }}">
+    </label>
+    <label>
+      <span>Movie Root <small class="muted">Real path: /mnt/user/Movies</small></span>
+      <input type="text" name="movie_root" value="{{ settings['movie_root'] }}">
+    </label>
+    <label>
+      <span>YouTube Root <small class="muted">Real path: /mnt/user/Youtube Downloads</small></span>
+      <input type="text" name="youtube_root" value="{{ settings['youtube_root'] }}">
+    </label>
+    <label>
+      <span>Destination Root <small class="muted">Real path: /mnt/user/TBP/Jobs</small></span>
+      <input type="text" name="dest_root" value="{{ settings['dest_root'] }}">
+    </label>
+    <label>
+      <span>End Tag</span>
+      <input type="text" name="end_tag" value="{{ settings['end_tag'] }}">
+    </label>
+    <label>
+      <span>Recycle Bin Root <small class="muted">Usually maps under /mnt/user/TBP/Jobs/.prepac_recycle</small></span>
+      <input type="text" name="recycle_bin_root" value="{{ settings['recycle_bin_root'] }}">
+    </label>
+
+    <label class="checkbox">
+      <input type="checkbox" name="clean_dry_run" {% if settings.clean_dry_run == 'true' %}checked{% endif %}>
+      <span>Clean Dry Run</span>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="clean_use_recycle_bin" {% if settings.clean_use_recycle_bin == 'true' %}checked{% endif %}>
+      <span>Use Recycle Bin for real clean actions</span>
+    </label>
+
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Application Version</h3>
+  <div class="form-grid">
+    <label><span>Version</span><input type="text" value="{{ app_version }}" readonly></label>
+    <label><span>Build</span><input type="text" value="{{ build_display }}" readonly></label>
+    <label style="grid-column: 1 / -1;"><span>Full Version</span><input type="text" value="{{ full_version }}" readonly></label>
+  </div>
+</section>
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Authentication</h3>
+  <div class="form-grid">
+    <label><span>Username</span><input type="text" name="auth_username" value="{{ settings['auth_username'] }}"></label>
+    <label><span>Password Status</span><input type="text" value="{{ 'Configured' if settings['auth_password_hash'] else 'Not configured' }}" readonly></label>
+    <label><span>Recovery Secret Status</span><input type="text" value="{{ 'Configured' if settings['auth_recovery_hash'] else 'Not configured' }}" readonly></label>
+  </div>
+  <div class="row" style="margin-top: 1rem;">
+    <a class="buttonlike" href="{{ url_for('change_recovery_secret_page') }}">{{ "Change Recovery Secret" if settings['auth_recovery_hash'] else "Set Recovery Secret" }}</a>
+  </div>
+  <p class="muted">Authentication is mandatory. Use the button above to set or change the recovery secret for password recovery.</p>
+</section>
+
+    <section class="card inset-card" style="grid-column: 1 / -1;">
+      <h3>Plex Settings</h3>
+      <p>Connect PrepaC to Plex and review the detected server.</p>
+
+      <div class="row">
+        <a class="buttonlike" href="{{ url_for('plex_signin') }}">Sign in with Plex</a>
+        <button type="button" onclick="loadServers()">Refresh Servers From Saved Token</button>
+      </div>
+      <p class="muted">The callback URL is generated automatically from the current browser address, so this flow works on different systems without hardcoding a specific IP.</p>
+      <pre id="pinStatus">Use “Sign in with Plex” to complete authentication in one flow.</pre>
+
+      <div class="row">
+        <button type="button" onclick="loadServers()">Load Servers From Saved Token</button>
+      </div>
+      <div id="serversBox"><p class="muted">No server list loaded yet.</p></div>
+
+      <div class="form-grid">
+        <label>
+          <span>Plex URL</span>
+          <input type="text" name="plex_url" value="{{ settings['plex_url'] }}" placeholder="http://IP:32400">
+        </label>
+        <label>
+          <span>Plex Token</span>
+          <input type="text" name="plex_token" value="{{ settings['plex_token'] }}" placeholder="token">
+        </label>
+        <label>
+          <span>TV Library Name</span>
+          <input type="text" name="plex_tv_library" value="{{ settings['plex_tv_library'] }}">
+        </label>
+        <label>
+          <span>Movie Library Name</span>
+          <input type="text" name="plex_movie_library" value="{{ settings['plex_movie_library'] }}">
+        </label>
+        <label>
+          <span>YouTube Library Name</span>
+          <input type="text" name="plex_youtube_library" value="{{ settings['plex_youtube_library'] }}">
+        </label>
+      </div>
+    </section>
+
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Prepare Settings</h3>
+  <div class="form-grid">
+    <label><span>Prepare Max Concurrent Jobs</span><input type="number" name="prepare_max_concurrent_jobs" value="{{ settings['prepare_max_concurrent_jobs'] }}"></label>
+  </div>
+</section>
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Workflow Automation</h3>
+  <label class="checkbox">
+    <input type="checkbox" name="workflow_auto_chain_enabled" {% if settings.workflow_auto_chain_enabled == 'true' %}checked{% endif %}>
+    <span>Enable automated workflow chaining (Prepare → Packing → Posting)</span>
+  </label>
+  <p class="muted">Prepare still starts manually. When enabled, each completed Prepare job automatically queues Packing, and each completed Packing job automatically queues Posting for that same job. Clean remains fully manual.</p>
+</section>
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Packing Settings</h3>
+  <div class="form-grid">
+    <label><span>Packing Max Concurrent Jobs</span><input type="number" name="packing_max_concurrent_jobs" value="{{ settings['packing_max_concurrent_jobs'] }}"></label>
+    <label><span>Packing Watch Folder</span><input type="text" name="packing_watch_root" value="{{ settings['packing_watch_root'] }}"></label>
+    <label><span>Packing Output Folder</span><input type="text" name="packing_output_root" value="{{ settings['packing_output_root'] }}"></label>
+    <label><span>Stability Delay (seconds)</span><input type="number" name="packing_stability_delay" value="{{ settings['packing_stability_delay'] }}"></label>
+    <label class="checkbox"><input type="checkbox" name="packing_delete_source_after_success" {% if settings.packing_delete_source_after_success == 'true' %}checked{% endif %}><span>Delete source after successful packing (default ON)</span></label>
+    <label><span>Password Prefix</span><input type="text" name="packing_password_prefix" value="{{ settings['packing_password_prefix'] }}"></label>
+    <label><span>Password Length</span><input type="number" name="packing_password_length" value="{{ settings['packing_password_length'] }}"></label>
+    <label class="checkbox"><input type="checkbox" name="packing_header_encrypt" {% if settings.packing_header_encrypt == 'true' %}checked{% endif %}><span>RAR header encryption</span></label>
+    <label class="checkbox"><input type="checkbox" name="packing_auto_volume" {% if settings.packing_auto_volume == 'true' %}checked{% endif %}><span>Auto RAR volume sizing</span></label>
+    <label class="checkbox"><input type="checkbox" name="packing_auto_par2" {% if settings.packing_auto_par2 == 'true' %}checked{% endif %}><span>Auto PAR2 percentage</span></label>
+    <label><span>PAR2 Threads</span><input type="number" name="packing_par2_threads" value="{{ settings['packing_par2_threads'] }}"></label>
+    <label><span>PAR2 Memory (MB)</span><input type="number" name="packing_par2_memory_mb" value="{{ settings['packing_par2_memory_mb'] }}"></label>
+    <label><span>PAR2 Block Size</span><input type="number" name="packing_par2_block_size" value="{{ settings['packing_par2_block_size'] }}"></label>
+    <label><span>Archive Name Length</span><input type="number" name="packing_name_length" value="{{ settings['packing_name_length'] }}"></label>
+    <label><span>Fixed Tag</span><input type="text" name="packing_name_fixed_tag" value="{{ settings['packing_name_fixed_tag'] }}"></label>
+    <label><span>Fixed Tag Position</span><input type="number" name="packing_name_fixed_pos" value="{{ settings['packing_name_fixed_pos'] }}"></label>
+    <label><span>Thumbnail Host</span><input type="text" name="packing_thumbnail_host" value="freeimage" readonly></label>
+    <label><span>Freeimage.host API Key</span><input type="text" name="packing_freeimage_api_key" value="{{ settings['packing_freeimage_api_key'] }}"><small class="muted">Source: {{ settings['packing_freeimage_api_key_source'] }}</small></label>
+  </div>
+  <p class="muted">Packed archives go to: <code>{{ settings['packing_output_root'] }}/&lt;jobname&gt;</code><br>Output files go to: <code>{{ settings['packing_output_root'] }}/output files/&lt;jobname&gt;</code></p>
+</section>
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Posting Settings</h3>
+  <div class="form-grid">
+    <label><span>Posted Output Root</span><input type="text" name="posting_posted_root" value="{{ settings['posting_posted_root'] }}"></label>
+    <label><span>NZB RAR Root</span><input type="text" name="posting_nzb_root" value="{{ settings['posting_nzb_root'] }}"></label>
+    <label><span>Name Randomizer File</span><input type="text" name="posting_randomizer_file" value="{{ settings['posting_randomizer_file'] }}"></label>
+    <label><span>Article Size</span><input type="number" name="posting_article_size" value="{{ settings['posting_article_size'] }}"></label>
+    <label><span>yEnc Line Size</span><input type="number" name="posting_yenc_line_size" value="{{ settings['posting_yenc_line_size'] }}"></label>
+    <label><span>Retries</span><input type="number" name="posting_retries" value="{{ settings['posting_retries'] }}"></label>
+    <label><span>Retry Delay</span><input type="text" name="posting_retry_delay" value="{{ settings['posting_retry_delay'] }}"></label>
+    <label><span>Comment</span><input type="text" name="posting_comment" value="{{ settings['posting_comment'] }}"></label>
+    <label><span>Provider 2 max job size when provider 1 is busy (GB)</span><input type="number" step="0.1" name="posting_provider2_max_gb_when_busy" value="{{ settings['posting_provider2_max_gb_when_busy'] }}"></label>
+    <label class="checkbox"><input type="checkbox" name="posting_embed_password_in_nzb" {% if settings.posting_embed_password_in_nzb == 'true' %}checked{% endif %}><span>Embed password in NZB</span></label>
+    <label class="checkbox"><input type="checkbox" name="posting_post_check" {% if settings.posting_post_check == 'true' %}checked{% endif %}><span>Enable post-check verification</span></label>
+  </div>
+  <div class="grid two provider-grid">
+    <section class="card inset-card">
+      <h4>Provider 1</h4>
+      <div class="form-grid">
+        <label class="checkbox"><input type="checkbox" name="posting_provider1_enabled" {% if settings.posting_provider1_enabled == 'true' %}checked{% endif %}><span>Enable Provider 1</span></label>
+        <label class="checkbox"><input type="checkbox" name="posting_provider1_ssl" {% if settings.posting_provider1_ssl == 'true' %}checked{% endif %}><span>Use SSL</span></label>
+        <label><span>Host</span><input type="text" name="posting_provider1_host" value="{{ settings['posting_provider1_host'] }}"></label>
+        <label><span>Port</span><input type="text" name="posting_provider1_port" value="{{ settings['posting_provider1_port'] }}"></label>
+        <label><span>Username</span><input type="text" name="posting_provider1_username" value="{{ settings['posting_provider1_username'] }}"></label>
+        <label><span>Password</span><input type="password" name="posting_provider1_password" value="{{ settings['posting_provider1_password'] }}"><small class="muted">Source: {{ settings['posting_provider1_password_source'] }}</small></label>
+        <label><span>Connections</span><input type="number" name="posting_provider1_connections" value="{{ settings['posting_provider1_connections'] }}"></label>
+      </div>
+    </section>
+    <section class="card inset-card">
+      <h4>Provider 2</h4>
+      <div class="form-grid">
+        <label class="checkbox"><input type="checkbox" name="posting_provider2_enabled" {% if settings.posting_provider2_enabled == 'true' %}checked{% endif %}><span>Enable Provider 2</span></label>
+        <label class="checkbox"><input type="checkbox" name="posting_provider2_ssl" {% if settings.posting_provider2_ssl == 'true' %}checked{% endif %}><span>Use SSL</span></label>
+        <label><span>Host</span><input type="text" name="posting_provider2_host" value="{{ settings['posting_provider2_host'] }}"></label>
+        <label><span>Port</span><input type="text" name="posting_provider2_port" value="{{ settings['posting_provider2_port'] }}"></label>
+        <label><span>Username</span><input type="text" name="posting_provider2_username" value="{{ settings['posting_provider2_username'] }}"></label>
+        <label><span>Password</span><input type="password" name="posting_provider2_password" value="{{ settings['posting_provider2_password'] }}"><small class="muted">Source: {{ settings['posting_provider2_password_source'] }}</small></label>
+        <label><span>Connections</span><input type="number" name="posting_provider2_connections" value="{{ settings['posting_provider2_connections'] }}"></label>
+      </div>
+    </section>
+  </div>
+  <p class="muted">Posting reads <code>template.txt</code> from <code>{{ settings['packing_output_root'] }}/output files/&lt;jobname&gt;</code>, updates the actual posted groups, moves output files to <code>{{ settings['posting_posted_root'] }}/&lt;jobname&gt;</code>, deletes <code>{{ settings['packing_output_root'] }}/&lt;jobname&gt;</code> after success, and stores the NZB as a RAR in <code>{{ settings['posting_nzb_root'] }}/&lt;jobname&gt;.rar</code>.</p>
+</section>
+
+    <div style="grid-column: 1 / -1;">
+      <button type="submit">Save Settings</button>
+    </div>
+  </form>
+<p class="muted">When post-check is enabled, PrepaC reserves 1 connection for checking and automatically clamps posting connections so the total does not exceed the provider max.</p>
+</section>
+
+<script>
+async function loadServers(){
+  const box = document.getElementById('serversBox');
+  box.innerHTML = '<p>Loading servers...</p>';
+  const r = await fetch('/api/plex/servers');
+  const d = await r.json();
+  if(!d.ok){
+    box.innerHTML = `<p><strong>Error:</strong> ${d.error}</p>`;
+    return;
+  }
+  if(!d.servers.length){
+    box.innerHTML = '<p>No servers found.</p>';
+    return;
+  }
+  box.innerHTML = d.servers.map(server => `
+    <article class="job">
+      <h4>${server.name}</h4>
+      <details open>
+        <summary>Connections</summary>
+        ${(server.connections || []).map(conn => `
+          <div class="row">
+            <code>${conn.uri}</code>
+            <button type="button" onclick="selectServer('${conn.uri.replace(/'/g, "\'")}')">Use this URL</button>
+          </div>
+        `).join('')}
+      </details>
+    </article>
+  `).join('');
+}
+async function selectServer(uri){
+  const r = await fetch('/api/plex/server/select', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({server_url: uri})
+  });
+  const d = await r.json();
+  if(!d.ok){
+    alert(d.error || 'Failed to save server');
+    return;
+  }
+  const plexUrlInput = document.querySelector('input[name="plex_url"]');
+  if (plexUrlInput) plexUrlInput.value = d.plex_url || uri;
+  alert('Plex server URL saved into settings. Click Save Settings to persist any other changes.');
+}
+</script>
+{% endblock %}

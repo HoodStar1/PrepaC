@@ -1,0 +1,12 @@
+site_name: PrepaC
+site_description: PrepaC documentation
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Setup: setup.md
+  - Settings: settings.md
+  - Workflows: workflows.md
+  - Operations: operations.md
+  - Troubleshooting: troubleshooting.md
+  - FAQ: faq.md

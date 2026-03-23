@@ -1,0 +1,413 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Prepare</h2><p>Browse media, queue selections and start preparation.</p></div></section>
+<section class="card">
+  <h2>Prepare</h2>
+  <p class="muted">Workflow automation: <strong>{{ 'Enabled' if settings.workflow_auto_chain_enabled == 'true' else 'Disabled' }}</strong>. When enabled, completed Prepare jobs automatically queue Packing, and completed Packing jobs automatically queue Posting.</p>
+  <p>Select TV or Movie items and start the queue.</p>
+
+  <div class="tabbar">
+    <button type="button" id="tabTvBtn" class="tabbtn active-item">TV</button>
+    <button type="button" id="tabMovieBtn" class="tabbtn">Movie</button>
+  </div>
+
+  <div id="tab-tv" class="prepare-tab">
+    <div class="row">
+      <input id="tvQuery" type="text" placeholder="Type part of a TV show name">
+      <button type="button" id="searchTvBtn">Search TV</button>
+    </div>
+    <p id="tvStatus" class="muted">Idle.</p>
+
+    <div class="selection-summary">
+      <div><strong>Selected shows:</strong> <span id="selectedShowsLabel">None</span></div>
+      <div><strong>Selected seasons:</strong> <span id="selectedSeasonsLabel">None</span></div>
+    </div>
+
+    <div class="grid two">
+      <div>
+        <h3>Shows</h3>
+        <div id="tvShows" class="poster-grid"></div>
+      </div>
+      <div>
+        <h3>Seasons for <span id="activeShowLabel">no show selected</span></h3>
+        <ul id="tvSeasons" class="plain selectable-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-movie" class="prepare-tab" style="display:none;">
+    <div class="row">
+      <input id="movieQuery" type="text" placeholder="Type part of a movie folder name">
+      <button type="button" id="searchMovieBtn">Search Movies</button>
+    </div>
+    <p id="movieStatus" class="muted">Idle.</p>
+
+    <div class="selection-summary">
+      <div><strong>Selected movies:</strong> <span id="selectedMoviesLabel">None</span></div>
+    </div>
+
+    <div id="movieResults" class="poster-grid"></div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Shared Queue</h2>
+  <label><span>Bracket Override (optional, applied to new preview builds)</span><input id="bracketOverride" type="text" placeholder="[WEBDL-2160p][DV HDR10Plus][EAC3 Atmos 5_1][h265]"></label>
+  <div id="queueBox"><p class="muted">Nothing queued yet.</p></div>
+  <p id="previewStatus" class="muted">Idle.</p>
+  <div class="row">
+    <button type="button" id="previewBtn" disabled>Build Queue Preview</button>
+    <button type="button" id="clearQueueBtn" disabled>Clear Queue</button>
+    <button type="button" id="startBtn" disabled>Start Queue Jobs</button>
+  </div>
+</section>
+
+<script>
+let activePrepareTab = 'tv';
+let selectedShows = new Map();
+let activeShow = null;
+let selectedMovies = new Map();
+let queueItems = [];
+let previewData = [];
+
+function setPreviewStatus(text) {
+  const el = document.getElementById('previewStatus');
+  if (el) el.textContent = text;
+}
+
+function showPrepareTab(tab){
+  activePrepareTab = tab;
+  document.getElementById('tab-tv').style.display = tab === 'tv' ? '' : 'none';
+  document.getElementById('tab-movie').style.display = tab === 'movie' ? '' : 'none';
+  document.getElementById('tabTvBtn').classList.toggle('active-item', tab === 'tv');
+  document.getElementById('tabMovieBtn').classList.toggle('active-item', tab === 'movie');
+}
+
+function updateTvSummary(){
+  const shows = Array.from(selectedShows.keys()).filter(k => (selectedShows.get(k).seasons || new Set()).size > 0);
+  const seasonCount = Array.from(selectedShows.values()).reduce((sum, x) => sum + x.seasons.size, 0);
+  document.getElementById('selectedShowsLabel').textContent = shows.length ? shows.join(', ') : 'None';
+  document.getElementById('selectedSeasonsLabel').textContent = seasonCount ? `${seasonCount} selected` : 'None';
+}
+
+function updateMovieSummary(){
+  const names = Array.from(selectedMovies.keys());
+  document.getElementById('selectedMoviesLabel').textContent = names.length ? names.join(', ') : 'None';
+}
+
+function syncButtons(){
+  document.getElementById('previewBtn').disabled = queueItems.length === 0;
+  document.getElementById('clearQueueBtn').disabled = queueItems.length === 0;
+  document.getElementById('startBtn').disabled = previewData.length === 0;
+}
+
+function renderQueue(){
+  const box = document.getElementById('queueBox');
+  if (!queueItems.length){
+    box.innerHTML = '<p class="muted">Nothing queued yet.</p>';
+  } else {
+    box.innerHTML = queueItems.map((item, idx) => {
+      const p = previewData[idx];
+      const important = p ? `
+        <div class="queue-important">
+          <div><strong>chosen_bracket:</strong> <code>${p.chosen_bracket || ''}</code></div>
+          <div><strong>dest_folder:</strong> <code>${p.dest_folder || ''}</code></div>
+          <div><strong>dest_path:</strong> <code>${p.dest_path || ''}</code></div>
+          <div><strong>detected_tags:</strong> <code>${JSON.stringify((p.detected_tags || {}).detected_tags || [])}</code></div>
+        </div>
+        <details>
+          <summary>View more</summary>
+          <pre>${JSON.stringify(p, null, 2)}</pre>
+        </details>
+      ` : `<div class="muted">Preview not built yet for this item.</div>`;
+      return `
+        <article class="job queue-job">
+          <div class="queue-media">
+            ${item.poster_url ? `<img class="queue-poster" src="${item.poster_url}" alt="">` : `<div class="poster-placeholder small">No image</div>`}
+          </div>
+          <div class="queue-content">
+            <div class="row queue-header-row">
+              <strong>${item.label}</strong>
+              <button type="button" class="mini-remove" onclick="removeQueueItem(${idx})">Remove</button>
+            </div>
+            ${important}
+          </div>
+        </article>
+      `;
+    }).join('');
+  }
+  syncButtons();
+}
+
+function removeQueueItem(idx){
+  const removed = queueItems[idx];
+  queueItems.splice(idx, 1);
+  previewData = [];
+  if (removed && removed.kind === 'tv') {
+    const data = selectedShows.get(removed.show_name);
+    if (data) data.seasons.delete(removed.season_name);
+    if (activeShow === removed.show_name) renderTvSeasons(removed.show_name);
+  } else if (removed && removed.kind === 'movie') {
+    selectedMovies.delete(removed.movie_name);
+    document.querySelectorAll('#movieResults .linkbtn').forEach(btn => {
+      if (btn.dataset.movieName === removed.movie_name) btn.classList.remove('selected-item');
+    });
+  }
+  updateTvSummary();
+  updateMovieSummary();
+  renderQueue();
+  setPreviewStatus(`Queue preview ready for ${previewData.length} item(s).`);
+}
+
+function clearQueue(){
+  queueItems = [];
+  previewData = [];
+  selectedShows.forEach(v => v.seasons.clear());
+  selectedMovies.clear();
+  renderTvSeasons(activeShow);
+  document.querySelectorAll('#movieResults .linkbtn').forEach(btn => btn.classList.remove('selected-item'));
+  updateTvSummary();
+  updateMovieSummary();
+  renderQueue();
+  setPreviewStatus('Idle.');
+}
+
+function markShowStates() {
+  document.querySelectorAll('#tvShows .linkbtn').forEach(btn => {
+    btn.classList.remove('selected-item', 'active-item');
+    const showName = btn.dataset.showName;
+    const data = selectedShows.get(showName);
+    if (data && data.seasons.size > 0) btn.classList.add('selected-item');
+    if (activeShow === showName) btn.classList.add('active-item');
+  });
+}
+
+function upsertTvQueueItem(showName, seasonName, posterUrl){
+  const idx = queueItems.findIndex(q => q.kind === 'tv' && q.show_name === showName && q.season_name === seasonName);
+  if (idx === -1) {
+    queueItems.push({
+      kind: 'tv',
+      show_name: showName,
+      season_name: seasonName,
+      label: `${showName} / ${seasonName}`,
+      poster_url: posterUrl || ''
+    });
+  }
+}
+
+function removeTvQueueItem(showName, seasonName){
+  queueItems = queueItems.filter(q => !(q.kind === 'tv' && q.show_name === showName && q.season_name === seasonName));
+}
+
+function renderTvSeasons(showName) {
+  const seasonsEl = document.getElementById('tvSeasons');
+  document.getElementById('activeShowLabel').textContent = showName || 'no show selected';
+  seasonsEl.innerHTML = '';
+  if (!showName || !selectedShows.has(showName)) return;
+  const data = selectedShows.get(showName);
+  (data.loadedSeasons || []).forEach(season => {
+    const li = document.createElement('li');
+    li.innerHTML = `<button type="button" class="linkbtn ${data.seasons.has(season) ? 'selected-item' : ''}">${season}</button>`;
+    const btn = li.querySelector('button');
+    btn.onclick = () => {
+      if (data.seasons.has(season)) {
+        data.seasons.delete(season);
+        btn.classList.remove('selected-item');
+        removeTvQueueItem(showName, season);
+      } else {
+        data.seasons.add(season);
+        btn.classList.add('selected-item');
+        upsertTvQueueItem(showName, season, data.poster_url || '');
+      }
+      previewData = [];
+      updateTvSummary();
+      renderQueue();
+      markShowStates();
+      setPreviewStatus('Idle.');
+    };
+    seasonsEl.appendChild(li);
+  });
+}
+
+async function loadSeasonsForShow(showName){
+  const status = document.getElementById('tvStatus');
+  status.textContent = 'Loading seasons...';
+  const rs = await fetch(`/api/prepare/tv/seasons?show=${encodeURIComponent(showName)}`);
+  const ds = await rs.json();
+  const data = selectedShows.get(showName);
+  if (data) data.loadedSeasons = ds.results || [];
+  status.textContent = data && data.loadedSeasons.length ? 'Select one or more seasons.' : 'No seasons found.';
+  renderTvSeasons(showName);
+}
+
+async function searchTvShows(){
+  const q = document.getElementById('tvQuery').value;
+  const status = document.getElementById('tvStatus');
+  const list = document.getElementById('tvShows');
+  list.innerHTML = '';
+  activeShow = null;
+  document.getElementById('tvSeasons').innerHTML = '';
+  document.getElementById('activeShowLabel').textContent = 'no show selected';
+  status.textContent = 'Searching...';
+  const r = await fetch(`/api/prepare/tv/search?q=${encodeURIComponent(q)}`);
+  const d = await r.json();
+  const results = d.results || [];
+  if (!results.length){
+    status.textContent = 'No results found.';
+    return;
+  }
+  status.textContent = `${results.length} result(s) found. Click a show, then choose seasons.`;
+  results.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'poster-card';
+    card.innerHTML = `${item.poster_url ? `<img src="${item.poster_url}" alt="">` : `<div class="poster-placeholder">No image</div>`}
+      <button type="button" class="linkbtn" data-show-name="${item.name}">${item.name}</button>`;
+    const btn = card.querySelector('button');
+    btn.onclick = async () => {
+      if (!selectedShows.has(item.name)) {
+        selectedShows.set(item.name, { poster_url: item.poster_url || '', seasons: new Set(), loadedSeasons: [] });
+      } else if (item.poster_url && !selectedShows.get(item.name).poster_url) {
+        selectedShows.get(item.name).poster_url = item.poster_url;
+      }
+      activeShow = item.name;
+      markShowStates();
+      if (!(selectedShows.get(item.name).loadedSeasons || []).length) {
+        await loadSeasonsForShow(item.name);
+      } else {
+        renderTvSeasons(item.name);
+        status.textContent = 'Select one or more seasons.';
+      }
+      updateTvSummary();
+      renderQueue();
+    };
+    list.appendChild(card);
+  });
+  markShowStates();
+  updateTvSummary();
+  renderQueue();
+}
+
+function upsertMovieQueueItem(movieName, posterUrl){
+  const idx = queueItems.findIndex(q => q.kind === 'movie' && q.movie_name === movieName);
+  if (idx === -1) {
+    queueItems.push({
+      kind: 'movie',
+      movie_name: movieName,
+      label: movieName,
+      poster_url: posterUrl || ''
+    });
+  }
+}
+
+function removeMovieQueueItemByName(movieName){
+  queueItems = queueItems.filter(q => !(q.kind === 'movie' && q.movie_name === movieName));
+}
+
+async function searchMovies(){
+  const q = document.getElementById('movieQuery').value;
+  const status = document.getElementById('movieStatus');
+  const list = document.getElementById('movieResults');
+  list.innerHTML = '';
+  status.textContent = 'Searching...';
+  const r = await fetch(`/api/prepare/movie/search?q=${encodeURIComponent(q)}`);
+  const d = await r.json();
+  const results = d.results || [];
+  if (!results.length){
+    status.textContent = 'No results found.';
+    return;
+  }
+  status.textContent = `${results.length} result(s) found. Click one or more movies to select them.`;
+  results.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'poster-card';
+    card.innerHTML = `${item.poster_url ? `<img src="${item.poster_url}" alt="">` : `<div class="poster-placeholder">No image</div>`}
+      <button type="button" class="linkbtn" data-movie-name="${item.name}">${item.name}</button>`;
+    const btn = card.querySelector('button');
+    btn.onclick = () => {
+      if (selectedMovies.has(item.name)) {
+        selectedMovies.delete(item.name);
+        btn.classList.remove('selected-item');
+        removeMovieQueueItemByName(item.name);
+      } else {
+        selectedMovies.set(item.name, { poster_url: item.poster_url || '' });
+        btn.classList.add('selected-item');
+        upsertMovieQueueItem(item.name, item.poster_url || '');
+      }
+      previewData = [];
+      updateMovieSummary();
+      renderQueue();
+      setPreviewStatus('Idle.');
+    };
+    list.appendChild(card);
+  });
+  updateMovieSummary();
+  renderQueue();
+}
+
+async function buildBatchPreview(){
+  const bracket_override = document.getElementById('bracketOverride').value;
+  if (!queueItems.length) return;
+  setPreviewStatus('Building queue preview...');
+  previewData = [];
+  renderQueue();
+
+  for (const item of queueItems) {
+    if (item.kind === 'tv') {
+      setPreviewStatus(`Building queue preview... TV ${previewData.length + 1} of ${queueItems.length}`);
+      const r = await fetch('/api/prepare/tv/preview', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({show_name: item.show_name, season_name: item.season_name, bracket_override})
+      });
+      previewData.push(await r.json());
+    } else {
+      setPreviewStatus(`Building queue preview... Movie ${previewData.length + 1} of ${queueItems.length}`);
+      const r = await fetch('/api/prepare/movie/preview', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({movie_name: item.movie_name, bracket_override})
+      });
+      previewData.push(await r.json());
+    }
+    renderQueue();
+  }
+  renderQueue();
+  setPreviewStatus(`Queue preview ready for ${previewData.length} item(s).`);
+}
+
+async function startBatchJobs(){
+  if (!previewData.length) return;
+  for (let i = 0; i < previewData.length; i++) {
+    const item = previewData[i];
+    const meta = queueItems[i];
+    if (meta.kind === 'tv') {
+      await fetch('/api/prepare/tv/start', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(item)
+      });
+    } else {
+      await fetch('/api/prepare/movie/start', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(item)
+      });
+    }
+  }
+  window.location.href = '/jobs';
+}
+
+document.getElementById('tabTvBtn').addEventListener('click', () => showPrepareTab('tv'));
+document.getElementById('tabMovieBtn').addEventListener('click', () => showPrepareTab('movie'));
+document.getElementById('searchTvBtn').addEventListener('click', searchTvShows);
+document.getElementById('searchMovieBtn').addEventListener('click', searchMovies);
+document.getElementById('previewBtn').addEventListener('click', buildBatchPreview);
+document.getElementById('clearQueueBtn').addEventListener('click', clearQueue);
+document.getElementById('startBtn').addEventListener('click', startBatchJobs);
+
+showPrepareTab('tv');
+updateTvSummary();
+updateMovieSummary();
+renderQueue();
+</script>
+{% endblock %}

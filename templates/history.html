@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Prepared History</h2>
+  <p><a href="{{ url_for('api_history_export') }}">Download CSV</a></p>
+  {% if history %}
+  <table>
+    <tr><th>ID</th><th>Type</th><th>Source</th><th>Destination</th><th>Size</th><th>Time</th><th>Bracket</th><th>End Tag</th><th>Date</th></tr>
+    {% for h in history %}
+    <tr>
+      <td>{{ h.id }}</td><td>{{ h.media_type }}</td>
+      <td><code>{{ h.source_path }}</code></td><td><code>{{ h.dest_path }}</code></td>
+      <td>{{ h.dest_bytes|humansize }}</td><td>{{ h.duration_seconds|humanduration }}</td><td><code>{{ h.chosen_bracket or '' }}</code></td><td><code>{{ h.end_tag or '' }}</code></td><td>{{ h.created_at }}</td>
+    </tr>
+    <tr><td colspan="9"><details><summary>Copied files / tags</summary><p><strong>Copied files:</strong></p><pre>{{ h.copied_files_json|prettyjson }}</pre><p><strong>Detected tags:</strong></p><pre>{{ h.detected_tags_json|prettyjson }}</pre></details></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>No history yet.</p>{% endif %}
+</section>
+{% endblock %}

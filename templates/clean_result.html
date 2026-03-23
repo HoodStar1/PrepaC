@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Clean Result</h2>
+  <p>This screen shows the full result of the most recent clean action.</p>
+  <div class="row">
+    <a class="tabbtn" href="{{ url_for('clean_page') }}">Back to Clean</a>
+    <a class="tabbtn" href="{{ url_for('history_clean_page') }}">Open Clean History</a>
+  </div>
+</section>
+
+<section class="card">
+  <h3>Summary</h3>
+  <div id="summaryBox"><p class="muted">Loading result...</p></div>
+</section>
+
+<section class="card">
+  <h3>Per-item details</h3>
+  <div id="resultBox"><p class="muted">Loading result...</p></div>
+</section>
+
+<script>
+function gb(v){
+  return ((v || 0) / (1024**3)).toFixed(2) + ' GB';
+}
+
+function render(){
+  const raw = sessionStorage.getItem('prepac_clean_result');
+  const summaryBox = document.getElementById('summaryBox');
+  const resultBox = document.getElementById('resultBox');
+
+  if (!raw){
+    summaryBox.innerHTML = '<p>No clean result data found.</p>';
+    resultBox.innerHTML = '<p>No clean result data found.</p>';
+    return;
+  }
+
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    summaryBox.innerHTML = '<p>Could not read clean result data.</p>';
+    resultBox.innerHTML = '<p>Could not read clean result data.</p>';
+    return;
+  }
+
+  summaryBox.innerHTML = `
+    <p><strong>Processed items:</strong> ${data.processed_count || 0}</p>
+    <p><strong>Plex libraries refreshed:</strong> ${data.refreshed_count || 0}</p>
+  `;
+
+  const results = data.results || [];
+  if (!results.length){
+    resultBox.innerHTML = '<p>No item results available.</p>';
+    return;
+  }
+
+  resultBox.innerHTML = results.map(r => {
+    const before = r.disk_free_before || [];
+    const after = r.disk_free_after || [];
+    return `
+      <article class="job">
+        <h4>${r.target_path || ''}</h4>
+        <p><strong>Media type:</strong> ${r.media_type || ''}</p>
+        <p><strong>Reason:</strong> ${r.reason || ''}</p>
+        <p><strong>Status:</strong> ${r.success ? 'Successful' : 'Failed'}</p>
+        <p><strong>Message:</strong> ${r.message || ''}</p>
+
+        <details open>
+          <summary>Disk free space before</summary>
+          ${before.length ? before.map(x => `<div><code>${x.mount_path}</code> — ${gb(x.free_bytes)} free</div>`).join('') : '<p>No disk info.</p>'}
+        </details>
+
+        <details open>
+          <summary>Disk free space after</summary>
+          ${after.length ? after.map(x => `<div><code>${x.mount_path}</code> — ${gb(x.free_bytes)} free</div>`).join('') : '<p>No disk info.</p>'}
+        </details>
+
+        <details>
+          <summary>Full result data</summary>
+          <pre>${JSON.stringify(r, null, 2)}</pre>
+        </details>
+      </article>
+    `;
+  }).join('');
+}
+
+render();
+</script>
+{% endblock %}

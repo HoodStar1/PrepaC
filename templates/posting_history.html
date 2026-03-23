@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Posting History</h2>
+  <p><a href="{{ url_for('api_posting_history_export') }}">Download CSV</a></p>
+  {% if jobs %}
+  <table>
+    <tr><th>Date</th><th>Job</th><th>Status</th><th>Provider</th><th>Size</th><th>NZB</th><th>Message</th></tr>
+    {% for j in jobs %}
+    <tr>
+      <td>{{ j.finished_at or j.created_at }}</td>
+      <td><code>{{ j.job_name }}</code></td>
+      <td>{{ j.status }}</td>
+      <td>{{ j.provider_used or '' }}</td>
+      <td>{{ '%.2f'|format((j.size_bytes or 0)/(1024**3)) }} GB</td>
+      <td><code>{{ j.nzb_path or '' }}</code></td>
+      <td>{{ j.message or '' }}</td>
+    </tr>
+    <tr>
+      <td colspan="7">
+        <details><summary>Details / Events</summary>
+          <p><strong>Packed root:</strong> <code>{{ j.packed_root }}</code></p>
+          <p><strong>Posted root:</strong> <code>{{ j.posted_root or '' }}</code></p>
+          <p><strong>Template:</strong> <code>{{ j.template_path or '' }}</code></p>
+          <p><strong>Header:</strong> <code>{{ j.header_value or '' }}</code></p>
+          <p><strong>Groups:</strong> <code>{{ j.groups_csv or '' }}</code></p>
+          <p><strong>From:</strong> <code>{{ j.from_header or '' }}</code></p>
+          <pre>{{ j.events|prettyjson }}</pre>
+        </details>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No posting history yet.</p>
+  {% endif %}
+</section>
+{% endblock %}
