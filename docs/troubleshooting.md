@@ -1,12 +1,12 @@
 # Troubleshooting
 
-## The app does not start
+## The app warns about Flask development server
 
-Check container logs and confirm all expected mounts exist.
+Use the included Dockerfile and startup script; they run Gunicorn.
 
 ## Posters or watched-state cleanup are not working
 
-Check Plex URL, Plex token, library names, and container-to-Plex network access.
+Check Plex URL, token, library names, and container-to-Plex network access.
 
 ## Posting does not start
 

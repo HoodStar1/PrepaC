@@ -9,6 +9,7 @@ import signal
 import atexit
 import time
 import requests
+import fcntl
 from flask import Flask, jsonify, redirect, render_template, request, url_for, flash, Response, session, stream_with_context
 from urllib.parse import urlencode
 
@@ -25,9 +26,9 @@ from app.plex_auth import create_pin, check_pin, list_servers_for_token, save_se
 from app.plex_notify import notify_after_clean
 from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
-from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs
+from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats
-from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event
+from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
@@ -711,19 +712,17 @@ def _prepare_has_auto_chain_event(job):
 def _packing_has_auto_chain_event(job):
     return any((ev.get("phase") == "auto_chain") for ev in (job.get("events") or []))
 
-def _has_any_packing_job_for_source(source_path):
+def _has_any_packing_job_for_source(source_path, prepared_finished_at=""):
     source_path = str(source_path or "")
-    for job in list_packing_history(5000):
-        if str(job.get("source_path", "")) == source_path and str(job.get("status", "")).lower() in {"queued", "running", "done"}:
-            return True
-    return False
+    if get_existing_active_packing_job_id(source_path):
+        return True
+    return not has_outdated_or_missing_successful_packing(source_path, prepared_finished_at)
 
-def _has_any_posting_job_for_packed_root(packed_root):
+def _has_any_posting_job_for_packed_root(packed_root, packed_finished_at=""):
     packed_root = str(packed_root or "")
-    for job in list_posting_history(5000):
-        if str(job.get("packed_root", "")) == packed_root and str(job.get("status", "")).lower() in {"queued", "running", "done"}:
-            return True
-    return False
+    if get_existing_active_posting_job_id(packed_root):
+        return True
+    return not has_outdated_or_missing_successful_posting(packed_root, packed_finished_at)
 
 def process_auto_chain_once():
     if APP_RUNTIME_STATE.get("draining"):
@@ -742,7 +741,8 @@ def process_auto_chain_once():
         dest_path = str(job.get("dest_path", "") or "").strip()
         if not dest_path:
             continue
-        if _has_any_packing_job_for_source(dest_path):
+        prepared_finished_at = str(job.get("finished_at") or job.get("created_at") or "")
+        if _has_any_packing_job_for_source(dest_path, prepared_finished_at):
             add_job_event(job["id"], "auto_chain", "Auto-chain: packing already exists for this prepared job", 100)
             continue
         start_packing_job_async(dest_path, settings)
@@ -758,7 +758,8 @@ def process_auto_chain_once():
         packed_root = str(job.get("output_root", "") or "").strip()
         if not packed_root:
             continue
-        if _has_any_posting_job_for_packed_root(packed_root):
+        packed_finished_at = str(job.get("finished_at") or job.get("created_at") or "")
+        if _has_any_posting_job_for_packed_root(packed_root, packed_finished_at):
             add_packing_event(job["id"], "auto_chain", "Auto-chain: posting already exists for this packed job", 100)
             continue
         start_posting_job_async(packed_root, settings)
@@ -771,6 +772,23 @@ def auto_chain_loop():
         except Exception:
             pass
         time.sleep(5)
+
+
+AUTO_CHAIN_LOCK_FILE = "/config/prepac_auto_chain.lock"
+AUTO_CHAIN_LOCK_HANDLE = None
+
+def start_auto_chain_thread_once():
+    global AUTO_CHAIN_LOCK_HANDLE
+    if AUTO_CHAIN_LOCK_HANDLE is not None:
+        return
+    try:
+        Path("/config").mkdir(parents=True, exist_ok=True)
+        AUTO_CHAIN_LOCK_HANDLE = open(AUTO_CHAIN_LOCK_FILE, "w")
+        fcntl.flock(AUTO_CHAIN_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        AUTO_CHAIN_LOCK_HANDLE = None
+        return
+    threading.Thread(target=auto_chain_loop, daemon=True).start()
 
 def reject_if_draining():
     if APP_RUNTIME_STATE.get("draining"):
@@ -813,7 +831,7 @@ def setup_page():
 
     return render_template("setup.html")
 
-threading.Thread(target=auto_chain_loop, daemon=True).start()
+start_auto_chain_thread_once()
 
 @app.route("/login", methods=["GET", "POST"])
 def login_page():
@@ -1503,7 +1521,14 @@ def api_clean_delete():
                     "details": dict(c.get("details", {}) or {}),
                 })
 
-        plex_refresh = {"ok": True, "refreshed": [], "deferred": True}
+        successful_candidates = [c for c, r in zip(effective_candidates, results) if r.get("success")]
+        if not dry_run and successful_candidates:
+            try:
+                plex_refresh = notify_after_clean(settings, successful_candidates)
+            except Exception as e:
+                plex_refresh = {"ok": False, "message": str(e), "refreshed": []}
+        else:
+            plex_refresh = {"ok": True, "refreshed": [], "skipped": True}
         http_status = 200 if any(r.get("success") for r in results) else 500
         return jsonify({"ok": any(r.get("success") for r in results), "results": results, "plex_refresh": plex_refresh}), http_status
     except Exception as e:

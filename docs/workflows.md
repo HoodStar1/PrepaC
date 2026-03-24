@@ -2,18 +2,16 @@
 
 ## Prepare
 
-Search local media folders, select TV seasons or movies, preview the queue, and start prepare jobs.
-
-Default release tag: **PrepaC** unless changed in Settings.
+Search TV and movie source folders, build a queue preview, and create jobs.
 
 ## Packing
 
-Scan the packing watch folder, select eligible jobs, and create packed output.
+Pack prepared jobs into RAR/PAR2 output.
 
 ## Posting
 
-Scan packed jobs, select them, and start provider-backed posting jobs.
+Use configured providers to upload packed jobs.
 
 ## Clean
 
-Preview clean candidates based on Plex watched state or previously prepared items. Use **Dry Run** to test safely before deleting anything.
+Preview candidates before deleting or recycling files.

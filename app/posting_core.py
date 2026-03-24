@@ -14,6 +14,7 @@ from collections import deque
 from pathlib import Path
 
 from app.secret_utils import resolve_secret
+from app.packing_jobs import list_packing_history
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.posting_jobs import (
     add_posting_event,
@@ -23,6 +24,8 @@ from app.posting_jobs import (
     has_successful_posting,
     start_posting,
     update_posting_job,
+    get_existing_active_posting_job_id,
+    has_outdated_or_missing_successful_posting,
 )
 
 GB = 1024 ** 3
@@ -134,6 +137,40 @@ def scan_posting_candidates(settings):
     results = []
     if not packed_root.exists():
         return results
+
+    packing_history = list_packing_history(5000)
+    latest_packing_finished = {}
+    for job in packing_history:
+        if str(job.get("status", "")).lower() != "done":
+            continue
+        packed_path = str(job.get("output_root", "") or "").strip()
+        finished_at = str(job.get("finished_at") or job.get("created_at") or "")
+        if packed_path and (packed_path not in latest_packing_finished or finished_at > latest_packing_finished[packed_path]):
+            latest_packing_finished[packed_path] = finished_at
+
+    for item in sorted(packed_root.iterdir()):
+        if not item.is_dir() or item.name == "output files":
+            continue
+        template = output_root / item.name / "template.txt"
+        if not template.exists():
+            continue
+        packed_path = str(item)
+        if get_existing_active_posting_job_id(packed_path):
+            continue
+        if not has_outdated_or_missing_successful_posting(packed_path, latest_packing_finished.get(packed_path, "")):
+            continue
+        size_bytes = sum(p.stat().st_size for p in item.rglob('*') if p.is_file())
+        info = parse_template_info(template)
+        results.append({
+            "job_name": item.name,
+            "packed_root": packed_path,
+            "output_files_root": str(output_root / item.name),
+            "template_path": str(template),
+            "size_bytes": size_bytes,
+            "header": info.get("header", ""),
+            "password_present": bool(info.get("password")),
+        })
+    return results
     for item in sorted(packed_root.iterdir()):
         if not item.is_dir() or item.name == "output files":
             continue

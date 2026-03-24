@@ -5,6 +5,9 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 def create_packing_job(source_path, job_name, output_root, output_files_root):
+    existing_id = get_existing_active_packing_job_id(source_path)
+    if existing_id:
+        return existing_id
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
         "INSERT INTO packing_jobs(source_path, job_name, output_root, output_files_root, status, created_at) VALUES (?, ?, ?, ?, 'queued', ?)",
@@ -13,6 +16,65 @@ def create_packing_job(source_path, job_name, output_root, output_files_root):
     job_id = cur.lastrowid
     conn.commit(); conn.close()
     return job_id
+
+
+
+def get_existing_active_packing_job_id(source_path):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM packing_jobs WHERE source_path=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1", (source_path,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+def latest_successful_packing_finished_at(source_path):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT finished_at FROM packing_jobs WHERE source_path=? AND status='done' ORDER BY id DESC LIMIT 1", (source_path,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+def has_outdated_or_missing_successful_packing(source_path, prepared_finished_at=""):
+    latest_pack = latest_successful_packing_finished_at(source_path)
+    if not latest_pack:
+        return True
+    if not prepared_finished_at:
+        return False
+    try:
+        return prepared_finished_at > latest_pack
+    except Exception:
+        return prepared_finished_at != latest_pack
+
+def count_running_packing_jobs():
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status='running'")
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0] or 0)
+
+
+
+def try_claim_packing_slot(job_id, max_jobs):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status='running'")
+        running = int(cur.fetchone()[0] or 0)
+        if running >= int(max_jobs):
+            conn.rollback()
+            conn.close()
+            return False
+        cur.execute("UPDATE packing_jobs SET status='running', started_at=? WHERE id=? AND status='queued'", (now(), job_id))
+        claimed = cur.rowcount == 1
+        conn.commit()
+        conn.close()
+        return claimed
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        return False
 
 def update_packing_job(job_id, **fields):
     if not fields:

@@ -1,39 +1,21 @@
 # PrepaC
 
-PrepaC is a self-hosted Docker application for media workflow automation. It helps users prepare media releases, pack them into RAR/PAR2 jobs, post them with Nyuu, and clean up media afterwards through a browser-based interface.
+PrepaC is a self-hosted Docker application for media workflow automation. It helps you prepare media releases, pack them into RAR/PAR2 jobs, post them with Nyuu, and clean up media afterwards.
 
-## Features
+**Current release:** PrepaC v1.0.0 (Build 2026.03.23-2117)
 
-- **Prepare** TV, movie, and YouTube source content into structured workflow folders
+## Main Features
+
+- **Prepare** TV, movie, and YouTube source content into structured workflow-ready folders
 - **Pack** prepared jobs into RAR + PAR2 output sets
 - **Post** packed jobs with Nyuu using one or more provider profiles
 - **Clean** fully played or previously prepared content
-- **Track** job progress, history, and summaries from the web UI
-- **Configure** paths, Plex, provider settings, and workflow behavior from the Settings page
+- **Track** job progress, history, and summaries from a browser-based UI
+- **Configure** paths, Plex, posting providers, and workflow behavior from the Settings page
 - **Authenticate** with a built-in first-run admin setup flow
-- **Help** users with a built-in Help section inside the app
-
-## Runtime
-
-PrepaC runs behind **Gunicorn** in production.
-
-Default Gunicorn behavior:
-- workers = `(CPU cores × 2) + 1`
-- threads scale by host size
-- timeout defaults to `120`
-
-Supported override environment variables:
-- `GUNICORN_WORKERS`
-- `GUNICORN_THREADS`
-- `GUNICORN_TIMEOUT`
-- `GUNICORN_GRACEFUL_TIMEOUT`
-- `GUNICORN_KEEPALIVE`
-- `GUNICORN_BIND`
-- `GUNICORN_LOG_LEVEL`
+- **Reference built-in help** from the in-app Help section
 
 ## Quick Start
-
-### Docker Compose
 
 ```yaml
 services:
@@ -48,6 +30,7 @@ services:
       - ./data/movies:/media/movies
       - ./data/youtube:/media/youtube
       - ./data/destination:/media/dest
+      - /mnt:/host_mnt
     restart: unless-stopped
 ```
 
@@ -57,70 +40,47 @@ Then open:
 http://localhost:1234
 ```
 
-## Required Mounts
+## Production Runtime
 
-PrepaC expects these container paths:
+PrepaC now starts behind **Gunicorn** instead of Flask's development server.
 
-- `/config`
-- `/media/tv`
-- `/media/movies`
-- `/media/youtube`
-- `/media/dest`
+### Default Gunicorn behavior
 
-## First Run
+The included startup script auto-tunes to the host:
 
-1. Open the application in your browser.
-2. Create the initial admin account.
-3. Configure source and destination paths in **Settings**.
-4. Optionally connect Plex for posters and watched-state cleanup.
-5. Configure posting providers before using the Posting module.
+- `workers = (CPU cores × 2) + 1`
+- threads scale by host CPU count
+- timeout defaults to `120`
 
-## Core Workflow
+Optional overrides:
+- `GUNICORN_WORKERS`
+- `GUNICORN_THREADS`
+- `GUNICORN_TIMEOUT`
+- `GUNICORN_GRACEFUL_TIMEOUT`
+- `GUNICORN_KEEPALIVE`
+- `GUNICORN_BIND`
+- `GUNICORN_LOG_LEVEL`
 
-```text
-Prepare → Packing → Posting → Clean
-```
-
-## Settings Notes
+## Notes
 
 - Default prepare end tag: **PrepaC**
 - `packing_freeimage_api_key` is for **freeimage.host** thumbnail uploads during packing
+- It is **not** a TMDB key
+- Built-in end-user guidance is available at **Help**
 
-## In-App Help
+## Documentation
 
-The application includes a Help section that covers:
+- In-app: **Help**
+- Static docs: `/docs`
+- MkDocs config: `mkdocs.yml`
 
-- Getting Started
-- Prepare
-- Packing
-- Posting
-- Clean
-- Settings
-- Operations
 
-## Static Documentation
+## Final packaging note
 
-This repository also includes docs for GitHub or static hosting:
+This build uses a proper Python package layout for Gunicorn:
 
-- `docs/index.md`
-- `docs/setup.md`
-- `docs/settings.md`
-- `docs/workflows.md`
-- `docs/operations.md`
-- `docs/troubleshooting.md`
-- `docs/faq.md`
+- `app/__init__.py` included
+- internal imports rewritten to `from app...`
+- Gunicorn target: `app.app:app`
 
-`mkdocs.yml` is included for static documentation hosting.
-
-## Project Structure
-
-```text
-app/         Application code
-templates/   HTML templates
-static/      CSS and static assets
-docs/        Repository documentation
-```
-
-## License
-
-This repository includes the MIT License.
+Current release: **PrepaC v1.0.0 (Build 2026.03.23-2211)**

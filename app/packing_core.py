@@ -18,6 +18,7 @@ from PIL import Image, ImageOps, ImageDraw, ImageFont
 
 from app.media_probe import detect_tags, build_bracket_from_detected
 from app.db import load_settings
+from app.jobs import list_jobs
 from app.secret_utils import resolve_secret
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.packing_jobs import (
@@ -28,6 +29,10 @@ from app.packing_jobs import (
     list_packing_jobs,
     start_packing,
     update_packing_job,
+    get_existing_active_packing_job_id,
+    has_outdated_or_missing_successful_packing,
+    count_running_packing_jobs,
+    try_claim_packing_slot,
 )
 
 VIDEO_EXTS = {".mkv",".mp4",".avi",".mov",".m4v",".ts",".m2ts",".wmv",".mpg",".mpeg"}
@@ -70,6 +75,44 @@ def scan_watch_folder(settings):
     jobs = []
     if not watch.exists():
         return jobs
+
+    prepare_jobs = list_jobs(5000)
+    latest_prepare_finished = {}
+    for job in prepare_jobs:
+        if str(job.get("status", "")).lower() != "done":
+            continue
+        dest_path = str(job.get("dest_path", "") or "").strip()
+        if not dest_path:
+            continue
+        finished_at = str(job.get("finished_at") or job.get("created_at") or "")
+        if dest_path not in latest_prepare_finished or finished_at > latest_prepare_finished[dest_path]:
+            latest_prepare_finished[dest_path] = finished_at
+
+    for p in sorted([x for x in watch.iterdir() if x.is_dir()]):
+        if p.name.startswith("_packed"):
+            continue
+        source_path = str(p)
+        if get_existing_active_packing_job_id(source_path):
+            continue
+        if not has_outdated_or_missing_successful_packing(source_path, latest_prepare_finished.get(source_path, "")):
+            continue
+        size = folder_size(p)
+        rep = largest_video(p)
+        probe = detect_tags(str(rep)) if rep else {}
+        chosen_bracket = build_bracket_from_detected(probe) if probe else ""
+        jobs.append({
+            "source_path": source_path,
+            "job_name": p.name,
+            "size_bytes": size,
+            "size_gb": round(size / GB, 2),
+            "largest_video": str(rep) if rep else "",
+            "detected_tags": probe,
+            "chosen_bracket": chosen_bracket,
+            "estimated_volume": choose_volume_size(size)[0],
+            "estimated_parts": choose_volume_size(size)[1],
+            "estimated_par2_percent": choose_par2_percent(size),
+        })
+    return jobs
     for p in sorted([x for x in watch.iterdir() if x.is_dir()]):
         if p.name.startswith("_packed"):
             continue
@@ -742,7 +785,9 @@ def run_packing_job(job_id, source_path, settings):
     output_files_root.mkdir(parents=True, exist_ok=True)
 
     try:
-        start_packing(job_id)
+        current_job = next((j for j in list_packing_jobs(5000) if int(j.get("id", 0)) == int(job_id)), None)
+        if not current_job or str(current_job.get("status", "")).lower() != "running":
+            start_packing(job_id)
         add_packing_event(job_id, "stability", "Checking folder stability...", 2)
         delay = int(settings.get("packing_stability_delay","30") or 30)
         size1 = folder_size(source)
@@ -944,24 +989,17 @@ def start_packing_job_async(source_path, settings):
     import threading
 
     def _runner():
-        global PACKING_ACTIVE_COUNT
         while True:
             current_settings = load_settings()
             try:
                 max_jobs = max(1, int(current_settings.get("packing_max_concurrent_jobs", settings.get("packing_max_concurrent_jobs","1")) or 1))
             except Exception:
                 max_jobs = 1
-            with PACKING_SLOT_LOCK:
-                if PACKING_ACTIVE_COUNT < max_jobs:
-                    PACKING_ACTIVE_COUNT += 1
-                    break
+            if try_claim_packing_slot(job_id, max_jobs):
+                break
             add_packing_event(job_id, "queued", f"Waiting for packing slot ({max_jobs} max concurrent jobs).", 0)
             time.sleep(1)
-        try:
-            run_packing_job(job_id, str(source), load_settings())
-        finally:
-            with PACKING_SLOT_LOCK:
-                PACKING_ACTIVE_COUNT = max(0, PACKING_ACTIVE_COUNT - 1)
+        run_packing_job(job_id, str(source), load_settings())
 
     threading.Thread(target=_runner, daemon=True).start()
     return job_id

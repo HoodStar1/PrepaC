@@ -10,7 +10,7 @@ def refresh_library(url, token, section_key):
 
 def notify_after_clean(settings, candidates):
     url = (settings.get("plex_url") or "").strip()
-    token = (settings.get("plex_token") or "").strip()
+    token = (resolve_secret("plex_token", settings) or settings.get("plex_token") or "").strip()
     if not url or not token:
         return {"ok": False, "message": "No Plex URL/token configured.", "refreshed": []}
 
@@ -29,8 +29,12 @@ def notify_after_clean(settings, candidates):
             continue
         key = get_library_key(url, token, lib_name)
         if key:
-            refresh_library(url, token, key)
-            refreshed.append({"media_type": media_type, "library": lib_name, "section_key": key})
-            seen.add(lib_name)
+            try:
+                refresh_library(url, token, key)
+                refreshed.append({"media_type": media_type, "library": lib_name, "section_key": key})
+                seen.add(lib_name)
+            except Exception as e:
+                refreshed.append({"media_type": media_type, "library": lib_name, "section_key": key, "error": str(e)})
 
-    return {"ok": True, "refreshed": refreshed}
+    ok = any("error" not in r for r in refreshed)
+    return {"ok": ok, "refreshed": refreshed}

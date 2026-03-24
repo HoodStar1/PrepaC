@@ -1,5 +1,5 @@
 site_name: PrepaC
-site_description: PrepaC documentation
+site_description: PrepaC user documentation
 theme:
   name: material
 nav:

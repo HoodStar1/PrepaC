@@ -1,20 +1,10 @@
 # Operations
 
-PrepaC runs behind Gunicorn.
+PrepaC runs behind Gunicorn using a host-aware startup script.
 
 ## Default runtime behavior
 
 - workers scale from CPU count
 - threads scale by host size
 - settings persist in `/config`
-- use a normal Docker restart policy for resilience
-
-## Useful overrides
-
-- `GUNICORN_WORKERS`
-- `GUNICORN_THREADS`
-- `GUNICORN_TIMEOUT`
-- `GUNICORN_GRACEFUL_TIMEOUT`
-- `GUNICORN_KEEPALIVE`
-- `GUNICORN_BIND`
-- `GUNICORN_LOG_LEVEL`
+- use normal Docker restart policies for resilience

@@ -5,6 +5,9 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 def create_posting_job(job_name, packed_root, output_files_root, template_path, size_bytes=0):
+    existing_id = get_existing_active_posting_job_id(packed_root)
+    if existing_id:
+        return existing_id
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
         "INSERT INTO posting_jobs(job_name, packed_root, output_files_root, template_path, size_bytes, status, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
@@ -13,6 +16,33 @@ def create_posting_job(job_name, packed_root, output_files_root, template_path, 
     job_id = cur.lastrowid
     conn.commit(); conn.close()
     return job_id
+
+
+
+def get_existing_active_posting_job_id(packed_root):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM posting_jobs WHERE packed_root=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1", (packed_root,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+def latest_successful_posting_finished_at(packed_root):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT finished_at FROM posting_jobs WHERE packed_root=? AND status='done' ORDER BY id DESC LIMIT 1", (packed_root,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+def has_outdated_or_missing_successful_posting(packed_root, packed_finished_at=""):
+    latest_post = latest_successful_posting_finished_at(packed_root)
+    if not latest_post:
+        return True
+    if not packed_finished_at:
+        return False
+    try:
+        return packed_finished_at > latest_post
+    except Exception:
+        return packed_finished_at != latest_post
 
 def update_posting_job(job_id, **fields):
     if not fields:
