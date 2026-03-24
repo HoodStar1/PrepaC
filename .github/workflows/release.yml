@@ -1,0 +1,79 @@
+name: Release PrepaC
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Generate build metadata
+        id: meta
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME#v}"
+          BUILD_NUMBER="$(date -u +'%Y%m%d.%H%M')"
+          BUILD_DISPLAY="$(date -u +'%Y.%m.%d-%H%M')"
+          ZIP_NAME="PrepaC_v${TAG_NAME}_build_${BUILD_NUMBER/./_}.zip"
+
+          {
+            echo "tag_name=$TAG_NAME"
+            echo "build_number=$BUILD_NUMBER"
+            echo "build_display=$BUILD_DISPLAY"
+            echo "zip_name=$ZIP_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update app/version.py for this release
+        shell: bash
+        run: |
+          cat > app/version.py <<EOF
+          APP_NAME = "PrepaC"
+          APP_VERSION = "${{ steps.meta.outputs.tag_name }}"
+          BUILD_NUMBER = "${{ steps.meta.outputs.build_number }}"
+          FULL_VERSION = f"{APP_VERSION}+{BUILD_NUMBER}"
+          DISPLAY_VERSION = "PrepaC v${{ steps.meta.outputs.tag_name }} (Build ${{ steps.meta.outputs.build_display }})"
+          BUILD_DISPLAY = "${{ steps.meta.outputs.build_display }}"
+          EOF
+
+      - name: Create release zip
+        shell: bash
+        run: |
+          zip -r "${{ steps.meta.outputs.zip_name }}" . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "__pycache__/*" \
+            -x "*.pyc" \
+            -x "*.pyo" \
+            -x "*.db" \
+            -x "*.sqlite" \
+            -x "*.sqlite3" \
+            -x "config/*" \
+            -x ".venv/*" \
+            -x "venv/*" \
+            -x "env/*" \
+            -x ".pytest_cache/*" \
+            -x ".mypy_cache/*" \
+            -x ".ruff_cache/*" \
+            -x ".DS_Store"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: PrepaC v${{ steps.meta.outputs.tag_name }}
+          generate_release_notes: true
+          files: ${{ steps.meta.outputs.zip_name }}
