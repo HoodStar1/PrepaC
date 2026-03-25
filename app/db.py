@@ -81,7 +81,10 @@ DEFAULT_SETTINGS = {
     "auth_username": "",
     "auth_password_hash": "",
     "auth_recovery_hash": "",
-    "workflow_auto_chain_enabled": "false"
+    "workflow_auto_chain_enabled": "false",
+    "github_repo_owner": "HoodStar1",
+    "github_repo_name": "PrepaC",
+    "update_check_enabled": "true"
 }
 
 def get_conn():

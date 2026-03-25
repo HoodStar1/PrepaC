@@ -592,3 +592,18 @@ pre{
     padding-bottom:10px;
   }
 }
+
+
+.update-badge{
+  display:inline-flex;
+  align-items:center;
+  border:1px solid rgba(217,164,65,.38);
+  background:linear-gradient(180deg, rgba(217,164,65,.24), rgba(217,164,65,.12));
+  color:#fff7e7;
+  padding:10px 14px;
+  border-radius:999px;
+  font-weight:700;
+}
+.update-badge:hover{
+  filter:brightness(1.05);
+}

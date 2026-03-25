@@ -27,6 +27,30 @@ def finish_job(job_id, success=True):
     cur.execute("UPDATE prepare_jobs SET status=?, finished_at=? WHERE id=?", ("done" if success else "failed", now(), job_id))
     conn.commit(); conn.close()
 
+
+
+def try_claim_prepare_slot(job_id, max_jobs):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT COUNT(*) FROM prepare_jobs WHERE status='running'")
+        running = int(cur.fetchone()[0] or 0)
+        if running >= int(max_jobs):
+            conn.rollback()
+            conn.close()
+            return False
+        cur.execute("UPDATE prepare_jobs SET status='running' WHERE id=? AND status='queued'", (job_id,))
+        claimed = cur.rowcount == 1
+        conn.commit(); conn.close()
+        return claimed
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        return False
+
 def list_jobs(limit=20):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM prepare_jobs ORDER BY id DESC LIMIT ?", (limit,))

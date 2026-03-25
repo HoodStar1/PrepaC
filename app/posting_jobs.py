@@ -63,6 +63,44 @@ def add_posting_event(job_id, phase, message, percent=None):
     cur.execute("UPDATE posting_jobs SET phase=?, percent=?, message=? WHERE id=?", (phase, percent, message, job_id))
     conn.commit(); conn.close()
 
+
+
+def count_running_posting_jobs():
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM posting_jobs WHERE status='running'")
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0] or 0)
+
+def try_claim_posting_provider(job_id, provider_name):
+    provider_name = str(provider_name or "").strip()
+    if not provider_name:
+        return False
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT COUNT(*) FROM posting_jobs WHERE status='running' AND provider_used=?", (provider_name,))
+        running = int(cur.fetchone()[0] or 0)
+        if running > 0:
+            conn.rollback()
+            conn.close()
+            return False
+        cur.execute(
+            "UPDATE posting_jobs SET status='running', started_at=?, provider_used=? WHERE id=? AND status='queued'",
+            (now(), provider_name, job_id),
+        )
+        claimed = cur.rowcount == 1
+        conn.commit()
+        conn.close()
+        return claimed
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        return False
+
 def start_posting(job_id, provider_used=None):
     fields = {"status":"running", "started_at":now()}
     if provider_used:

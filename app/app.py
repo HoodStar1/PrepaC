@@ -4,6 +4,7 @@ import io
 import os
 import pathlib
 import json
+import re
 import threading
 import signal
 import atexit
@@ -14,7 +15,7 @@ from flask import Flask, jsonify, redirect, render_template, request, url_for, f
 from urllib.parse import urlencode
 
 from app.db import init_db, load_settings, save_settings, get_conn
-from app.jobs import create_job, add_job_event, list_jobs, interrupt_running_prepare_jobs
+from app.jobs import create_job, add_job_event, list_jobs, interrupt_running_prepare_jobs, try_claim_prepare_slot
 from app.history_db import list_history, delete_prepared_by_source_path, delete_prepared_by_id
 from app.clean_actions import list_clean_actions
 from app.prepare_tv import search_shows, list_seasons, preview_tv
@@ -26,7 +27,7 @@ from app.plex_auth import create_pin, check_pin, list_servers_for_token, save_se
 from app.plex_notify import notify_after_clean
 from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
-from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing
+from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats
 from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
@@ -306,9 +307,8 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
             max_jobs = max(1, int(current.get("prepare_max_concurrent_jobs", settings.get("prepare_max_concurrent_jobs", "1")) or 1))
         except Exception:
             max_jobs = 1
-        with PREPARE_QUEUE_LOCK:
-            if _prepare_running_count() < max_jobs:
-                break
+        if try_claim_prepare_slot(job_id, max_jobs):
+            break
         add_job_event(job_id, "queued", f"Waiting for prepare slot ({max_jobs} max concurrent jobs).", 0)
         time.sleep(1)
     if media_type == "tv":
@@ -684,6 +684,117 @@ def api_version():
         "display_version": DISPLAY_VERSION,
     })
 
+
+
+UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+def _semver_tuple(version_text):
+    raw = str(version_text or "").strip().lower()
+    if raw.startswith("v"):
+        raw = raw[1:]
+    parts = raw.split(".")
+    nums = []
+    for part in parts[:3]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        nums.append(int(digits or 0))
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+def _github_release_config(settings=None):
+    settings = settings or load_settings()
+    owner = (settings.get("github_repo_owner") or "HoodStar1").strip()
+    repo = (settings.get("github_repo_name") or "PrepaC").strip()
+    return owner, repo
+
+def _update_cache_file():
+    p = pathlib.Path("/config/update_check_cache.json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _load_update_cache():
+    p = _update_cache_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_update_cache(payload):
+    try:
+        _update_cache_file().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def check_latest_release(force=False):
+    settings = load_settings()
+    owner, repo = _github_release_config(settings)
+    cache = _load_update_cache()
+    now_ts = int(time.time())
+    if not force and cache.get("checked_at_epoch") and now_ts - int(cache.get("checked_at_epoch", 0)) < UPDATE_CACHE_TTL_SECONDS:
+        return cache
+
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "PrepaC-UpdateChecker"}
+    current_version = APP_VERSION
+    payload = {
+        "ok": False,
+        "current_version": current_version,
+        "current_display": DISPLAY_VERSION,
+        "latest_version": current_version,
+        "latest_tag": f"v{current_version}",
+        "update_available": False,
+        "release_url": "",
+        "asset_name": "",
+        "asset_url": "",
+        "checked_at_epoch": now_ts,
+        "checked_at_display": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+    }
+    try:
+        r = requests.get(api_url, headers=headers, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        latest_tag = str(data.get("tag_name") or f"v{current_version}")
+        latest_version = latest_tag[1:] if latest_tag.startswith("v") else latest_tag
+        assets = data.get("assets") or []
+        preferred_asset = next((a for a in assets if str(a.get("name", "")).lower().endswith(".zip") and "source code" not in str(a.get("name", "")).lower()), None)
+        payload.update({
+            "ok": True,
+            "latest_version": latest_version,
+            "latest_tag": latest_tag,
+            "update_available": _semver_tuple(latest_version) > _semver_tuple(current_version),
+            "release_url": data.get("html_url") or "",
+            "asset_name": (preferred_asset or {}).get("name", ""),
+            "asset_url": (preferred_asset or {}).get("browser_download_url", "") or (data.get("html_url") or ""),
+        })
+    except Exception as e:
+        payload["error"] = str(e)
+
+    _save_update_cache(payload)
+    return payload
+
+
+
+@app.route("/api/version/check")
+def api_version_check():
+    settings = load_settings()
+    force = request.args.get("force") in {"1", "true", "yes"}
+    if str(settings.get("update_check_enabled", "true")).lower() != "true" and not force:
+        return jsonify({
+            "ok": True,
+            "current_version": APP_VERSION,
+            "current_display": DISPLAY_VERSION,
+            "latest_version": APP_VERSION,
+            "latest_tag": f"v{APP_VERSION}",
+            "update_available": False,
+            "disabled": True,
+            "release_url": "",
+            "asset_name": "",
+            "asset_url": "",
+        })
+    return jsonify(check_latest_release(force=force))
+
 @app.route("/health")
 def health_page():
     healthy, payload = _evaluate_health_state()
@@ -782,7 +893,7 @@ def start_auto_chain_thread_once():
     if AUTO_CHAIN_LOCK_HANDLE is not None:
         return
     try:
-        Path("/config").mkdir(parents=True, exist_ok=True)
+        pathlib.Path("/config").mkdir(parents=True, exist_ok=True)
         AUTO_CHAIN_LOCK_HANDLE = open(AUTO_CHAIN_LOCK_FILE, "w")
         fcntl.flock(AUTO_CHAIN_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except Exception:
@@ -989,7 +1100,7 @@ def clean_logs_page():
 def api_settings_save():
     current = load_settings()
     data = dict(current)
-    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_randomizer_file","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","auth_username"]:
+    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_randomizer_file","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","auth_username","github_repo_owner","github_repo_name"]:
         if k in request.form:
             incoming = request.form.get(k, current.get(k, "")).strip()
             if k in SECRET_SPECS and incoming.startswith("********"):
@@ -1008,6 +1119,7 @@ def api_settings_save():
     data["posting_provider2_enabled"] = "true" if request.form.get("posting_provider2_enabled") else "false"
     data["posting_provider2_ssl"] = "true" if request.form.get("posting_provider2_ssl") else "false"
     data["workflow_auto_chain_enabled"] = "true" if request.form.get("workflow_auto_chain_enabled") else "false"
+    data["update_check_enabled"] = "true" if request.form.get("update_check_enabled") else "false"
     save_settings(data)
     flash("Settings saved.", "success")
     return redirect(url_for("settings_page"))

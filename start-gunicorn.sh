@@ -31,4 +31,15 @@ MAX_REQUESTS_JITTER="${GUNICORN_MAX_REQUESTS_JITTER:-100}"
 BIND="${GUNICORN_BIND:-0.0.0.0:1234}"
 LOG_LEVEL="${GUNICORN_LOG_LEVEL:-info}"
 
-exec gunicorn   --worker-class gthread   --workers "$WORKERS"   --threads "$THREADS"   --bind "$BIND"   --timeout "$TIMEOUT"   --graceful-timeout "$GRACEFUL_TIMEOUT"   --keep-alive "$KEEPALIVE"   --max-requests "$MAX_REQUESTS"   --max-requests-jitter "$MAX_REQUESTS_JITTER"   --log-level "$LOG_LEVEL"   app.app:app
+exec gunicorn \
+  --worker-class gthread \
+  --workers "$WORKERS" \
+  --threads "$THREADS" \
+  --bind "$BIND" \
+  --timeout "$TIMEOUT" \
+  --graceful-timeout "$GRACEFUL_TIMEOUT" \
+  --keep-alive "$KEEPALIVE" \
+  --max-requests "$MAX_REQUESTS" \
+  --max-requests-jitter "$MAX_REQUESTS_JITTER" \
+  --log-level "$LOG_LEVEL" \
+  app.app:app

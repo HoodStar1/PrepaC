@@ -21,6 +21,7 @@ from app.posting_jobs import (
     create_posting_job,
     finish_posting,
     get_running_provider_names,
+    try_claim_posting_provider,
     has_successful_posting,
     start_posting,
     update_posting_job,
@@ -340,19 +341,19 @@ def wait_for_provider(settings, size_bytes, job_id):
     provider2 = provider_config(settings, 2)
     size_limit_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 25)
     while True:
-        running = set(get_running_provider_names())
-        if provider1["enabled"] and provider1["name"] not in running:
-            return provider1
-        if (
-            provider2["enabled"]
-            and provider2["name"] not in running
-            and size_bytes < size_limit_gb * GB
-        ):
-            return provider2
-        update_posting_job(job_id, status="queued")
+        candidates = []
+        if provider1["enabled"]:
+            candidates.append(provider1)
+        if provider2["enabled"] and size_bytes < size_limit_gb * GB:
+            candidates.append(provider2)
+
+        for provider in candidates:
+            if try_claim_posting_provider(job_id, provider["name"]):
+                return provider
+
+        update_posting_job(job_id, status="queued", provider_used="")
         add_posting_event(job_id, "queued", "Waiting for an available posting provider", None)
         time.sleep(5)
-
 
 def build_nyuu_command(job_name, packed_root: Path, nzb_path: Path, header: str, password: str, groups_csv: str, from_header: str, provider: dict, settings):
     comment = settings.get("posting_comment", "").strip()
@@ -628,7 +629,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
 
     try:
         provider = wait_for_provider(settings, size_bytes, job_id)
-        start_posting(job_id, provider_used=provider["name"])
+        update_posting_job(job_id, provider_used=provider["name"])
         add_posting_event(job_id, "prepare", f"Using {provider['name']} for posting", 5)
 
         info = parse_template_info(template_path)
@@ -735,6 +736,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         if packed_root.exists():
             shutil.rmtree(packed_root)
 
+        update_posting_job(job_id, provider_used=provider["name"])
         finish_posting(job_id, True, "Posting complete")
         add_posting_event(job_id, "complete", "Posting complete", 100)
         # keep live output briefly available; stats remain for UI/history
@@ -747,6 +749,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
                 logf.write(str(e) + "\n")
         except Exception:
             pass
+        update_posting_job(job_id, provider_used="")
         finish_posting(job_id, False, str(e))
         add_posting_event(job_id, "failed", str(e), None)
 def start_posting_job_async(packed_root, settings):

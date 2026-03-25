@@ -48,6 +48,7 @@ def _apply_open_permissions_recursive(root_path):
 def run_tv_prepare(job_id, settings, payload):
     source_path = Path(payload["source_path"]); dest_path = Path(payload["dest_path"]); files = [Path(p) for p in payload["video_files"]]
     try:
+        # status may already be atomically claimed as running
         set_job_status(job_id, "running", str(dest_path))
         add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
         dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
@@ -74,6 +75,7 @@ def run_tv_prepare(job_id, settings, payload):
 def run_movie_prepare(job_id, settings, payload):
     source_file = Path(payload["source_file"]); source_path = Path(payload["source_path"]); dest_path = Path(payload["dest_path"])
     try:
+        # status may already be atomically claimed as running
         set_job_status(job_id, "running", str(dest_path))
         add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
         dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)

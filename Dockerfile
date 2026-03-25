@@ -1,5 +1,8 @@
 FROM node:20.20.1-bookworm AS nyuu-builder
 
+ARG NODE_GYP_VERSION=12.2.0
+ARG NYUU_VERSION=0.4.2
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
@@ -8,11 +11,13 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g node-gyp \
-    && npm install -g nyuu --unsafe-perm
+RUN npm install -g "node-gyp@${NODE_GYP_VERSION}" \
+    && npm install -g "nyuu@${NYUU_VERSION}" --unsafe-perm
 
 
 FROM debian:bookworm-slim AS par2-builder
+
+ARG PAR2_TAG=v1.2.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -26,7 +31,7 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth=1 https://github.com/animetosho/par2cmdline-turbo.git /tmp/par2cmdline-turbo \
+RUN git clone --branch "${PAR2_TAG}" --depth=1 https://github.com/animetosho/par2cmdline-turbo.git /tmp/par2cmdline-turbo \
     && cd /tmp/par2cmdline-turbo \
     && (./automake.sh || autoreconf -fi) \
     && ./configure --prefix=/usr/local \
@@ -43,6 +48,9 @@ ENV PYTHONUNBUFFERED=1
 ENV PIP_PREFER_BINARY=1
 
 WORKDIR /app
+
+ARG RAR_URL=https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz
+ARG RAR_SHA256=d3e7fba3272385b1d0255ee332a1e8c1a6779bb5a5ff9d4d8ac2be846e49ca46
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -67,7 +75,7 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy exact Node runtime and Nyuu install from builder to avoid native addon ABI mismatch.
+# Copy exact Node runtime and Nyuu install from builder to avoid ABI mismatch.
 COPY --from=nyuu-builder /usr/local/bin/node /usr/local/bin/node
 RUN ln -sf /usr/local/bin/node /usr/local/bin/nodejs
 COPY --from=nyuu-builder /usr/local/lib/node_modules/nyuu /usr/local/lib/node_modules/nyuu
@@ -77,18 +85,19 @@ RUN ln -sf /usr/local/lib/node_modules/nyuu/bin/nyuu.js /usr/local/bin/nyuu
 # Copy par2 binary from dedicated builder stage.
 COPY --from=par2-builder /usr/local/bin/par2 /usr/local/bin/par2
 
-COPY rarlinux-x64-720.tar.gz /tmp/rarlinux-x64-720.tar.gz
-RUN cd /tmp \
-    && tar -xzf rarlinux-x64-720.tar.gz \
-    && cp rar/rar /usr/local/bin/rar \
+# Download official RAR binary at build time instead of committing the tarball.
+RUN curl -L --retry 3 --retry-delay 2 "${RAR_URL}" -o /tmp/rarlinux.tar.gz \
+    && echo "${RAR_SHA256}  /tmp/rarlinux.tar.gz" | sha256sum -c - \
+    && cd /tmp \
+    && tar -xzf /tmp/rarlinux.tar.gz \
+    && cp /tmp/rar/rar /usr/local/bin/rar \
     && chmod +x /usr/local/bin/rar \
     && strip /usr/local/bin/rar || true \
-    && rm -rf /tmp/rar /tmp/rarlinux-x64-720.tar.gz
+    && rm -rf /tmp/rar /tmp/rarlinux.tar.gz
 
 COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir gunicorn
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY templates ./templates
@@ -100,7 +109,6 @@ RUN chmod +x /usr/local/bin/start-gunicorn.sh
 EXPOSE 1234
 
 STOPSIGNAL SIGTERM
-
 ENTRYPOINT ["tini", "--"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 CMD curl -fs http://localhost:1234/health || exit 1

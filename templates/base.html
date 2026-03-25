@@ -26,6 +26,7 @@
         <a class="{{ 'active' if request.path.startswith('/history') else '' }}" href="{{ url_for('history_page') }}">History</a>
         <a class="{{ 'active' if request.path.startswith('/settings') or request.path.startswith('/plex') or request.path.startswith('/setup') else '' }}" href="{{ url_for('settings_page') }}">Settings</a>
         <a class="{{ 'active' if request.path.startswith('/help') else '' }}" href="{{ url_for('help_page') }}">Help</a>
+        <a id="updateBadge" class="update-badge" href="#" target="_blank" rel="noopener" style="display:none"></a>
         {% if session.get("auth_ok") %}
           <span class="session-pill">Signed in as {{ session.get("auth_user") }}</span>
           <a href="{{ url_for('logout_page') }}">Logout</a>
@@ -68,5 +69,31 @@
       </div>
     </div>
   </footer>
+
+
+<script>
+async function prepacCheckForUpdates(force = false) {
+  try {
+    const res = await fetch(`/api/version/check${force ? '?force=1' : ''}`, { credentials: 'same-origin' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const badge = document.getElementById('updateBadge');
+    if (badge && data && data.update_available) {
+      badge.textContent = `Update available: ${data.latest_tag || ('v' + data.latest_version)}`;
+      badge.href = data.asset_url || data.release_url || '#';
+      badge.style.display = 'inline-flex';
+    } else if (badge) {
+      badge.style.display = 'none';
+    }
+    return data;
+  } catch (_e) {
+    return null;
+  }
+}
+document.addEventListener('DOMContentLoaded', () => {
+  prepacCheckForUpdates(false);
+});
+</script>
+
 </body>
 </html>

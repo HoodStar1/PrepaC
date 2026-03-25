@@ -50,6 +50,22 @@
   </div>
 </section>
 
+
+
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Update Settings</h3>
+  <div class="form-grid">
+    <label><span>GitHub Repo Owner</span><input type="text" name="github_repo_owner" value="{{ settings['github_repo_owner'] }}"></label>
+    <label><span>GitHub Repo Name</span><input type="text" name="github_repo_name" value="{{ settings['github_repo_name'] }}"></label>
+    <label class="checkbox"><input type="checkbox" name="update_check_enabled" {% if settings.update_check_enabled == 'true' %}checked{% endif %}><span>Enable update checks</span></label>
+  </div>
+  <div class="row" style="margin-top: 1rem;">
+    <button type="button" onclick="checkForUpdatesNow()">Check for updates</button>
+  </div>
+  <pre id="updateCheckResult">No update check performed yet.</pre>
+  <p class="muted">When an update is available, a badge appears in the header. The manual check button lets you refresh the result immediately.</p>
+</section>
+
 <section class="card inset-card" style="grid-column: 1 / -1;">
   <h3>Authentication</h3>
   <div class="form-grid">
@@ -241,4 +257,23 @@ async function selectServer(uri){
   alert('Plex server URL saved into settings. Click Save Settings to persist any other changes.');
 }
 </script>
+
+
+<script>
+async function checkForUpdatesNow() {
+  const box = document.getElementById('updateCheckResult');
+  box.textContent = 'Checking for updates...';
+  const data = await prepacCheckForUpdates(true);
+  if (!data) {
+    box.textContent = 'Update check failed.';
+    return;
+  }
+  if (data.update_available) {
+    box.textContent = `Current: ${data.current_version}\nLatest: ${data.latest_version}\nRelease: ${data.release_url || ''}\nAsset: ${data.asset_name || data.asset_url || ''}`;
+  } else {
+    box.textContent = `You are up to date. Current: ${data.current_version}`;
+  }
+}
+</script>
+
 {% endblock %}
