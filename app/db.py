@@ -52,7 +52,6 @@ DEFAULT_SETTINGS = {
     "packing_ffmpeg_collage_height": "844",
     "posting_posted_root": "/media/dest/_posted",
     "posting_nzb_root": "/media/dest/_nzb",
-    "posting_randomizer_file": "/app/NameRandomizer.txt",
     "posting_article_size": "768000",
     "posting_yenc_line_size": "8000",
     "posting_retries": "1",

@@ -1,11 +1,8 @@
+
 # Setup
 
-Mount persistent storage for:
+1. Install Docker
+2. Run docker compose
+3. Access the web interface
 
-- `/config`
-- `/media/tv`
-- `/media/movies`
-- `/media/youtube`
-- `/media/dest`
-
-On first run, create the initial admin account and then configure paths in **Settings**.
+No additional configuration is required to get started.

@@ -102,7 +102,6 @@ RUN pip install --upgrade pip setuptools wheel \
 COPY app ./app
 COPY templates ./templates
 COPY static ./static
-COPY NameRandomizer.txt ./NameRandomizer.txt
 COPY start-gunicorn.sh /usr/local/bin/start-gunicorn.sh
 RUN chmod +x /usr/local/bin/start-gunicorn.sh
 

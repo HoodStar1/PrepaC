@@ -607,3 +607,15 @@ pre{
 .update-badge:hover{
   filter:brightness(1.05);
 }
+
+
+.action-toolbar{
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255,255,255,.05);
+  border-radius: 14px;
+  background: rgba(255,255,255,.02);
+}
+.action-toolbar-bottom{
+  margin-top: 16px;
+}

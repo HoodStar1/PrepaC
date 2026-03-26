@@ -1,5 +1,16 @@
 from pathlib import Path
 
+ALIAS_ROOTS = {
+    "/media/youtube": ["/media/Youtube Downloads"],
+    "/media/Youtube Downloads": ["/media/youtube"],
+    "/media/movies": ["/media/Movies"],
+    "/media/Movies": ["/media/movies"],
+    "/media/tv": ["/media/TV Shows"],
+    "/media/TV Shows": ["/media/tv"],
+    "/media/dest": ["/media/TBP/Jobs"],
+    "/media/TBP/Jobs": ["/media/dest"],
+}
+
 ALLOWED_ROOT_SETTING_KEYS = [
     "config_root",
     "tv_root",
@@ -25,7 +36,12 @@ def build_allowed_roots(settings):
         raw = str(settings.get(key, "") or "").strip()
         if not raw:
             continue
-        roots.append(_safe_resolve(raw))
+        resolved = _safe_resolve(raw)
+        roots.append(resolved)
+        for alias in ALIAS_ROOTS.get(str(raw), []):
+            roots.append(_safe_resolve(alias))
+        for alias in ALIAS_ROOTS.get(str(resolved), []):
+            roots.append(_safe_resolve(alias))
     return list(dict.fromkeys(str(r) for r in roots))
 
 def is_path_within_roots(path_value, allowed_roots):

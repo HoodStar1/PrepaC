@@ -200,14 +200,36 @@ def target_exists(path_str):
 
 def nearest_parent_target(file_path, youtube_root="/media/youtube"):
     fp = Path(file_path)
-    root = Path(youtube_root)
-    try:
-        rel = fp.relative_to(root)
-    except Exception:
+    youtube_roots = [
+        str(Path(youtube_root)),
+        "/media/youtube",
+        "/media/Youtube Downloads",
+        "/mnt/user/youtube",
+        "/mnt/user/Youtube Downloads",
+        "/host_mnt/user/youtube",
+        "/host_mnt/user/Youtube Downloads",
+    ]
+    rel = None
+    for root_str in youtube_roots:
+        try:
+            rel = fp.relative_to(Path(root_str))
+            break
+        except Exception:
+            continue
+
+    if rel is None:
         return str(fp.parent if fp.parent.exists() else fp)
+
+    # Safe rule:
+    # /root/channel/video_folder/file.mp4 -> delete video_folder
+    # /root/channel/file.mp4 -> delete only the file, never the whole channel folder
+    if len(rel.parts) >= 3:
+        return str(fp.parent)
+    if len(rel.parts) == 2:
+        return str(fp)
     if len(rel.parts) == 1:
         return str(fp)
-    return str(fp.parent)
+    return str(fp.parent if fp.parent.exists() else fp)
 
 def _contains_query(item, query):
     q = (query or "").strip().lower()

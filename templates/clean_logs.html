@@ -5,7 +5,7 @@
   <p><a href="{{ url_for('api_clean_logs_export') }}">Download CSV</a></p>
   {% if logs %}
   <table>
-    <tr><th>Date</th><th>Type</th><th>Reason</th><th>Target</th><th>Dry Run</th><th>Success</th><th>Size</th><th>Message</th></tr>
+    <tr><th>Date</th><th>Type</th><th>Reason</th><th>Target</th><th>Dry Run</th><th>Success</th><th>Logical Size</th><th>Message</th></tr>
     {% for l in logs %}
     <tr>
       <td>{{ l.created_at }}</td>
@@ -14,7 +14,7 @@
       <td><code>{{ l.target_path }}</code></td>
       <td>{{ l.dry_run }}</td>
       <td>{{ l.success }}</td>
-      <td>{{ l.size_bytes }}</td>
+      <td>{{ l.size_bytes|humansize }}</td>
       <td>{{ l.message }}</td>
     </tr>
     <tr>
@@ -22,6 +22,7 @@
         <details><summary>Breakdown / Details</summary>
           <p><strong>Breakdown:</strong></p>
           <pre>{{ l.breakdown_json|prettyjson }}</pre>
+          <p><strong>Actual freed:</strong> {% set d = l.details_json|prettyjson %}</p>
           <p><strong>Details:</strong></p>
           <pre>{{ l.details_json|prettyjson }}</pre>
         </details>

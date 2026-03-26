@@ -6,10 +6,12 @@
   <p>Scan eligible items and start packing.</p>
   <div class="row">
     <button type="button" onclick="scanPacking()">Scan watched folder</button>
-    <button type="button" id="startPackingBtn" onclick="startSelectedPacking()" disabled>Start selected packing jobs</button>
   </div>
   <p class="muted">Watch folder: <code>{{ settings['packing_watch_root'] }}</code></p>
   <div id="packingCandidates"><p class="muted">No scan run yet.</p></div>
+  <div class="row action-toolbar action-toolbar-bottom">
+    <button type="button" id="startPackingBtn" onclick="startSelectedPacking()" disabled>Start selected packing jobs</button>
+  </div>
 </section>
 
 <section class="card">

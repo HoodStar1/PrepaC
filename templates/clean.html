@@ -40,13 +40,19 @@
   </label>
   <div class="row">
     <button onclick="runScan()">Run Clean Scan</button>
-    <input id="confirm" type="text" placeholder="Type DELETE to process selected">
-    <button id="deleteBtn" onclick="runDelete()">Process Selected</button>
   </div>
 </section>
 <section class="card">
   <h2>Results</h2>
-  <div id="resultsBox"><p>No scan yet.</p></div><p id="cleanStatus" class="muted"></p>
+  <div class="row action-toolbar">
+    <label class="checkbox"><input type="checkbox" id="selectAllClean"><span>Select all shown results</span></label>
+  </div>
+  <div id="resultsBox"><p>No scan yet.</p></div>
+  <div class="row action-toolbar action-toolbar-bottom">
+    <input id="confirm" type="text" placeholder="Type DELETE to process selected">
+    <button id="deleteBtn" onclick="runDelete()">Process Selected</button>
+  </div>
+  <p id="cleanStatus" class="muted"></p>
 </section>
 <script>
 let currentResults = [];
@@ -62,7 +68,7 @@ function renderResults(list){
       <p><strong>Reason:</strong> ${item.reason}</p>
       <p><strong>Target Kind:</strong> ${item.target_kind}</p>
       <p><strong>Target Path:</strong> <code>${item.target_path}</code></p>
-      <p><strong>Estimated Delete Size:</strong> ${(item.size_bytes/1024/1024).toFixed(2)} MB</p>
+      <p><strong>Estimated Logical Size:</strong> ${(item.size_bytes/1024/1024).toFixed(2)} MB</p>
       ${item.details && item.details.will_also_remove_show_folder ? `<p class="clean-extra-note"><strong>Additional action:</strong> This will also remove the show folder.</p>` : `<p class="clean-extra-note"></p>`}
       <details><summary>Storage Breakdown</summary><pre>${JSON.stringify(item.breakdown, null, 2)}</pre></details>
       <details><summary>Details</summary><pre>${JSON.stringify(item.details, null, 2)}</pre></details>
@@ -203,6 +209,10 @@ document.addEventListener('input', e => { if(e.target.id === 'search') applyClie
 
 document.addEventListener('change', e => {
   if(e.target.id === 'sortBy') applyClientFilters();
+  if(e.target.id === 'selectAllClean'){
+    document.querySelectorAll('.cand').forEach(cb => { cb.checked = e.target.checked; });
+    refreshCleanSelectionContext();
+  }
   if(e.target.id === 'sortBy' || (e.target.classList && e.target.classList.contains('cand'))) refreshCleanSelectionContext();
 });
 </script>

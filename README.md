@@ -1,81 +1,43 @@
+
 # PrepaC
 
-PrepaC is a self-hosted Docker application for media workflow automation. It helps you prepare media releases, pack them into RAR/PAR2 jobs, post them with Nyuu, and clean up media afterwards.
+PrepaC is an automation tool designed to streamline media preparation, packaging, and posting workflows.
 
-## Main Features
+## Features
 
-- **Prepare** TV, movie, and YouTube source content into structured workflow-ready folders
-- **Pack** prepared jobs into RAR + PAR2 output sets
-- **Post** packed jobs with Nyuu using one or more provider profiles
-- **Clean** fully played or previously prepared content
-- **Track** job progress, history, and summaries from a browser-based UI
-- **Configure** paths, Plex, posting providers, and workflow behavior from the Settings page
-- **Authenticate** with a built-in first-run admin setup flow
-- **Reference built-in help** from the in-app Help section
+- Automated workflow from preparation to posting
+- Queue-based processing with concurrency control
+- Clean-up tools with safety protections
+- Real-time dashboard and monitoring
+- Update checking inside the application
+- Optimized for containerized environments
 
-## Quick Start
+## Installation
 
-```yaml
-services:
-  prepac:
-    build: .
-    container_name: prepac
-    ports:
-      - "1234:1234"
-    volumes:
-      - ./config:/config
-      - ./data/tv:/media/tv
-      - ./data/movies:/media/movies
-      - ./data/youtube:/media/youtube
-      - ./data/destination:/media/dest
-      - /mnt:/host_mnt
-    restart: unless-stopped
+1. Clone or download this repository
+2. Place files in your preferred directory
+3. Run:
+
+```bash
+docker compose up -d --build
 ```
 
-Then open:
-
-```text
+4. Open your browser and navigate to:
+```
 http://localhost:1234
 ```
 
-## Production Runtime
+## Usage
 
-PrepaC now starts behind **Gunicorn**.
-
-### Default Gunicorn behavior
-
-The included startup script auto-tunes to the host:
-
-- `workers = (CPU cores × 2) + 1`
-- threads scale by host CPU count
-- timeout defaults to `120`
-
-Optional overrides:
-- `GUNICORN_WORKERS`
-- `GUNICORN_THREADS`
-- `GUNICORN_TIMEOUT`
-- `GUNICORN_GRACEFUL_TIMEOUT`
-- `GUNICORN_KEEPALIVE`
-- `GUNICORN_BIND`
-- `GUNICORN_LOG_LEVEL`
+- Use the **Prepare** section to process files
+- Use **Packing** and **Posting** to continue the workflow
+- Use **Clean** to remove processed files safely
 
 ## Notes
 
-- Default prepare end tag: **PrepaC**
-- `packing_freeimage_api_key` is for **freeimage.host** thumbnail uploads during packing
-- Built-in end-user guidance is available at **Help**
+- Designed for reliability and automation
+- Recommended to run on a system with sufficient storage and network bandwidth
 
-## Documentation
+## License
 
-- In-app: **Help**
-- Static docs: `/docs`
-- MkDocs config: `mkdocs.yml`
-
-
-## Final packaging note
-
-This build uses a proper Python package layout for Gunicorn:
-
-- `app/__init__.py` included
-- internal imports rewritten to `from app...`
-- Gunicorn target: `app.app:app`
+Private software – all rights reserved.

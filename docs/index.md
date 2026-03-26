@@ -1,7 +1,6 @@
-# PrepaC
 
-PrepaC is a Dockerized media workflow application for preparing, packing, posting, and cleaning media jobs.
+# Documentation
 
-## Core flow
+PrepaC provides an automated workflow for media handling.
 
-Prepare → Packing → Posting → Clean
+Refer to sections for setup and usage guidance.

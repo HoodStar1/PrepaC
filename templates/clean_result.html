@@ -44,9 +44,15 @@ function render(){
     return;
   }
 
+  const totalLogical = (data.results || []).reduce((acc, r) => acc + (r.logical_size_bytes || r.size_bytes || 0), 0);
+  const totalAllocated = (data.results || []).reduce((acc, r) => acc + (r.allocated_size_bytes || 0), 0);
+  const totalFreed = (data.results || []).reduce((acc, r) => acc + (r.actual_freed_bytes || 0), 0);
   summaryBox.innerHTML = `
     <p><strong>Processed items:</strong> ${data.processed_count || 0}</p>
     <p><strong>Plex libraries refreshed:</strong> ${data.refreshed_count || 0}</p>
+    <p><strong>Logical size selected:</strong> ${gb(totalLogical)}</p>
+    <p><strong>Allocated size before delete:</strong> ${gb(totalAllocated)}</p>
+    <p><strong>Actual disk space freed:</strong> ${gb(totalFreed)}</p>
   `;
 
   const results = data.results || [];
@@ -65,6 +71,9 @@ function render(){
         <p><strong>Reason:</strong> ${r.reason || ''}</p>
         <p><strong>Status:</strong> ${r.success ? 'Successful' : 'Failed'}</p>
         <p><strong>Message:</strong> ${r.message || ''}</p>
+        <p><strong>Logical size:</strong> ${gb(r.logical_size_bytes || r.size_bytes || 0)}</p>
+        <p><strong>Allocated size before delete:</strong> ${gb(r.allocated_size_bytes || 0)}</p>
+        <p><strong>Actual disk space freed:</strong> ${gb(r.actual_freed_bytes || 0)}</p>
 
         <details open>
           <summary>Disk free space before</summary>
@@ -74,6 +83,11 @@ function render(){
         <details open>
           <summary>Disk free space after</summary>
           ${after.length ? after.map(x => `<div><code>${x.mount_path}</code> — ${gb(x.free_bytes)} free</div>`).join('') : '<p>No disk info.</p>'}
+        </details>
+
+        <details open>
+          <summary>Disk free space delta</summary>
+          ${(r.disk_free_delta || []).length ? (r.disk_free_delta || []).map(x => `<div><code>${x.mount_path}</code> — freed ${gb(x.freed_bytes || 0)}</div>`).join('') : '<p>No delta info.</p>'}
         </details>
 
         <details>

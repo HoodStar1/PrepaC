@@ -12,6 +12,7 @@ import select
 import datetime
 from collections import deque
 from pathlib import Path
+from app.name_randomizer_data import RANDOMIZER_TEXT
 
 from app.secret_utils import resolve_secret
 from app.packing_jobs import list_packing_history
@@ -37,11 +38,10 @@ GROUP_RE = re.compile(r"^Group:\s*(.+?)\s*$", re.I | re.M)
 PASSWORD_RE = re.compile(r"^\[CODE\](.*?)\[/CODE\]\s*$", re.I | re.M | re.S)
 
 
-def parse_randomizer_file(path: Path):
-    text = path.read_text(encoding="utf-8", errors="replace")
+def parse_randomizer_text(text: str):
     sections = {}
     current = None
-    for raw in text.splitlines():
+    for raw in str(text or "").splitlines():
         m = SECTION_RE.match(raw.strip())
         if m:
             current = m.group(1).strip().lower()
@@ -51,10 +51,18 @@ def parse_randomizer_file(path: Path):
             sections[current].append(raw.strip())
     return sections
 
+def parse_randomizer_file(path: Path):
+    try:
+        if path and path.exists():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            return parse_randomizer_text(text)
+    except Exception:
+        pass
+    return parse_randomizer_text(RANDOMIZER_TEXT)
+
 
 def choose_from_and_groups(settings):
-    rand_path = Path(settings.get("posting_randomizer_file") or "/app/NameRandomizer.txt")
-    sections = parse_randomizer_file(rand_path)
+    sections = parse_randomizer_text(RANDOMIZER_TEXT)
 
     def pick(name, fallback):
         vals = sections.get(name, [])
@@ -78,7 +86,7 @@ def choose_from_and_groups(settings):
             return f"{isp_value}.com"
         if "." not in domain_value:
             return f"{isp_value}.{domain_value}"
-        # If the randomizer already gave a full domain including the isp, keep it.
+        #
         if domain_value.startswith(isp_value + "."):
             return domain_value
         # Otherwise prepend isp to keep the required naming scheme.
