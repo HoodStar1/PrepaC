@@ -52,23 +52,37 @@ jobs:
       - name: Create release zip
         shell: bash
         run: |
-          zip -r "${{ steps.meta.outputs.zip_name }}" . \
-            -x ".git/*" \
-            -x ".github/*" \
-            -x "__pycache__/*" \
-            -x "*.pyc" \
-            -x "*.pyo" \
-            -x "*.db" \
-            -x "*.sqlite" \
-            -x "*.sqlite3" \
-            -x "config/*" \
-            -x ".venv/*" \
-            -x "venv/*" \
-            -x "env/*" \
-            -x ".pytest_cache/*" \
-            -x ".mypy_cache/*" \
-            -x ".ruff_cache/*" \
-            -x ".DS_Store"
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          root = Path('.')
+          zip_name = Path("${{ steps.meta.outputs.zip_name }}")
+
+          exclude_dir_names = {
+              '.git', '.github', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+              '.venv', 'venv', 'env', 'config'
+          }
+          exclude_suffixes = {'.pyc', '.pyo', '.db', '.sqlite', '.sqlite3'}
+          exclude_file_names = {'.DS_Store'}
+
+          def should_skip(path: Path) -> bool:
+              parts = set(path.parts)
+              if parts & exclude_dir_names:
+                  return True
+              if path.name in exclude_file_names:
+                  return True
+              if path.suffix.lower() in exclude_suffixes:
+                  return True
+              return False
+
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+              for path in root.rglob('*'):
+                  if path.is_dir() or should_skip(path):
+                      continue
+                  zf.write(path, path.as_posix())
+          print(f"Created {zip_name}")
+          PY
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
