@@ -26,6 +26,32 @@ def get_existing_active_packing_job_id(source_path):
     conn.close()
     return int(row[0]) if row else None
 
+
+
+def latest_successful_packing_job_id(source_path):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM packing_jobs WHERE source_path=? AND status='done' ORDER BY id DESC LIMIT 1", (source_path,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+
+def reconcile_orphaned_running_packing_jobs(active_job_ids, reason="Recovered orphaned packing job with no active worker thread"):
+    active_ids = {int(x) for x in (active_job_ids or set()) if str(x).isdigit()}
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id, percent FROM packing_jobs WHERE status='running'")
+    rows = [dict(r) for r in cur.fetchall()]
+    changed = 0
+    for row in rows:
+        job_id = int(row.get("id") or 0)
+        if job_id in active_ids:
+            continue
+        cur.execute("UPDATE packing_jobs SET status='failed', finished_at=?, message=? WHERE id=?", (now(), reason, job_id))
+        cur.execute("INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (job_id, now(), 'recovered', reason, row.get('percent')))
+        changed += 1
+    conn.commit(); conn.close()
+    return changed
+
 def latest_successful_packing_finished_at(source_path):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT finished_at FROM packing_jobs WHERE source_path=? AND status='done' ORDER BY id DESC LIMIT 1", (source_path,))

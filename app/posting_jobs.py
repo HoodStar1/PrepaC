@@ -26,6 +26,32 @@ def get_existing_active_posting_job_id(packed_root):
     conn.close()
     return int(row[0]) if row else None
 
+
+
+def latest_successful_posting_job_id(packed_root):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM posting_jobs WHERE packed_root=? AND status='done' ORDER BY id DESC LIMIT 1", (packed_root,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+
+def reconcile_orphaned_running_posting_jobs(active_job_ids, reason="Recovered orphaned posting job with no active worker thread"):
+    active_ids = {int(x) for x in (active_job_ids or set()) if str(x).isdigit()}
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id, percent FROM posting_jobs WHERE status='running'")
+    rows = [dict(r) for r in cur.fetchall()]
+    changed = 0
+    for row in rows:
+        job_id = int(row.get("id") or 0)
+        if job_id in active_ids:
+            continue
+        cur.execute("UPDATE posting_jobs SET status='failed', finished_at=?, message=? WHERE id=?", (now(), reason, job_id))
+        cur.execute("INSERT INTO posting_job_events(posting_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (job_id, now(), 'recovered', reason, row.get('percent')))
+        changed += 1
+    conn.commit(); conn.close()
+    return changed
+
 def latest_successful_posting_finished_at(packed_root):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT finished_at FROM posting_jobs WHERE packed_root=? AND status='done' ORDER BY id DESC LIMIT 1", (packed_root,))

@@ -28,9 +28,25 @@ from app.posting_jobs import (
     update_posting_job,
     get_existing_active_posting_job_id,
     has_outdated_or_missing_successful_posting,
+    latest_successful_posting_job_id,
+    reconcile_orphaned_running_posting_jobs,
 )
 
 GB = 1024 ** 3
+POSTING_ACTIVE_JOB_IDS = set()
+
+
+def _mark_posting_job_active(job_id):
+    POSTING_ACTIVE_JOB_IDS.add(int(job_id))
+
+
+def _mark_posting_job_inactive(job_id):
+    POSTING_ACTIVE_JOB_IDS.discard(int(job_id))
+
+
+def reconcile_orphaned_posting_jobs_in_process():
+    return reconcile_orphaned_running_posting_jobs(set(POSTING_ACTIVE_JOB_IDS))
+
 
 SECTION_RE = re.compile(r"^//([^/]+)//\s*$")
 HEADER_RE = re.compile(r"^Header:\s*(.+?)\s*$", re.I | re.M)
@@ -141,6 +157,7 @@ def update_template_groups(template_text: str, groups_csv: str):
 
 
 def scan_posting_candidates(settings):
+    reconcile_orphaned_posting_jobs_in_process()
     packed_root = Path(settings.get("packing_output_root") or "/media/dest/_packed")
     output_root = packed_root / "output files"
     results = []
@@ -213,6 +230,7 @@ def provider_config(settings, idx):
         "username": settings.get(prefix + "username", "").strip(),
         "password": resolve_secret(prefix + "password", settings),
         "connections": settings.get(prefix + "connections", "50").strip(),
+        "max_connections": settings.get(prefix + "max_connections", settings.get(prefix + "connections", "50")).strip(),
     }
 
 
@@ -337,14 +355,14 @@ def post_check_enabled(settings):
     return str(settings.get("posting_post_check", "false")).lower() == "true"
 
 def effective_connections(settings, provider: dict):
-    # The provider connection count in Settings is the user's intended max.
-    # Reserve 1 connection for post-check when enabled, without applying a second hidden cap.
-    requested = int(str(provider.get("connections", "1") or "1"))
-    requested = max(1, requested)
+    requested = max(1, int(str(provider.get("connections", "1") or "1")))
+    configured_max = max(1, int(str(provider.get("max_connections", provider.get("connections", "1")) or "1")))
+    clamped_total = min(requested, configured_max)
     reserve = 1 if post_check_enabled(settings) else 0
-    effective = max(1, requested - reserve)
-    return effective, requested, reserve
+    effective = max(1, clamped_total - reserve)
+    return effective, clamped_total, reserve
 def wait_for_provider(settings, size_bytes, job_id):
+    reconcile_orphaned_posting_jobs_in_process()
     provider1 = provider_config(settings, 1)
     provider2 = provider_config(settings, 2)
     size_limit_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 25)
@@ -765,7 +783,17 @@ def start_posting_job_async(packed_root, settings):
     output_files_root = Path(settings.get("packing_output_root") or "/media/dest/_packed") / "output files" / packed_root.name
     template_path = output_files_root / "template.txt"
     size_bytes = sum(p.stat().st_size for p in packed_root.rglob('*') if p.is_file()) if packed_root.exists() else 0
+    reconcile_orphaned_posting_jobs_in_process()
+    existing_done_id = latest_successful_posting_job_id(str(packed_root))
+    if existing_done_id and not get_existing_active_posting_job_id(str(packed_root)):
+        return existing_done_id
     job_id = create_posting_job(packed_root.name, str(packed_root), str(output_files_root), str(template_path), size_bytes)
     import threading
-    threading.Thread(target=run_posting_job, args=(job_id, str(packed_root), str(output_files_root), str(template_path), settings), daemon=True).start()
+    def _runner():
+        _mark_posting_job_active(job_id)
+        try:
+            run_posting_job(job_id, str(packed_root), str(output_files_root), str(template_path), settings)
+        finally:
+            _mark_posting_job_inactive(job_id)
+    threading.Thread(target=_runner, daemon=True).start()
     return job_id

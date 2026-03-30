@@ -33,6 +33,8 @@ from app.packing_jobs import (
     has_outdated_or_missing_successful_packing,
     count_running_packing_jobs,
     try_claim_packing_slot,
+    latest_successful_packing_job_id,
+    reconcile_orphaned_running_packing_jobs,
 )
 
 VIDEO_EXTS = {".mkv",".mp4",".avi",".mov",".m4v",".ts",".m2ts",".wmv",".mpg",".mpeg"}
@@ -43,6 +45,23 @@ ALLOWED_VOLUMES = [50*MB,100*MB,250*MB,500*MB,1*GB,2*GB]
 SECTION_RE = re.compile(r"^//([^/]+)//\s*$")
 PACKING_SLOT_LOCK = Lock()
 PACKING_ACTIVE_COUNT = 0
+PACKING_ACTIVE_JOB_IDS = set()
+
+
+def _mark_packing_job_active(job_id):
+    with PACKING_SLOT_LOCK:
+        PACKING_ACTIVE_JOB_IDS.add(int(job_id))
+
+
+def _mark_packing_job_inactive(job_id):
+    with PACKING_SLOT_LOCK:
+        PACKING_ACTIVE_JOB_IDS.discard(int(job_id))
+
+
+def reconcile_orphaned_packing_jobs_in_process():
+    with PACKING_SLOT_LOCK:
+        active_ids = set(PACKING_ACTIVE_JOB_IDS)
+    return reconcile_orphaned_running_packing_jobs(active_ids)
 
 def is_video(p: Path):
     return p.suffix.lower() in VIDEO_EXTS
@@ -71,6 +90,7 @@ def largest_video(path: Path):
     return best
 
 def scan_watch_folder(settings):
+    reconcile_orphaned_packing_jobs_in_process()
     watch = Path(settings.get("packing_watch_root") or settings.get("dest_root") or "/media/dest")
     jobs = []
     if not watch.exists():
@@ -765,6 +785,23 @@ def strip_dest_root_prefix(text: str, dest_root: str) -> str:
     prefix = str(dest_root or "/media/dest").rstrip("/") + "/"
     return (text or "").replace(prefix, "")
 
+
+
+def _reset_directory_contents(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+    for child in list(path.iterdir()):
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except FileNotFoundError:
+            pass
+
+def _prepare_clean_packing_roots(pack_job_root: Path, output_files_root: Path):
+    _reset_directory_contents(pack_job_root)
+    _reset_directory_contents(output_files_root)
+
 def media_type_for_job_path(job_path: Path):
     lower = str(job_path).lower()
     if "/tv" in lower or "season " in lower:
@@ -781,8 +818,7 @@ def run_packing_job(job_id, source_path, settings):
     packed_root = Path(settings.get("packing_output_root") or str(Path(settings.get("dest_root","/media/dest")) / "_packed"))
     pack_job_root = packed_root / job_name
     output_files_root = packed_root / "output files" / job_name
-    pack_job_root.mkdir(parents=True, exist_ok=True)
-    output_files_root.mkdir(parents=True, exist_ok=True)
+    _prepare_clean_packing_roots(pack_job_root, output_files_root)
 
     try:
         current_job = next((j for j in list_packing_jobs(5000) if int(j.get("id", 0)) == int(job_id)), None)
@@ -985,6 +1021,10 @@ def start_packing_job_async(source_path, settings):
     packed_root = Path(settings.get("packing_output_root") or str(Path(settings.get("dest_root","/media/dest")) / "_packed"))
     pack_job_root = packed_root / source.name
     output_files_root = packed_root / "output files" / source.name
+    reconcile_orphaned_packing_jobs_in_process()
+    existing_done_id = latest_successful_packing_job_id(str(source))
+    if existing_done_id and not get_existing_active_packing_job_id(str(source)):
+        return existing_done_id
     job_id = create_packing_job(str(source), source.name, str(pack_job_root), str(output_files_root))
     import threading
 
@@ -995,11 +1035,16 @@ def start_packing_job_async(source_path, settings):
                 max_jobs = max(1, int(current_settings.get("packing_max_concurrent_jobs", settings.get("packing_max_concurrent_jobs","1")) or 1))
             except Exception:
                 max_jobs = 1
+            reconcile_orphaned_packing_jobs_in_process()
             if try_claim_packing_slot(job_id, max_jobs):
+                _mark_packing_job_active(job_id)
                 break
             add_packing_event(job_id, "queued", f"Waiting for packing slot ({max_jobs} max concurrent jobs).", 0)
             time.sleep(1)
-        run_packing_job(job_id, str(source), load_settings())
+        try:
+            run_packing_job(job_id, str(source), load_settings())
+        finally:
+            _mark_packing_job_inactive(job_id)
 
     threading.Thread(target=_runner, daemon=True).start()
     return job_id

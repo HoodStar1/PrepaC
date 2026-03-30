@@ -9,10 +9,11 @@ import threading
 import signal
 import atexit
 import time
+import secrets
 import requests
 import fcntl
 from flask import Flask, jsonify, redirect, render_template, request, url_for, flash, Response, session, stream_with_context
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from app.db import init_db, load_settings, save_settings, get_conn
 from app.jobs import create_job, add_job_event, list_jobs, interrupt_running_prepare_jobs, try_claim_prepare_slot
@@ -35,8 +36,42 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
 from app.version import APP_NAME, APP_VERSION, BUILD_NUMBER, FULL_VERSION, DISPLAY_VERSION, BUILD_DISPLAY
 
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_or_create_flask_secret() -> str:
+    env_value = (os.environ.get("PREPAC_FLASK_SECRET_KEY", "") or "").strip()
+    if env_value:
+        return env_value
+    secret_path = pathlib.Path("/config/flask_secret_key")
+    try:
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        if secret_path.exists():
+            existing = secret_path.read_text(encoding="utf-8", errors="replace").strip()
+            if existing:
+                return existing
+        generated = secrets.token_urlsafe(64)
+        secret_path.write_text(generated, encoding="utf-8")
+        try:
+            os.chmod(secret_path, 0o600)
+        except Exception:
+            pass
+        return generated
+    except Exception:
+        return secrets.token_urlsafe(64)
+
 app = Flask(__name__, template_folder="../templates", static_folder="../static")
-app.secret_key = "prepac-phase7-authfix"
+app.secret_key = _load_or_create_flask_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_bool_env("PREPAC_SESSION_COOKIE_SECURE", False),
+)
 init_db()
 
 
@@ -81,6 +116,20 @@ def current_external_base_url():
     proto = request.headers.get("X-Forwarded-Proto", request.scheme)
     host = request.headers.get("X-Forwarded-Host", request.host)
     return f"{proto}://{host}".rstrip("/")
+
+
+def _safe_next_url(candidate: str | None):
+    target = (candidate or "").strip()
+    if not target:
+        return url_for("dashboard")
+    parsed = urlparse(target)
+    if parsed.scheme or parsed.netloc:
+        return url_for("dashboard")
+    if not target.startswith("/"):
+        return url_for("dashboard")
+    if target.startswith("//"):
+        return url_for("dashboard")
+    return target
 
 
 @app.before_request
@@ -949,7 +998,7 @@ def login_page():
     settings = load_settings()
     if not auth_initialized(settings):
         return redirect(url_for("setup_page"))
-    next_url = request.values.get("next") or url_for("dashboard")
+    next_url = _safe_next_url(request.values.get("next"))
     if request.method == "POST":
         username = (request.form.get("username", "") or "").strip()
         password = request.form.get("password", "") or ""
@@ -957,7 +1006,7 @@ def login_page():
             session["auth_ok"] = True
             session["auth_user"] = username
             flash("Logged in successfully.", "success")
-            return redirect(next_url)
+            return redirect(_safe_next_url(next_url))
         flash("Invalid username or password.", "error")
     return render_template("login.html", next_url=next_url)
 

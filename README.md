@@ -1,7 +1,7 @@
 
 # PrepaC
 
-PrepaC is an automation tool designed to streamline media preparation, packaging, and posting workflows.
+PrepaC is an automation tool designed to streamline media preparation, packaging, and posting workflows. The 1.0.4 build adds hardened session handling, safer login redirects, a Cython-backed application build path, and queue/posting stability fixes.
 
 ## Features
 
