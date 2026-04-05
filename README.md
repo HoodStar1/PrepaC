@@ -1,7 +1,6 @@
-
 # PrepaC
 
-PrepaC is an automation tool designed to streamline media preparation, packaging, and posting workflows. The 1.0.4 build adds hardened session handling, safer login redirects, a Cython-backed application build path, and queue/posting stability fixes.
+PrepaC is an automation tool that streamlines media preparation, packaging, posting, and cleanup workflows in one place. Version 1.0.5 improves provider-aware posting behavior, queue handling, and overall workflow stability.
 
 ## Features
 
@@ -32,6 +31,17 @@ http://localhost:1234
 - Use the **Prepare** section to process files
 - Use **Packing** and **Posting** to continue the workflow
 - Use **Clean** to remove processed files safely
+
+## Provider prioritization
+
+The setting **Provider 2 max job size when provider 1 is busy (GB)** now also controls how smaller and larger posting jobs are distributed between providers.
+
+- When the value is greater than **0**:
+  - Provider 1 prioritizes larger jobs first
+  - Smaller jobs can be handled by Provider 2 while larger jobs are still packing or waiting to post
+- When the value is **0**:
+  - This behavior is disabled
+  - Both providers can process any size job, with Provider 1 taking priority as usual
 
 ## Notes
 

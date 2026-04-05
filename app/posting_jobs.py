@@ -160,6 +160,24 @@ def get_running_provider_names():
     vals = [r[0] for r in cur.fetchall()]
     conn.close(); return vals
 
+def has_large_queued_posting_job(min_size_bytes, exclude_job_id=None):
+    min_size_bytes = int(min_size_bytes or 0)
+    exclude_job_id = int(exclude_job_id or 0)
+    conn = get_conn(); cur = conn.cursor()
+    if exclude_job_id > 0:
+        cur.execute(
+            "SELECT 1 FROM posting_jobs WHERE status='queued' AND size_bytes >= ? AND id != ? LIMIT 1",
+            (min_size_bytes, exclude_job_id),
+        )
+    else:
+        cur.execute(
+            "SELECT 1 FROM posting_jobs WHERE status='queued' AND size_bytes >= ? LIMIT 1",
+            (min_size_bytes,),
+        )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
 
 def interrupt_running_posting_jobs(reason="Interrupted by container shutdown", recovery=False):
     conn = get_conn(); cur = conn.cursor()

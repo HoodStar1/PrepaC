@@ -170,3 +170,15 @@ def interrupt_running_packing_jobs(reason="Interrupted by container shutdown", r
                     (row["id"], now(), phase, message, row.get("percent")))
     conn.commit(); conn.close()
     return len(rows)
+
+
+def has_large_running_packing_job(min_size_bytes):
+    min_size_bytes = int(min_size_bytes or 0)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM packing_jobs WHERE status='running' AND size_bytes >= ? LIMIT 1",
+        (min_size_bytes,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None

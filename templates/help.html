@@ -87,6 +87,8 @@
       <p>The Posting screen scans packed jobs, selects eligible releases, and starts uploads using your configured providers.</p>
       <ul class="help-list">
         <li>Provider 1 and Provider 2 can be enabled independently.</li>
+        <li>The Provider 2 max job size setting can also make Provider 1 hold smaller jobs back while larger jobs are still packing or waiting to post.</li>
+        <li>Set that value to <code>0</code> to disable the size-based provider split and keep normal provider priority behavior.</li>
         <li>Posting tracks phase, progress, transfer rate, transferred amount, and ETA.</li>
         <li>Completed jobs move into Posting History.</li>
       </ul>
@@ -118,6 +120,8 @@
       <ul class="help-list">
         <li>Secrets can come from the UI, environment variables, or secret files under <code>/run/secrets</code>.</li>
         <li>The Freeimage key is optional and only used during packing.</li>
+        <li>Set <strong>Provider 2 max job size when provider 1 is busy (GB)</strong> above <code>0</code> to make Provider 1 prioritize larger jobs first and let Provider 2 handle smaller jobs in the meantime.</li>
+        <li>Set that value to <code>0</code> to disable the behavior.</li>
       </ul>
 
     {% elif active_topic == "operations" %}

@@ -15,7 +15,7 @@ from pathlib import Path
 from app.name_randomizer_data import RANDOMIZER_TEXT
 
 from app.secret_utils import resolve_secret
-from app.packing_jobs import list_packing_history
+from app.packing_jobs import list_packing_history, has_large_running_packing_job
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.posting_jobs import (
     add_posting_event,
@@ -30,6 +30,7 @@ from app.posting_jobs import (
     has_outdated_or_missing_successful_posting,
     latest_successful_posting_job_id,
     reconcile_orphaned_running_posting_jobs,
+    has_large_queued_posting_job,
 )
 
 GB = 1024 ** 3
@@ -354,6 +355,23 @@ def validate_posting_inputs(settings, provider, packed_root: Path, output_files_
 def post_check_enabled(settings):
     return str(settings.get("posting_post_check", "false")).lower() == "true"
 
+def provider1_should_defer_small_job(settings, size_bytes, job_id):
+    try:
+        threshold_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 0)
+    except Exception:
+        threshold_gb = 0.0
+    if threshold_gb <= 0:
+        return False
+    threshold_bytes = int(threshold_gb * GB)
+    if int(size_bytes or 0) >= threshold_bytes:
+        return False
+    if has_large_running_packing_job(threshold_bytes):
+        return True
+    if has_large_queued_posting_job(threshold_bytes, exclude_job_id=job_id):
+        return True
+    return False
+
+
 def effective_connections(settings, provider: dict):
     requested = max(1, int(str(provider.get("connections", "1") or "1")))
     configured_max = max(1, int(str(provider.get("max_connections", provider.get("connections", "1")) or "1")))
@@ -365,12 +383,20 @@ def wait_for_provider(settings, size_bytes, job_id):
     reconcile_orphaned_posting_jobs_in_process()
     provider1 = provider_config(settings, 1)
     provider2 = provider_config(settings, 2)
-    size_limit_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 25)
+    try:
+        size_limit_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 0)
+    except Exception:
+        size_limit_gb = 0.0
+    threshold_bytes = int(size_limit_gb * GB) if size_limit_gb > 0 else 0
     while True:
+        provider1_deferred = False
         candidates = []
         if provider1["enabled"]:
-            candidates.append(provider1)
-        if provider2["enabled"] and size_bytes < size_limit_gb * GB:
+            provider1_deferred = provider1_should_defer_small_job(settings, size_bytes, job_id)
+            if not provider1_deferred:
+                candidates.append(provider1)
+        provider2_can_take = provider2["enabled"] and (threshold_bytes <= 0 or int(size_bytes or 0) < threshold_bytes)
+        if provider2_can_take:
             candidates.append(provider2)
 
         for provider in candidates:
@@ -378,7 +404,11 @@ def wait_for_provider(settings, size_bytes, job_id):
                 return provider
 
         update_posting_job(job_id, status="queued", provider_used="")
-        add_posting_event(job_id, "queued", "Waiting for an available posting provider", None)
+        if provider1_deferred:
+            msg = "Waiting for larger posting work to clear so Provider 1 can prioritize bigger jobs"
+        else:
+            msg = "Waiting for an available posting provider"
+        add_posting_event(job_id, "queued", msg, None)
         time.sleep(5)
 
 def build_nyuu_command(job_name, packed_root: Path, nzb_path: Path, header: str, password: str, groups_csv: str, from_header: str, provider: dict, settings):
