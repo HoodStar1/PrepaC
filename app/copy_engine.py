@@ -1,18 +1,28 @@
 import os, shutil, subprocess
 from pathlib import Path
 from app.helpers import human_bytes, video_stats
-from app.jobs import add_job_event, set_job_status, finish_job
+from app.jobs import add_job_event, set_job_status, finish_job, register_prepare_proc, unregister_prepare_proc, get_prepare_job_status
 from app.history_db import save_prepared_item
 
 VIDEO_EXTS = ("mkv","mp4","avi","mov","m4v","ts","m2ts","wmv","mpg","mpeg","webm")
 
 def _run_rsync(cmd, job_id):
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    if proc.stdout:
-        for line in proc.stdout:
-            msg = line.strip()
-            if msg: add_job_event(job_id, "copying", msg[:400], None)
-    return proc.wait()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+    register_prepare_proc(job_id, proc)
+    try:
+        if proc.stdout:
+            for line in proc.stdout:
+                msg = line.strip()
+                if msg: add_job_event(job_id, "copying", msg[:400], None)
+                if get_prepare_job_status(job_id).lower() == 'cancelled':
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+        return proc.wait()
+    finally:
+        unregister_prepare_proc(job_id, proc)
 
 def _chmod_chown(dest_path, settings):
     try:
@@ -58,7 +68,11 @@ def run_tv_prepare(job_id, settings, payload):
         include_args.append("--exclude=*")
         cmd = ["rsync","-ah","--no-perms","--no-owner","--no-group","--info=progress2,name0"] + include_args + [str(source_path) + "/", str(dest_path) + "/"]
         rc = _run_rsync(cmd, job_id)
-        if rc != 0: add_job_event(job_id, "copying", f"rsync failed with exit code {rc}", 100); finish_job(job_id, False); return
+        if rc != 0:
+            if get_prepare_job_status(job_id).lower() == 'cancelled':
+                add_job_event(job_id, 'cancelled', 'Prepare job stopped by user', None)
+                return
+            add_job_event(job_id, "copying", f"rsync failed with exit code {rc}", 100); finish_job(job_id, False); return
         add_job_event(job_id, "verifying", "Verifying copied video files...", 85)
         src_count, src_bytes = video_stats(files)
         dest_files = [p for p in dest_path.rglob("*") if p.is_file() and p.suffix.lower().lstrip(".") in VIDEO_EXTS]
@@ -82,7 +96,11 @@ def run_movie_prepare(job_id, settings, payload):
         add_job_event(job_id, "copying", f"Copying largest non-trailer file: {source_file.name}", 20)
         cmd = ["rsync","-ah","--no-perms","--no-owner","--no-group","--info=progress2,name0", str(source_file), str(dest_path) + "/"]
         rc = _run_rsync(cmd, job_id)
-        if rc != 0: add_job_event(job_id, "copying", f"rsync failed with exit code {rc}", 100); finish_job(job_id, False); return
+        if rc != 0:
+            if get_prepare_job_status(job_id).lower() == 'cancelled':
+                add_job_event(job_id, 'cancelled', 'Prepare job stopped by user', None)
+                return
+            add_job_event(job_id, "copying", f"rsync failed with exit code {rc}", 100); finish_job(job_id, False); return
         add_job_event(job_id, "verifying", "Verifying copied file...", 85)
         src_bytes = source_file.stat().st_size; copied = dest_path / source_file.name; dest_bytes = copied.stat().st_size if copied.exists() else 0
         if dest_bytes < src_bytes:

@@ -31,6 +31,9 @@ from app.posting_jobs import (
     latest_successful_posting_job_id,
     reconcile_orphaned_running_posting_jobs,
     has_large_queued_posting_job,
+    get_posting_job_status,
+    register_posting_proc,
+    unregister_posting_proc,
 )
 
 GB = 1024 ** 3
@@ -404,6 +407,8 @@ def wait_for_provider(settings, size_bytes, job_id):
                 return provider
 
         update_posting_job(job_id, status="queued", provider_used="")
+        if get_posting_job_status(job_id).lower() == "cancelled":
+            raise RuntimeError("Posting job cancelled")
         if provider1_deferred:
             msg = "Waiting for larger posting work to clear so Provider 1 can prioritize bigger jobs"
         else:
@@ -548,6 +553,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id):
         close_fds=True
     )
     os.close(slave_fd)
+    register_posting_proc(job_id, proc)
 
     pending = ""
     with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
@@ -567,6 +573,12 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id):
                         logf.flush()
                         _append_live_output(job_id, line)
                         clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                        if get_posting_job_status(job_id).lower() == "cancelled":
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            break
 
                         m = UPLOAD_RE.search(clean_line)
                         if m:
@@ -670,6 +682,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id):
         os.close(master_fd)
     except Exception:
         pass
+    unregister_posting_proc(job_id, proc)
     return proc.wait(), state
 def run_posting_job(job_id, packed_root_str, output_files_root_str, template_path_str, settings):
     allowed_roots = build_allowed_roots(settings)
@@ -746,6 +759,10 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
 
         rc, _state = stream_nyuu_process(cmd, packed_root, posting_log, job_id)
 
+        if get_posting_job_status(job_id).lower() == "cancelled":
+            add_posting_event(job_id, "cancelled", "Posting job stopped by user", None)
+            return
+
         with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
             logf.write(f"\nExit code: {rc}\n")
 
@@ -814,10 +831,25 @@ def start_posting_job_async(packed_root, settings):
     template_path = output_files_root / "template.txt"
     size_bytes = sum(p.stat().st_size for p in packed_root.rglob('*') if p.is_file()) if packed_root.exists() else 0
     reconcile_orphaned_posting_jobs_in_process()
-    existing_done_id = latest_successful_posting_job_id(str(packed_root))
-    if existing_done_id and not get_existing_active_posting_job_id(str(packed_root)):
-        return existing_done_id
-    job_id = create_posting_job(packed_root.name, str(packed_root), str(output_files_root), str(template_path), size_bytes)
+    packed_root_str = str(packed_root)
+    existing_active_id = get_existing_active_posting_job_id(packed_root_str)
+    if existing_active_id:
+        return existing_active_id
+    packing_jobs = list_packing_history(5000)
+    latest_packing_finished = ""
+    for job in packing_jobs:
+        if str(job.get("status", "")).lower() != "done":
+            continue
+        if str(job.get("output_root", "") or "").strip() != packed_root_str:
+            continue
+        finished_at = str(job.get("finished_at") or job.get("created_at") or "")
+        if finished_at > latest_packing_finished:
+            latest_packing_finished = finished_at
+    if not has_outdated_or_missing_successful_posting(packed_root_str, latest_packing_finished):
+        existing_done_id = latest_successful_posting_job_id(packed_root_str)
+        if existing_done_id:
+            return existing_done_id
+    job_id = create_posting_job(packed_root.name, packed_root_str, str(output_files_root), str(template_path), size_bytes)
     import threading
     def _runner():
         _mark_posting_job_active(job_id)

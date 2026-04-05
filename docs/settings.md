@@ -19,3 +19,6 @@ This setting controls how job sizes are distributed between Provider 1 and Provi
 - When set to **0**:
   - The behavior is disabled
   - Both providers can process any size job, with Provider 1 taking priority as usual
+
+
+Active Prepare Jobs are shown on the Prepare screen. Cancelled, failed, and completed prepare jobs move to Prepare History. The duplicate completed packing summary panel was removed because Packing History already includes that information.

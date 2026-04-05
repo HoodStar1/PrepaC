@@ -60,6 +60,11 @@ async function startSelectedPosting(){
 
 
 
+async function stopPostingJob(jobId){
+  await fetch('/api/posting/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({job_id: jobId})});
+  await refreshPostingJobs();
+}
+
 async function refreshPostingJobs(){
   const r = await fetch('/api/posting/jobs');
   const d = await r.json();
@@ -103,7 +108,7 @@ async function refreshPostingJobs(){
                 <p><strong>Transfer rate:</strong> <span class="job-rate"></span></p>
         <p><strong>Transferred:</strong> <span class="job-transferred"></span></p>
         <p><strong>Estimated time left:</strong> <span class="job-eta"></span></p>
-        
+        <div class="row"><button type="button" class="job-stop">Stop job</button></div>
       `;
       box.appendChild(card);
     }
@@ -122,6 +127,7 @@ async function refreshPostingJobs(){
     card.querySelector('.job-rate').textContent = job.runtime_stats?.transfer_rate || '';
     card.querySelector('.job-transferred').textContent = job.runtime_stats?.percent_transferred || '';
     card.querySelector('.job-eta').textContent = job.runtime_stats?.eta || '';
+    card.querySelector('.job-stop').onclick = () => stopPostingJob(job.id);
 
   }
 }
@@ -156,6 +162,7 @@ function startPostingStream(){
         <p><strong>Transfer rate:</strong> ${job.runtime_stats?.transfer_rate || ''}</p>
         <p><strong>Transferred:</strong> ${job.runtime_stats?.percent_transferred || ''}</p>
         <p><strong>Estimated time left:</strong> ${job.runtime_stats?.eta || ''}</p>
+        <div class="row"><button type="button" onclick="stopPostingJob(${job.id})">Stop job</button></div>
       </article>
     `).join('');
   };

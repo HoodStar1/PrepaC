@@ -50,6 +50,13 @@
   </div>
 </section>
 
+
+<section class="card">
+  <h2>Active Prepare Jobs</h2>
+  <p class="muted">Only queued and running jobs appear here. Cancelled, failed, and completed jobs move to Prepare History.</p>
+  <div id="prepareJobs"><p class="muted">Loading jobs...</p></div>
+</section>
+
 <section class="card">
   <h2>Shared Queue</h2>
   <label><span>Bracket Override (optional, applied to new preview builds)</span><input id="bracketOverride" type="text" placeholder="[WEBDL-2160p][DV HDR10Plus][EAC3 Atmos 5_1][h265]"></label>
@@ -64,6 +71,41 @@
 
 <script>
 let activePrepareTab = 'tv';
+
+async function stopPrepareJob(jobId){
+  await fetch('/api/prepare/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({job_id: jobId})});
+  await refreshPrepareJobs();
+}
+
+async function refreshPrepareJobs(){
+  const r = await fetch('/api/jobs');
+  const d = await r.json();
+  const jobs = d.jobs || [];
+  const box = document.getElementById('prepareJobs');
+  if (!jobs.length){
+    box.innerHTML = '<p class="muted">No active prepare jobs right now.</p>';
+    return;
+  }
+  box.innerHTML = jobs.map(j => `
+    <article class="job">
+      <h3>#${j.id} — ${j.media_type}</h3>
+      <p><strong>Status:</strong> ${j.status || ''}</p>
+      <p><strong>Source:</strong> <code>${j.source_path || ''}</code></p>
+      <p><strong>Destination:</strong> <code>${j.dest_path || ''}</code></p>
+      <p><strong>Phase:</strong> ${j.phase || ''}</p>
+      <p><strong>Message:</strong> ${j.message || ''}</p>
+      <p><strong>Percent:</strong> ${j.percent ?? ''}</p>
+      <div class="row"><button type="button" onclick="stopPrepareJob(${j.id})">Stop job</button></div>
+    </article>`).join('');
+}
+
+let prepareJobsStream = null;
+function startPrepareJobsStream(){
+  if(prepareJobsStream) prepareJobsStream.close();
+  prepareJobsStream = new EventSource('/api/jobs/stream');
+  prepareJobsStream.onmessage = () => refreshPrepareJobs();
+}
+
 let selectedShows = new Map();
 let activeShow = null;
 let selectedMovies = new Map();
@@ -394,7 +436,7 @@ async function startBatchJobs(){
       });
     }
   }
-  window.location.href = '/jobs';
+  window.location.href = '/prepare';
 }
 
 document.getElementById('tabTvBtn').addEventListener('click', () => showPrepareTab('tv'));
@@ -405,6 +447,8 @@ document.getElementById('previewBtn').addEventListener('click', buildBatchPrevie
 document.getElementById('clearQueueBtn').addEventListener('click', clearQueue);
 document.getElementById('startBtn').addEventListener('click', startBatchJobs);
 
+refreshPrepareJobs();
+startPrepareJobsStream();
 showPrepareTab('tv');
 updateTvSummary();
 updateMovieSummary();

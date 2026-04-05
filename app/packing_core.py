@@ -35,6 +35,9 @@ from app.packing_jobs import (
     try_claim_packing_slot,
     latest_successful_packing_job_id,
     reconcile_orphaned_running_packing_jobs,
+    register_packing_proc,
+    unregister_packing_proc,
+    get_packing_job_status,
 )
 
 VIDEO_EXTS = {".mkv",".mp4",".avi",".mov",".m4v",".ts",".m2ts",".wmv",".mpg",".mpeg"}
@@ -754,8 +757,10 @@ def run_cmd(cmd, cwd=None):
     rc = proc.wait()
     return rc, "".join(out)
 
-def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1):
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None):
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+    if job_id is not None:
+        register_packing_proc(job_id, proc)
     out_lines = []
     last_tick = 0.0
     while True:
@@ -1022,9 +1027,24 @@ def start_packing_job_async(source_path, settings):
     pack_job_root = packed_root / source.name
     output_files_root = packed_root / "output files" / source.name
     reconcile_orphaned_packing_jobs_in_process()
-    existing_done_id = latest_successful_packing_job_id(str(source))
-    if existing_done_id and not get_existing_active_packing_job_id(str(source)):
-        return existing_done_id
+    existing_active_id = get_existing_active_packing_job_id(str(source))
+    if existing_active_id:
+        return existing_active_id
+    prepared_jobs = list_jobs(5000)
+    latest_prepare_finished = ""
+    source_key = str(source)
+    for job in prepared_jobs:
+        if str(job.get("status", "")).lower() != "done":
+            continue
+        if str(job.get("dest_path", "") or "").strip() != source_key:
+            continue
+        finished_at = str(job.get("finished_at") or job.get("created_at") or "")
+        if finished_at > latest_prepare_finished:
+            latest_prepare_finished = finished_at
+    if not has_outdated_or_missing_successful_packing(source_key, latest_prepare_finished):
+        existing_done_id = latest_successful_packing_job_id(source_key)
+        if existing_done_id:
+            return existing_done_id
     job_id = create_packing_job(str(source), source.name, str(pack_job_root), str(output_files_root))
     import threading
 
@@ -1035,6 +1055,9 @@ def start_packing_job_async(source_path, settings):
                 max_jobs = max(1, int(current_settings.get("packing_max_concurrent_jobs", settings.get("packing_max_concurrent_jobs","1")) or 1))
             except Exception:
                 max_jobs = 1
+            status = get_packing_job_status(job_id).lower()
+            if status == "cancelled":
+                return
             reconcile_orphaned_packing_jobs_in_process()
             if try_claim_packing_slot(job_id, max_jobs):
                 _mark_packing_job_active(job_id)

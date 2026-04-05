@@ -17,4 +17,20 @@
   </table>
   {% else %}<p>No history yet.</p>{% endif %}
 </section>
+
+<section class="card">
+  <h2>Prepare Job History</h2>
+  {% if prepare_jobs %}
+  <table>
+    <tr><th>ID</th><th>Type</th><th>Status</th><th>Source</th><th>Destination</th><th>Time</th><th>Date</th></tr>
+    {% for j in prepare_jobs %}
+    <tr>
+      <td>{{ j.id }}</td><td>{{ j.media_type }}</td><td>{{ j.status }}</td>
+      <td><code>{{ j.source_path }}</code></td><td><code>{{ j.dest_path or '' }}</code></td><td>{{ j.duration_seconds|humanduration }}</td><td>{{ j.finished_at or j.started_at }}</td>
+    </tr>
+    <tr><td colspan="7"><details><summary>Details / Events</summary><p><strong>Phase:</strong> {{ j.phase or '' }}</p><p><strong>Message:</strong> {{ j.message or '' }}</p><pre>{{ j.events|prettyjson }}</pre></details></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>No prepare job history yet.</p>{% endif %}
+</section>
 {% endblock %}

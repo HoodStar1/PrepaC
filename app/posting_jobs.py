@@ -1,6 +1,8 @@
 from datetime import datetime
 from app.db import get_conn
 
+ACTIVE_POSTING_PROCS = {}
+
 def now():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -193,3 +195,35 @@ def interrupt_running_posting_jobs(reason="Interrupted by container shutdown", r
                     (row["id"], now(), phase, message, row.get("percent")))
     conn.commit(); conn.close()
     return len(rows)
+
+
+def get_posting_job_status(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT status FROM posting_jobs WHERE id=?", (job_id,))
+    row = cur.fetchone()
+    conn.close()
+    return str(row[0]) if row else ""
+
+def register_posting_proc(job_id, proc):
+    ACTIVE_POSTING_PROCS[int(job_id)] = proc
+
+def unregister_posting_proc(job_id, proc=None):
+    current = ACTIVE_POSTING_PROCS.get(int(job_id))
+    if proc is None or current is proc:
+        ACTIVE_POSTING_PROCS.pop(int(job_id), None)
+
+def cancel_posting_job(job_id, reason="Cancelled by user"):
+    proc = ACTIVE_POSTING_PROCS.get(int(job_id))
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE posting_jobs SET status='cancelled', finished_at=?, message=?, provider_used='' WHERE id=? AND status IN ('queued','running')", (now(), reason, job_id))
+    changed = cur.rowcount > 0
+    if changed:
+        cur.execute("INSERT INTO posting_job_events(posting_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
+                    (job_id, now(), 'cancelled', reason, None))
+    conn.commit(); conn.close()
+    return changed

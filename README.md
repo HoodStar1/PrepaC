@@ -1,6 +1,6 @@
 # PrepaC
 
-PrepaC is an automation tool that streamlines media preparation, packaging, posting, and cleanup workflows in one place. Version 1.0.5 improves provider-aware posting behavior, queue handling, and overall workflow stability.
+PrepaC is an automation tool that streamlines media preparation, packaging, posting, and cleanup workflows in one place. Version 1.0.6 improves provider-aware posting behavior, queue handling, and overall workflow stability.
 
 ## Features
 

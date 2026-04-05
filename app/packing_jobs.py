@@ -1,6 +1,8 @@
 from datetime import datetime
 from app.db import get_conn
 
+ACTIVE_PACKING_PROCS = {}
+
 def now():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -182,3 +184,35 @@ def has_large_running_packing_job(min_size_bytes):
     row = cur.fetchone()
     conn.close()
     return row is not None
+
+
+def get_packing_job_status(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT status FROM packing_jobs WHERE id=?", (job_id,))
+    row = cur.fetchone()
+    conn.close()
+    return str(row[0]) if row else ""
+
+def register_packing_proc(job_id, proc):
+    ACTIVE_PACKING_PROCS[int(job_id)] = proc
+
+def unregister_packing_proc(job_id, proc=None):
+    current = ACTIVE_PACKING_PROCS.get(int(job_id))
+    if proc is None or current is proc:
+        ACTIVE_PACKING_PROCS.pop(int(job_id), None)
+
+def cancel_packing_job(job_id, reason="Cancelled by user"):
+    proc = ACTIVE_PACKING_PROCS.get(int(job_id))
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE packing_jobs SET status='cancelled', finished_at=?, message=? WHERE id=? AND status IN ('queued','running')", (now(), reason, job_id))
+    changed = cur.rowcount > 0
+    if changed:
+        cur.execute("INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
+                    (job_id, now(), 'cancelled', reason, None))
+    conn.commit(); conn.close()
+    return changed

@@ -19,10 +19,6 @@
   <div id="packingJobs"><p class="muted">Loading jobs...</p></div>
 </section>
 
-<section class="card">
-  <h2>Recent Completed Packing Summaries</h2>
-  <div id="packingCompleted"><p class="muted">Loading completed packing summaries...</p></div>
-</section>
 
 <script>
 let packingList = [];
@@ -75,6 +71,11 @@ async function startSelectedPacking(){
   await scanPacking();
 }
 
+async function stopPackingJob(jobId){
+  await fetch('/api/packing/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({job_id: jobId})});
+  await refreshPackingJobs();
+}
+
 async function refreshPackingJobs(){
   const r = await fetch('/api/packing/jobs');
   const d = await r.json();
@@ -97,40 +98,18 @@ async function refreshPackingJobs(){
       <p><strong>PAR2 %:</strong> ${job.par2_percent || 0}%</p>
       <p><strong>Output root:</strong> <code>${job.output_root || ''}</code></p>
       <p><strong>Output files root:</strong> <code>${job.output_files_root || ''}</code></p>
+      <div class="row"><button type="button" onclick="stopPackingJob(${job.id})">Stop job</button></div>
       ${job.imgbox_url ? `<p><strong>Thumbnail host:</strong> <code>${job.imgbox_url}</code></p>` : ''}
     </article>
   `).join('');
 }
 
-async function refreshPackingCompleted(){
-  const r = await fetch('/api/packing/completed');
-  const d = await r.json();
-  const jobs = d.jobs || [];
-  const box = document.getElementById('packingCompleted');
-  if(!jobs.length){
-    box.innerHTML = '<p class="muted">No completed packing jobs yet.</p>';
-    return;
-  }
-  box.innerHTML = jobs.map(job => `
-    <article class="job">
-      <h3>${job.job_name}</h3>
-      <p><strong>RAR size:</strong> ${((job.rar_size_bytes||0)/(1024**3) >= 1024 ? (((job.rar_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.rar_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
-      <p><strong>RAR parts:</strong> ${job.rar_parts_actual || job.rar_parts_estimate || 0}</p>
-      <p><strong>RAR time:</strong> ${formatDuration(job.rar_time_seconds || 0)}</p>
-      <p><strong>PAR2 size:</strong> ${((job.par2_size_bytes||0)/(1024**3) >= 1024 ? (((job.par2_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.par2_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
-      <p><strong>PAR2 time:</strong> ${formatDuration(job.par2_time_seconds || 0)}</p>
-    </article>
-  `).join('');
-}
 refreshPackingJobs();
-refreshPackingCompleted();
 
 let packingJobsStream = null;
-let packingCompletedStream = null;
 
 function startPackingStreams(){
   if(packingJobsStream) packingJobsStream.close();
-  if(packingCompletedStream) packingCompletedStream.close();
 
   packingJobsStream = new EventSource('/api/packing/jobs/stream');
   packingJobsStream.onmessage = (event) => {
@@ -154,28 +133,8 @@ function startPackingStreams(){
         <p><strong>PAR2 %:</strong> ${job.par2_percent || 0}%</p>
         <p><strong>Output root:</strong> <code>${job.output_root || ''}</code></p>
         <p><strong>Output files root:</strong> <code>${job.output_files_root || ''}</code></p>
+        <div class="row"><button type="button" onclick="stopPackingJob(${job.id})">Stop job</button></div>
         ${job.imgbox_url ? `<p><strong>Thumbnail host:</strong> <code>${job.imgbox_url}</code></p>` : ''}
-      </article>
-    `).join('');
-  };
-
-  packingCompletedStream = new EventSource('/api/packing/completed/stream');
-  packingCompletedStream.onmessage = (event) => {
-    const d = JSON.parse(event.data || '{}');
-    const jobs = d.jobs || [];
-    const box = document.getElementById('packingCompleted');
-    if(!jobs.length){
-      box.innerHTML = '<p class="muted">No completed packing jobs yet.</p>';
-      return;
-    }
-    box.innerHTML = jobs.map(job => `
-      <article class="job">
-        <h3>${job.job_name}</h3>
-        <p><strong>RAR size:</strong> ${((job.rar_size_bytes||0)/(1024**3) >= 1024 ? (((job.rar_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.rar_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
-        <p><strong>RAR parts:</strong> ${job.rar_parts_actual || job.rar_parts_estimate || 0}</p>
-        <p><strong>RAR time:</strong> ${formatDuration(job.rar_time_seconds || 0)}</p>
-        <p><strong>PAR2 size:</strong> ${((job.par2_size_bytes||0)/(1024**3) >= 1024 ? (((job.par2_size_bytes||0)/(1024**4)).toFixed(2)+' TB') : (((job.par2_size_bytes||0)/(1024**3)).toFixed(2)+' GB'))}</p>
-        <p><strong>PAR2 time:</strong> ${formatDuration(job.par2_time_seconds || 0)}</p>
       </article>
     `).join('');
   };
@@ -183,7 +142,6 @@ function startPackingStreams(){
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){
     if(packingJobsStream) packingJobsStream.close();
-    if(packingCompletedStream) packingCompletedStream.close();
   } else {
     startPackingStreams();
   }

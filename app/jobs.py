@@ -1,5 +1,9 @@
 from datetime import datetime
+import subprocess
 from app.db import get_conn
+
+ACTIVE_PREPARE_PROCS = {}
+ACTIVE_PREPARE_WORKERS = set()
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 
@@ -29,7 +33,32 @@ def finish_job(job_id, success=True):
 
 
 
+
+
+def register_prepare_worker(job_id):
+    ACTIVE_PREPARE_WORKERS.add(int(job_id))
+
+def unregister_prepare_worker(job_id):
+    ACTIVE_PREPARE_WORKERS.discard(int(job_id))
+
+def reconcile_prepare_running_jobs(reason="Recovered stale prepare slot"):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM prepare_jobs WHERE status='running'")
+    rows = [int(r[0]) for r in cur.fetchall()]
+    changed = 0
+    for jid in rows:
+        if jid in ACTIVE_PREPARE_WORKERS or jid in ACTIVE_PREPARE_PROCS:
+            continue
+        cur.execute("UPDATE prepare_jobs SET status='failed', finished_at=? WHERE id=? AND status='running'", (now(), jid))
+        if cur.rowcount:
+            changed += 1
+            cur.execute("INSERT INTO job_events(job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
+                        (jid, now(), 'recovered', reason, None))
+    conn.commit(); conn.close()
+    return changed
+
 def try_claim_prepare_slot(job_id, max_jobs):
+    reconcile_prepare_running_jobs()
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("BEGIN IMMEDIATE")
@@ -79,3 +108,35 @@ def interrupt_running_prepare_jobs(reason="Interrupted by container shutdown", r
                     (row["id"], now(), phase, message, row.get("percent")))
     conn.commit(); conn.close()
     return len(rows)
+
+
+def get_prepare_job_status(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT status FROM prepare_jobs WHERE id=?", (job_id,))
+    row = cur.fetchone()
+    conn.close()
+    return str(row[0]) if row else ""
+
+def register_prepare_proc(job_id, proc):
+    ACTIVE_PREPARE_PROCS[int(job_id)] = proc
+
+def unregister_prepare_proc(job_id, proc=None):
+    current = ACTIVE_PREPARE_PROCS.get(int(job_id))
+    if proc is None or current is proc:
+        ACTIVE_PREPARE_PROCS.pop(int(job_id), None)
+
+def cancel_prepare_job(job_id, reason="Cancelled by user"):
+    proc = ACTIVE_PREPARE_PROCS.get(int(job_id))
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE prepare_jobs SET status='cancelled', finished_at=? WHERE id=? AND status IN ('queued','running')", (now(), job_id))
+    changed = cur.rowcount > 0
+    if changed:
+        cur.execute("INSERT INTO job_events(job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
+                    (job_id, now(), 'cancelled', reason, None))
+    conn.commit(); conn.close()
+    return changed

@@ -16,7 +16,7 @@ from flask import Flask, jsonify, redirect, render_template, request, url_for, f
 from urllib.parse import urlencode, urlparse
 
 from app.db import init_db, load_settings, save_settings, get_conn
-from app.jobs import create_job, add_job_event, list_jobs, interrupt_running_prepare_jobs, try_claim_prepare_slot
+from app.jobs import create_job, add_job_event, list_jobs, interrupt_running_prepare_jobs, try_claim_prepare_slot, cancel_prepare_job, get_prepare_job_status, register_prepare_worker, unregister_prepare_worker, reconcile_prepare_running_jobs
 from app.history_db import list_history, delete_prepared_by_source_path, delete_prepared_by_id
 from app.clean_actions import list_clean_actions
 from app.prepare_tv import search_shows, list_seasons, preview_tv
@@ -28,9 +28,9 @@ from app.plex_auth import create_pin, check_pin, list_servers_for_token, save_se
 from app.plex_notify import notify_after_clean
 from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
-from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event
+from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats
-from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting
+from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
@@ -350,20 +350,27 @@ def _packing_running_count():
     return sum(1 for j in list_packing_jobs(5000) if str(j.get("status","")).lower() == "running")
 
 def run_prepare_job_when_slot(job_id, media_type, settings, payload):
-    while True:
-        current = load_settings()
-        try:
-            max_jobs = max(1, int(current.get("prepare_max_concurrent_jobs", settings.get("prepare_max_concurrent_jobs", "1")) or 1))
-        except Exception:
-            max_jobs = 1
-        if try_claim_prepare_slot(job_id, max_jobs):
-            break
-        add_job_event(job_id, "queued", f"Waiting for prepare slot ({max_jobs} max concurrent jobs).", 0)
-        time.sleep(1)
-    if media_type == "tv":
-        run_tv_prepare(job_id, load_settings(), payload)
-    else:
-        run_movie_prepare(job_id, load_settings(), payload)
+    register_prepare_worker(job_id)
+    try:
+        while True:
+            current = load_settings()
+            try:
+                max_jobs = max(1, int(current.get("prepare_max_concurrent_jobs", settings.get("prepare_max_concurrent_jobs", "1")) or 1))
+            except Exception:
+                max_jobs = 1
+            reconcile_prepare_running_jobs()
+            if get_prepare_job_status(job_id).lower() == "cancelled":
+                return
+            if try_claim_prepare_slot(job_id, max_jobs):
+                break
+            add_job_event(job_id, "queued", f"Waiting for prepare slot ({max_jobs} max concurrent jobs).", 0)
+            time.sleep(1)
+        if media_type == "tv":
+            run_tv_prepare(job_id, load_settings(), payload)
+        else:
+            run_movie_prepare(job_id, load_settings(), payload)
+    finally:
+        unregister_prepare_worker(job_id)
 
 def run_packing_job_when_slot(source_path, settings, existing_job_id=None):
     while True:
@@ -684,8 +691,15 @@ def _dashboard_running_payload():
     all_posting_jobs = list_posting_jobs(5000)
     return {"ok": True, "running": summarize_running_jobs(all_jobs, all_packing_jobs, all_posting_jobs)}
 
-def _jobs_payload():
-    return {"jobs": list_jobs(50)}
+def _prepare_active_jobs_payload():
+    jobs = [j for j in list_jobs(200) if str(j.get("status", "")).lower() in {"queued", "running"}]
+    return {"jobs": jobs}
+
+def _prepare_history_jobs(limit=500):
+    jobs = [j for j in list_jobs(limit) if str(j.get("status", "")).lower() in {"done", "failed", "cancelled"}]
+    for j in jobs:
+        j["duration_seconds"] = _job_duration_seconds(j.get("started_at"), j.get("finished_at"))
+    return jobs
 
 def _packing_jobs_payload():
     jobs = list_packing_jobs(200)
@@ -1376,7 +1390,7 @@ def prepare_movie_page():
 
 @app.route("/jobs")
 def jobs_page():
-    return render_template("jobs.html")
+    return redirect(url_for("prepare_page"))
 
 
 
@@ -1473,7 +1487,7 @@ def history_page():
 
 @app.route("/history/prepare")
 def history_prepare_page():
-    return render_template("history.html", history=enrich_prepare_history_rows(list_history(500), list_jobs(5000)))
+    return render_template("history.html", history=enrich_prepare_history_rows(list_history(500), list_jobs(5000)), prepare_jobs=_prepare_history_jobs(500))
 
 @app.route("/history/clean")
 def history_clean_page():
@@ -1588,13 +1602,40 @@ def api_prepare_movie_start():
     threading.Thread(target=run_prepare_job_when_slot, args=(job_id, "movie", settings, payload), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
 
+@app.route("/api/prepare/cancel", methods=["POST"])
+def api_prepare_cancel():
+    data = request.get_json(force=True)
+    job_id = int(data.get("job_id") or 0)
+    if not job_id:
+        return jsonify({"ok": False, "error": "job_id required"}), 400
+    changed = cancel_prepare_job(job_id)
+    return jsonify({"ok": bool(changed)})
+
+@app.route("/api/packing/cancel", methods=["POST"])
+def api_packing_cancel():
+    data = request.get_json(force=True)
+    job_id = int(data.get("job_id") or 0)
+    if not job_id:
+        return jsonify({"ok": False, "error": "job_id required"}), 400
+    changed = cancel_packing_job(job_id)
+    return jsonify({"ok": bool(changed)})
+
+@app.route("/api/posting/cancel", methods=["POST"])
+def api_posting_cancel():
+    data = request.get_json(force=True)
+    job_id = int(data.get("job_id") or 0)
+    if not job_id:
+        return jsonify({"ok": False, "error": "job_id required"}), 400
+    changed = cancel_posting_job(job_id)
+    return jsonify({"ok": bool(changed)})
+
 @app.route("/api/jobs")
 def api_jobs():
-    return jsonify(_jobs_payload())
+    return jsonify(_prepare_active_jobs_payload())
 
 @app.route("/api/jobs/stream")
 def api_jobs_stream():
-    return _event_stream(_jobs_payload)
+    return _event_stream(_prepare_active_jobs_payload)
 
 @app.route("/api/clean/preview")
 def api_clean_preview():
