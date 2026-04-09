@@ -30,6 +30,7 @@ MAX_REQUESTS="${GUNICORN_MAX_REQUESTS:-1000}"
 MAX_REQUESTS_JITTER="${GUNICORN_MAX_REQUESTS_JITTER:-100}"
 BIND="${GUNICORN_BIND:-0.0.0.0:1234}"
 LOG_LEVEL="${GUNICORN_LOG_LEVEL:-info}"
+WORKER_TMP_DIR="${GUNICORN_WORKER_TMP_DIR:-/dev/shm}"
 
 exec gunicorn \
   --worker-class gthread \
@@ -41,5 +42,8 @@ exec gunicorn \
   --keep-alive "$KEEPALIVE" \
   --max-requests "$MAX_REQUESTS" \
   --max-requests-jitter "$MAX_REQUESTS_JITTER" \
+  --worker-tmp-dir "$WORKER_TMP_DIR" \
+  --access-logfile - \
+  --error-logfile - \
   --log-level "$LOG_LEVEL" \
   app.app:app

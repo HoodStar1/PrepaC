@@ -3,7 +3,7 @@
 <section class="hero-panel">
   <div>
     <h2>Help</h2>
-    <p>Guided documentation for setup, workflows, settings, and day-to-day operation.</p>
+    <p>Setup and workflow guidance for Prepare, Packing, Posting, Share, Clean, Settings, and everyday use.</p>
   </div>
 </section>
 
@@ -16,8 +16,8 @@
       {% endfor %}
     </nav>
     <div class="help-side-note">
-      <strong>Tip</strong>
-      <p>Use Settings first, then Prepare, then Packing, then Posting, and finally Clean.</p>
+      <strong>Recommended order</strong>
+      <p>Settings → Prepare → Packing → Posting → Share → Clean</p>
     </div>
   </aside>
 
@@ -26,119 +26,111 @@
       <span class="help-kicker">Getting Started</span>
       <h2>First launch checklist</h2>
       <div class="help-callout">
-        <strong>Recommended order</strong>
-        <p>Create your admin account, configure paths, optionally connect Plex, then configure posting providers before starting real jobs.</p>
+        <strong>What PrepaC does</strong>
+        <p>PrepaC helps you prepare source media, pack releases, post them, optionally share generated NZBs to Newznab-compatible destinations, and then clean up processed content.</p>
       </div>
       <ol class="help-list">
-        <li>Create the first admin account during the first-run setup flow.</li>
-        <li>Open <strong>Settings</strong> and confirm source and destination paths.</li>
-        <li>Set the default release tag if you want something other than <code>PrepaC</code>.</li>
-        <li>Optionally connect Plex for poster lookups, watched-state cleanup, and library-aware behavior.</li>
-        <li>Configure one or two posting providers before using the Posting screen.</li>
+        <li>Create the first admin account during the setup flow.</li>
+        <li>Open <strong>Settings</strong> and configure your paths before running jobs.</li>
+        <li>Configure posting providers if you plan to use the Posting screen.</li>
+        <li>Configure Share destinations if you want uploads sent to Newznab-compatible indexers after posting or by manual import.</li>
+        <li>Start with a small job before processing larger batches.</li>
       </ol>
       <div class="help-grid">
         <article class="help-panel">
-          <h3>What PrepaC does</h3>
-          <p>PrepaC turns source media into workflow-managed jobs, packs those jobs into release artifacts, posts them, and later helps clean them up.</p>
+          <h3>Persistent data</h3>
+          <p>Keep <code>/config</code> persistent across upgrades so your settings and history remain available.</p>
         </article>
         <article class="help-panel">
-          <h3>What is stored persistently</h3>
-          <p>Application settings, authentication details, job history, and workflow state live in the SQLite database under <code>/config</code>.</p>
+          <h3>Workflow</h3>
+          <p>Most setups will follow Settings → Prepare → Packing → Posting → Share → Clean.</p>
         </article>
       </div>
 
     {% elif active_topic == "prepare" %}
       <span class="help-kicker">Prepare</span>
-      <h2>Build queue previews before creating jobs</h2>
-      <p>The Prepare screen searches TV and movie source folders, lets you select seasons or movies, and shows a queue preview before any copy operation starts.</p>
-      <div class="help-grid">
-        <article class="help-panel">
-          <h3>TV workflow</h3>
-          <p>Search for a show, load available seasons, select one or more seasons, then build the queue preview.</p>
-        </article>
-        <article class="help-panel">
-          <h3>Movie workflow</h3>
-          <p>Search by movie folder name, select one or more results, then build the queue preview.</p>
-        </article>
-      </div>
+      <h2>Create working jobs from TV seasons or movie folders</h2>
+      <p>The Prepare screen scans your configured TV and movie roots, lets you choose content, and creates working jobs for later Packing.</p>
       <ul class="help-list">
-        <li>The queue preview shows the chosen bracket, destination folder, destination path, and detected tags.</li>
-        <li>If the end tag is left unchanged, PrepaC uses <code>PrepaC</code> by default.</li>
-        <li>Prepare jobs create the working folders that later appear in Packing.</li>
+        <li>TV mode lets you search shows and select one or more seasons.</li>
+        <li>Movie mode lets you search movie folders and build jobs from the selected results.</li>
+        <li>The queue preview shows detected bracket information, target naming, and destination paths before the copy starts.</li>
+        <li>Prepared jobs become the source for Packing.</li>
       </ul>
 
     {% elif active_topic == "packing" %}
       <span class="help-kicker">Packing</span>
-      <h2>Turn prepared jobs into RAR and PAR2 output</h2>
-      <p>The Packing screen scans the configured watch folder, estimates output, and starts packing jobs.</p>
+      <h2>Turn prepared jobs into release output</h2>
+      <p>The Packing screen scans prepared jobs, estimates the output, and creates the packed release artifacts used later by Posting.</p>
       <ul class="help-list">
+        <li>Packing writes release output to the configured packing output root.</li>
         <li>RAR and PAR2 estimates are shown during scan.</li>
-        <li>Packing writes output under the configured packing output folder.</li>
-        <li>The optional Freeimage key is only used for thumbnail upload during packing.</li>
+        <li>The optional Freeimage key is only used for image upload related packing features and is not used for title metadata lookup.</li>
       </ul>
-      <div class="help-callout">
-        <strong>Important</strong>
-        <p>The Freeimage API key is not a TMDB key and is not used for title metadata search.</p>
-      </div>
 
     {% elif active_topic == "posting" %}
       <span class="help-kicker">Posting</span>
-      <h2>Use provider-backed Nyuu posting jobs</h2>
-      <p>The Posting screen scans packed jobs, selects eligible releases, and starts uploads using your configured providers.</p>
+      <h2>Post packed releases with your configured providers</h2>
+      <p>The Posting screen scans packed jobs, starts provider-backed uploads, and shows live progress and transfer state.</p>
       <ul class="help-list">
         <li>Provider 1 and Provider 2 can be enabled independently.</li>
-        <li>The Provider 2 max job size setting can also make Provider 1 hold smaller jobs back while larger jobs are still packing or waiting to post.</li>
-        <li>Set that value to <code>0</code> to disable the size-based provider split and keep normal provider priority behavior.</li>
-        <li>Posting tracks phase, progress, transfer rate, transferred amount, and ETA.</li>
-        <li>Completed jobs move into Posting History.</li>
+        <li>Posting tracks phase, transfer rate, transferred amount, percent complete, and ETA.</li>
+        <li>Completed posting output becomes eligible for Share.</li>
+        <li>Finished posting jobs move to Posting History.</li>
+      </ul>
+
+    {% elif active_topic == "share" %}
+      <span class="help-kicker">Share</span>
+      <h2>Submit posted or imported NZBs to Newznab-compatible destinations</h2>
+      <p>The Share screen lets you review candidates, import RARred NZB + template bundles, preview destination categories, and submit to one or more configured destinations.</p>
+      <div class="help-grid">
+        <article class="help-panel">
+          <h3>Candidate sources</h3>
+          <p>Share can use successful Posting output or imported bundles made of a RARred NZB and template file. Imported bundles can also include an optional MediaInfo XML override.</p>
+        </article>
+        <article class="help-panel">
+          <h3>Destination routing</h3>
+          <p>PrepaC can auto-detect categories for TV and movies and let you override the final category before submission.</p>
+        </article>
+      </div>
+      <ul class="help-list">
+        <li>Single import handles one RARred NZB and one template at a time.</li>
+        <li>Mass import can pair many NZBs and templates using filename matching and template-content matching.</li>
+        <li>Share generates an NFO and metadata XML for submission when enabled by the destination.</li>
+        <li>Failed Share jobs can be retried from the Share page.</li>
+        <li>Removed Share candidates stay hidden, but importing the same bundle again creates a fresh candidate.</li>
       </ul>
 
     {% elif active_topic == "clean" %}
       <span class="help-kicker">Clean</span>
-      <h2>Preview before deleting</h2>
-      <p>The Clean screen combines Plex watched-state logic and previously prepared content to suggest deletion candidates.</p>
+      <h2>Preview cleanup before deleting anything</h2>
+      <p>The Clean screen uses app history and optional Plex watched-state information to suggest deletion candidates.</p>
       <ul class="help-list">
         <li><strong>Dry Run</strong> shows what would be removed without deleting files.</li>
         <li><strong>Use Recycle Bin</strong> moves files into the recycle location instead of deleting directly.</li>
-        <li>When every season folder in a show is selected, the interface states that the show folder will also be removed.</li>
+        <li>When every season folder in a show is selected, the interface tells you that the show folder will also be removed.</li>
       </ul>
 
     {% elif active_topic == "settings" %}
       <span class="help-kicker">Settings</span>
-      <h2>Application configuration reference</h2>
-      <p>The Settings page controls paths, Plex integration, packing behavior, posting provider details, and cleanup safety behavior.</p>
+      <h2>Configure paths, providers, destinations, and app behavior</h2>
+      <p>The Settings page controls paths, posting providers, optional Plex integration, Share destinations, and runtime behavior.</p>
       <div class="help-grid">
         <article class="help-panel">
-          <h3>Plex</h3>
-          <p>Use the built-in Plex sign-in flow or manually provide a token and library names.</p>
+          <h3>Paths</h3>
+          <p>Configure your main paths before using Prepare, Packing, Posting, Share, or Clean.</p>
         </article>
         <article class="help-panel">
-          <h3>Posting providers</h3>
-          <p>Configure hosts, ports, SSL, credentials, connections, and posting behavior from one place.</p>
+          <h3>Share destinations</h3>
+          <p>Share destinations support multiple targets, category overrides, and optional attachments.</p>
         </article>
       </div>
       <ul class="help-list">
-        <li>Secrets can come from the UI, environment variables, or secret files under <code>/run/secrets</code>.</li>
-        <li>The Freeimage key is optional and only used during packing.</li>
-        <li>Set <strong>Provider 2 max job size when provider 1 is busy (GB)</strong> above <code>0</code> to make Provider 1 prioritize larger jobs first and let Provider 2 handle smaller jobs in the meantime.</li>
-        <li>Set that value to <code>0</code> to disable the behavior.</li>
-      </ul>
-
-    {% elif active_topic == "operations" %}
-      <span class="help-kicker">Operations</span>
-      <h2>Running PrepaC in production</h2>
-      <div class="help-callout">
-        <strong>Gunicorn runtime</strong>
-        <p>PrepaC now starts behind Gunicorn instead of Flask’s development server. The startup script sizes workers from host CPU count and stays overrideable through environment variables.</p>
-      </div>
-      <ul class="help-list">
-        <li>Default workers: <code>(CPU cores × 2) + 1</code></li>
-        <li>Default threads scale by host size</li>
-        <li>Override with <code>GUNICORN_WORKERS</code>, <code>GUNICORN_THREADS</code>, <code>GUNICORN_TIMEOUT</code>, and related variables</li>
-        <li>Keep <code>/config</code> persistent for safe upgrades and rollback</li>
+        <li>Configure destination paths before using Prepare, Packing, Posting, or Share.</li>
+        <li>Set posting providers before starting uploads from Posting.</li>
+        <li>Refresh Share destination categories after adding or changing a destination.</li>
       </ul>
     {% endif %}
   </section>
 </div>
-  <div class="help-callout"><p>Active Prepare Jobs are shown on the Prepare screen. Cancelled, failed, and completed prepare jobs move to Prepare History. The duplicate completed packing summary panel was removed because Packing History already includes that information.</p></div>
 {% endblock %}

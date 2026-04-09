@@ -204,6 +204,30 @@
   <p class="muted">Posting reads <code>template.txt</code> from <code>{{ settings['packing_output_root'] }}/output files/&lt;jobname&gt;</code>, updates the actual posted groups, moves output files to <code>{{ settings['posting_posted_root'] }}/&lt;jobname&gt;</code>, deletes <code>{{ settings['packing_output_root'] }}/&lt;jobname&gt;</code> after success, and stores the NZB as a RAR in <code>{{ settings['posting_nzb_root'] }}/&lt;jobname&gt;.rar</code>.</p>
 </section>
 
+<section class="card inset-card" style="grid-column: 1 / -1;">
+  <h3>Share Settings</h3>
+  <div class="form-grid">
+    <label><span>Share Import Root</span><input type="text" name="share_import_root" value="{{ settings['share_import_root'] }}"></label>
+    <label><span>Share Request Timeout (seconds)</span><input type="number" name="share_request_timeout" value="{{ settings['share_request_timeout'] }}"></label>
+    <label class="checkbox"><input type="checkbox" name="share_auto_after_posting" {% if settings.share_auto_after_posting == 'true' %}checked{% endif %}><span>Auto-share after successful posting</span></label>
+    <label><span>Destination Source</span><input type="text" value="{{ settings['share_destinations_source'] }}" readonly></label>
+  </div>
+  <p class="muted">Configure one or more Newznab-compatible share destinations here. The hidden JSON is generated automatically from the form below when you save.</p>
+  <textarea id="shareDestinationsJson" name="share_destinations_json" style="display:none;">{{ settings['share_destinations_editor'] }}</textarea>
+
+  <div class="row" style="margin: 1rem 0;">
+    <button type="button" onclick="addShareDestination()">Add destination</button>
+    <button type="button" onclick="refreshShareCaps()">Refresh all saved destination categories</button>
+  </div>
+  <div id="shareDestinationsBuilder"></div>
+  <pre id="shareCapsResult">No share destination test or category refresh performed yet.</pre>
+  <details style="margin-top: 1rem;">
+    <summary>Advanced: current generated JSON</summary>
+    <pre id="shareDestinationsPreview">[]</pre>
+  </details>
+</section>
+
+
     <div style="grid-column: 1 / -1;">
       <button type="submit">Save Settings</button>
     </div>
@@ -212,6 +236,261 @@
 </section>
 
 <script>
+
+
+const shareCategoryOptions = {{ share_category_options|tojson }};
+let shareDestinationsState = {{ share_destinations|tojson }};
+let draggedShareDestinationIndex = null;
+
+function escHtml(v){ return String(v ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
+
+function slugifyDestinationId(value, fallbackIndex){
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('destination' + fallbackIndex);
+}
+
+function normalizedDestination(dest, idx){
+  const result = Object.assign({
+    id: 'destination' + (idx + 1),
+    name: 'New Destination',
+    enabled: true,
+    mode: 'both',
+    base_url: '',
+    api_key: '',
+    include_nfo: true,
+    include_mediainfo: true,
+    includemeta: true,
+    basic_auth: false,
+    username: '',
+    password: '',
+    categories_cache: [],
+    category_overrides: {}
+  }, dest || {});
+  if (!result.id) result.id = slugifyDestinationId(result.name, idx + 1);
+  result.categories_cache = Array.isArray(result.categories_cache) ? result.categories_cache : [];
+  result.category_overrides = (result.category_overrides && typeof result.category_overrides === 'object') ? result.category_overrides : {};
+  return result;
+}
+
+shareDestinationsState = (Array.isArray(shareDestinationsState) ? shareDestinationsState : []).map((dest, idx) => normalizedDestination(dest, idx));
+
+function defaultShareDestination(){
+  return normalizedDestination({}, shareDestinationsState.length);
+}
+
+function syncShareDestinationsJson(){
+  shareDestinationsState = shareDestinationsState.map((dest, idx) => normalizedDestination(dest, idx));
+  const hidden = document.getElementById('shareDestinationsJson');
+  const preview = document.getElementById('shareDestinationsPreview');
+  const serialized = JSON.stringify(shareDestinationsState, null, 2);
+  if(hidden) hidden.value = serialized;
+  if(preview) preview.textContent = serialized;
+}
+
+function categoryOverrideLabel(categoryKey){
+  const found = shareCategoryOptions.find(opt => opt.value === categoryKey);
+  return found ? found.label : categoryKey;
+}
+
+function categoryCacheOptions(cache, selectedValue){
+  const options = ['<option value="">Auto-match from cached categories</option>'];
+  for(const item of cache){
+    const selected = String(item.id) === String(selectedValue || '') ? 'selected' : '';
+    options.push(`<option value="${escHtml(item.id)}" ${selected}>${escHtml(item.id)} - ${escHtml(item.label)}</option>`);
+  }
+  return options.join('');
+}
+
+function shareCategoryOverrideRows(dest, idx){
+  const cache = Array.isArray(dest.categories_cache) ? dest.categories_cache : [];
+  return shareCategoryOptions.map(opt => `
+    <label>
+      <span>${escHtml(opt.label)}</span>
+      <select onchange="updateShareDestinationOverride(${idx}, '${opt.value}', this.value)">
+        ${categoryCacheOptions(cache, (dest.category_overrides || {})[opt.value])}
+      </select>
+    </label>
+  `).join('');
+}
+
+function shareDestinationCard(dest, idx){
+  const cache = Array.isArray(dest.categories_cache) ? dest.categories_cache : [];
+  const overrideCount = Object.values(dest.category_overrides || {}).filter(Boolean).length;
+  return `
+    <article class="job share-destination-card" style="margin-bottom:1rem;" draggable="true"
+      data-share-destination-index="${idx}"
+      ondragstart="startShareDestinationDrag(event, ${idx})"
+      ondragover="allowShareDestinationDrop(event, ${idx})"
+      ondrop="dropShareDestination(event, ${idx})"
+      ondragend="endShareDestinationDrag()">
+      <div class="row" style="justify-content:space-between; align-items:center; gap:.75rem; flex-wrap:wrap;">
+        <div class="row" style="gap:.75rem; align-items:center; flex-wrap:wrap;">
+          <span title="Drag to reorder" style="cursor:grab; font-size:1.25rem; user-select:none;">☰</span>
+          <h4 style="margin:0;">Destination ${idx + 1}</h4>
+          <code>${escHtml(dest.id)}</code>
+        </div>
+        <div class="row" style="gap:.5rem; flex-wrap:wrap;">
+          <button type="button" onclick="moveShareDestination(${idx}, -1)" ${idx === 0 ? 'disabled' : ''}>Move up</button>
+          <button type="button" onclick="moveShareDestination(${idx}, 1)" ${idx === shareDestinationsState.length - 1 ? 'disabled' : ''}>Move down</button>
+          <button type="button" onclick="cloneShareDestination(${idx})">Clone</button>
+          <button type="button" onclick="testShareDestination(${idx})">Test connection</button>
+          <button type="button" onclick="removeShareDestination(${idx})">Remove</button>
+        </div>
+      </div>
+      <div class="form-grid" style="margin-top:1rem;">
+        <label class="checkbox"><input type="checkbox" ${dest.enabled ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'enabled', this.checked)"><span>Enabled</span></label>
+        <label><span>Display Name</span><input type="text" value="${escHtml(dest.name)}" oninput="updateShareDestination(${idx}, 'name', this.value)"></label>
+        <label><span>ID</span><input type="text" value="${escHtml(dest.id)}" oninput="updateShareDestination(${idx}, 'id', this.value)"></label>
+        <label><span>Base URL</span><input type="text" placeholder="https://auto.example.com" value="${escHtml(dest.base_url)}" oninput="updateShareDestination(${idx}, 'base_url', this.value)"></label>
+        <label><span>API Key</span><input type="password" value="${escHtml(dest.api_key)}" oninput="updateShareDestination(${idx}, 'api_key', this.value)"></label>
+        <label><span>Mode</span>
+          <select onchange="updateShareDestination(${idx}, 'mode', this.value)">
+            <option value="manual" ${dest.mode === 'manual' ? 'selected' : ''}>Manual</option>
+            <option value="auto" ${dest.mode === 'auto' ? 'selected' : ''}>Automatic</option>
+            <option value="both" ${dest.mode === 'both' ? 'selected' : ''}>Both</option>
+          </select>
+        </label>
+        <label class="checkbox"><input type="checkbox" ${dest.include_nfo ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'include_nfo', this.checked)"><span>Attach generated NFO</span></label>
+        <label class="checkbox"><input type="checkbox" ${dest.include_mediainfo ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'include_mediainfo', this.checked)"><span>Attach MediaInfo XML</span></label>
+        <label class="checkbox"><input type="checkbox" ${dest.includemeta ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'includemeta', this.checked)"><span>Send includemeta=true</span></label>
+        <label class="checkbox"><input type="checkbox" ${dest.basic_auth ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'basic_auth', this.checked)"><span>Use basic auth</span></label>
+        <label><span>Username</span><input type="text" value="${escHtml(dest.username || '')}" oninput="updateShareDestination(${idx}, 'username', this.value)"></label>
+        <label><span>Password</span><input type="password" value="${escHtml(dest.password || '')}" oninput="updateShareDestination(${idx}, 'password', this.value)"></label>
+      </div>
+      <details style="margin-top:1rem;" ${overrideCount ? 'open' : ''}>
+        <summary>Category mapping overrides (${overrideCount})</summary>
+        <p class="muted">Leave each mapping on auto to use PrepaC's default category matching. Set an override when a destination uses a different category ID than the standard Newznab category.</p>
+        <div class="form-grid" style="margin-top:.75rem;">
+          ${shareCategoryOverrideRows(dest, idx)}
+        </div>
+      </details>
+      <details style="margin-top:1rem;">
+        <summary>Cached categories (${cache.length})</summary>
+        ${cache.length ? `<div class="row" style="flex-wrap:wrap; margin-top:.75rem;">${cache.map(cat => `<code>${escHtml(cat.id)} - ${escHtml(cat.label)}</code>`).join('')}</div>` : '<p class="muted">No cached categories yet. Use test connection or refresh all saved destination categories.</p>'}
+      </details>
+    </article>
+  `;
+}
+
+function renderShareDestinationsBuilder(){
+  const box = document.getElementById('shareDestinationsBuilder');
+  if(!box) return;
+  if(!shareDestinationsState.length){
+    box.innerHTML = '<p class="muted">No share destinations configured yet.</p>';
+  } else {
+    box.innerHTML = shareDestinationsState.map((dest, idx) => shareDestinationCard(dest, idx)).join('');
+  }
+  syncShareDestinationsJson();
+}
+
+function addShareDestination(){
+  shareDestinationsState.push(defaultShareDestination());
+  renderShareDestinationsBuilder();
+}
+
+function cloneShareDestination(idx){
+  const source = normalizedDestination(shareDestinationsState[idx], idx);
+  const copy = JSON.parse(JSON.stringify(source));
+  copy.name = `${source.name || 'New Destination'} Copy`;
+  copy.id = slugifyDestinationId(copy.name, shareDestinationsState.length + 1);
+  shareDestinationsState.splice(idx + 1, 0, copy);
+  renderShareDestinationsBuilder();
+}
+
+function removeShareDestination(idx){
+  shareDestinationsState.splice(idx, 1);
+  renderShareDestinationsBuilder();
+}
+
+function moveShareDestination(idx, delta){
+  const target = idx + delta;
+  if(target < 0 || target >= shareDestinationsState.length) return;
+  const [item] = shareDestinationsState.splice(idx, 1);
+  shareDestinationsState.splice(target, 0, item);
+  renderShareDestinationsBuilder();
+}
+
+function startShareDestinationDrag(event, idx){
+  draggedShareDestinationIndex = idx;
+  if(event.dataTransfer){
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(idx));
+  }
+}
+
+function allowShareDestinationDrop(event, idx){
+  event.preventDefault();
+  if(event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+}
+
+function dropShareDestination(event, idx){
+  event.preventDefault();
+  const sourceIdx = draggedShareDestinationIndex;
+  if(sourceIdx === null || sourceIdx === idx) return;
+  const [item] = shareDestinationsState.splice(sourceIdx, 1);
+  const insertAt = idx;
+  shareDestinationsState.splice(insertAt, 0, item);
+  draggedShareDestinationIndex = null;
+  renderShareDestinationsBuilder();
+}
+
+function endShareDestinationDrag(){
+  draggedShareDestinationIndex = null;
+}
+
+function updateShareDestination(idx, key, value){
+  shareDestinationsState[idx][key] = value;
+  if(key === 'name' && (!shareDestinationsState[idx].id || String(shareDestinationsState[idx].id).startsWith('destination') || String(shareDestinationsState[idx].id) === slugifyDestinationId(shareDestinationsState[idx].name, idx + 1))){
+    shareDestinationsState[idx].id = slugifyDestinationId(value, idx + 1);
+  }
+  if(key === 'id'){
+    shareDestinationsState[idx].id = slugifyDestinationId(value, idx + 1);
+  }
+  syncShareDestinationsJson();
+}
+
+function updateShareDestinationOverride(idx, categoryKey, categoryId){
+  const dest = shareDestinationsState[idx];
+  dest.category_overrides = (dest.category_overrides && typeof dest.category_overrides === 'object') ? dest.category_overrides : {};
+  if(categoryId){
+    dest.category_overrides[categoryKey] = categoryId;
+  } else {
+    delete dest.category_overrides[categoryKey];
+  }
+  syncShareDestinationsJson();
+}
+
+async function testShareDestination(idx){
+  const box = document.getElementById('shareCapsResult');
+  const destination = shareDestinationsState[idx];
+  box.textContent = `Testing ${destination.name || destination.id}...`;
+  const r = await fetch('/api/share/destination/test', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({destination})
+  });
+  const d = await r.json();
+  if(d.ok){
+    shareDestinationsState[idx].categories_cache = d.categories || [];
+    renderShareDestinationsBuilder();
+  }
+  box.textContent = JSON.stringify(d, null, 2);
+}
+
+async function refreshShareCaps(){
+  const box = document.getElementById('shareCapsResult');
+  if(box) box.textContent = 'Refreshing...';
+  const r = await fetch('/api/share/caps/refresh', {method:'POST'});
+  const d = await r.json();
+  if(box) box.textContent = JSON.stringify(d, null, 2);
+  if(d.ok){
+    try {
+      const refresh = await fetch('/api/share/candidates');
+      const data = await refresh.json();
+      shareDestinationsState = (data.destinations || shareDestinationsState).map((dest, idx) => normalizedDestination(dest, idx));
+      renderShareDestinationsBuilder();
+    } catch (e) {}
+  }
+}
 async function loadServers(){
   const box = document.getElementById('serversBox');
   box.innerHTML = '<p>Loading servers...</p>';
@@ -255,6 +534,7 @@ async function selectServer(uri){
   if (plexUrlInput) plexUrlInput.value = d.plex_url || uri;
   alert('Plex server URL saved into settings. Click Save Settings to persist any other changes.');
 }
+  renderShareDestinationsBuilder();
 </script>
 
 

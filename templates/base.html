@@ -21,6 +21,7 @@
         <a class="{{ 'active' if request.path.startswith('/prepare') else '' }}" href="{{ url_for('prepare_page') }}">Prepare</a>
         <a class="{{ 'active' if request.path.startswith('/packing') else '' }}" href="{{ url_for('packing_page') }}">Packing</a>
         <a class="{{ 'active' if request.path.startswith('/posting') else '' }}" href="{{ url_for('posting_page') }}">Posting</a>
+        <a class="{{ 'active' if request.path.startswith('/share') else '' }}" href="{{ url_for('share_page') }}">Share</a>
         <a class="{{ 'active' if request.path.startswith('/clean') else '' }}" href="{{ url_for('clean_page') }}">Clean</a>
         <a class="{{ 'active' if request.path.startswith('/history') else '' }}" href="{{ url_for('history_page') }}">History</a>
         <a class="{{ 'active' if request.path.startswith('/settings') or request.path.startswith('/plex') or request.path.startswith('/setup') else '' }}" href="{{ url_for('settings_page') }}">Settings</a>

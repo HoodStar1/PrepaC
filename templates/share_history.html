@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+{% set completed = jobs|selectattr("status", "equalto", "done")|list %}
+<section class="card">
+  <h2>Share Summary</h2>
+  {% if completed %}
+  <p><strong>Completed shares:</strong> {{ completed|length }}</p>
+  <table>
+    <tr><th>Date</th><th>Release</th><th>Destination</th><th>Remote</th><th>Saved Files</th></tr>
+    {% for j in completed[:8] %}
+    <tr>
+      <td>{{ j.finished_at or j.created_at }}</td>
+      <td><code>{{ j.job_name }}</code></td>
+      <td>{{ j.destination_name or j.destination_id }}</td>
+      <td><code>{{ j.remote_id or '' }}</code> <code>{{ j.remote_guid or '' }}</code></td>
+      <td><code>{{ j.generated_nfo_path or '' }}</code><br><code>{{ j.generated_mediainfo_path or '' }}</code></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No completed share summary yet.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Share History</h2>
+  <p><a href="{{ url_for('api_share_history_export') }}">Download CSV</a></p>
+  {% if jobs %}
+  <table>
+    <tr><th>Date</th><th>Job</th><th>Destination</th><th>Status</th><th>Category</th><th>Remote</th><th>Message</th></tr>
+    {% for j in jobs %}
+    <tr>
+      <td>{{ j.finished_at or j.created_at }}</td>
+      <td><code>{{ j.job_name }}</code></td>
+      <td>{{ j.destination_name or j.destination_id }}</td>
+      <td>{{ j.status }}</td>
+      <td>{{ j.selected_category_label or j.selected_category_id }}</td>
+      <td><code>{{ j.remote_id or '' }}</code> <code>{{ j.remote_guid or '' }}</code></td>
+      <td>{{ j.message or '' }}</td>
+    </tr>
+    <tr>
+      <td colspan="7">
+        <details><summary>Details / Events</summary>
+          <p><strong>Source:</strong> {{ j.source_type }} {{ j.source_ref_id }}</p>
+          <p><strong>NZB RAR:</strong> <code>{{ j.nzb_rar_path }}</code></p>
+          <p><strong>Template:</strong> <code>{{ j.template_path }}</code></p>
+          <p><strong>NFO:</strong> <code>{{ j.generated_nfo_path or '' }}</code></p>
+          <p><strong>MediaInfo:</strong> <code>{{ j.generated_mediainfo_path or '' }}</code></p>
+          <pre>{{ j.events|prettyjson }}</pre>
+        </details>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No share history yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

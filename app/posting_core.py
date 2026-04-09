@@ -15,6 +15,9 @@ from pathlib import Path
 from app.name_randomizer_data import RANDOMIZER_TEXT
 
 from app.secret_utils import resolve_secret
+from app.cache_store import SCAN_CACHE
+from app.metrics import inc, observe
+from app.subprocess_utils import run_command_with_output
 from app.packing_jobs import list_packing_history, has_large_running_packing_job
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.posting_jobs import (
@@ -163,6 +166,13 @@ def update_template_groups(template_text: str, groups_csv: str):
 def scan_posting_candidates(settings):
     reconcile_orphaned_posting_jobs_in_process()
     packed_root = Path(settings.get("packing_output_root") or "/media/dest/_packed")
+    cache_key = f"scan:posting:{packed_root}"
+    cached = SCAN_CACHE.get(cache_key)
+    if cached is not None:
+        inc("prepac_scan_cache_hits", 1, kind="posting")
+        return cached
+    inc("prepac_scan_cache_misses", 1, kind="posting")
+    started = time.time()
     output_root = packed_root / "output files"
     results = []
     if not packed_root.exists():
@@ -200,7 +210,8 @@ def scan_posting_candidates(settings):
             "header": info.get("header", ""),
             "password_present": bool(info.get("password")),
         })
-    return results
+    observe("prepac_scan_seconds", max(0.0, time.time() - started), kind="posting")
+    return SCAN_CACHE.set(cache_key, results, ttl_seconds=15)
     for item in sorted(packed_root.iterdir()):
         if not item.is_dir() or item.name == "output files":
             continue
@@ -810,8 +821,21 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             shutil.rmtree(packed_root)
 
         update_posting_job(job_id, provider_used=provider["name"])
+        SCAN_CACHE.invalidate_prefix("scan:posting")
         finish_posting(job_id, True, "Posting complete")
         add_posting_event(job_id, "complete", "Posting complete", 100)
+        try:
+            from app.share_core import maybe_auto_share_posting_job
+            maybe_auto_share_posting_job({
+                "id": job_id,
+                "job_name": job_name,
+                "size_bytes": size_bytes,
+                "groups_csv": groups_csv,
+                "nzb_rar_path": str(nzb_rar_path),
+                "template_path": str(posted_root / "template.txt"),
+            }, settings)
+        except Exception:
+            pass
         # keep live output briefly available; stats remain for UI/history
     except Exception as e:
         try:
@@ -857,5 +881,6 @@ def start_posting_job_async(packed_root, settings):
             run_posting_job(job_id, str(packed_root), str(output_files_root), str(template_path), settings)
         finally:
             _mark_posting_job_inactive(job_id)
+    SCAN_CACHE.invalidate_prefix("scan:posting")
     threading.Thread(target=_runner, daemon=True).start()
     return job_id

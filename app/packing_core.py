@@ -21,6 +21,9 @@ from app.db import load_settings
 from app.jobs import list_jobs
 from app.secret_utils import resolve_secret
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
+from app.cache_store import SCAN_CACHE
+from app.metrics import inc, observe
+from app.subprocess_utils import run_command_with_output
 from app.packing_jobs import (
     add_packing_event,
     create_packing_job,
@@ -95,6 +98,13 @@ def largest_video(path: Path):
 def scan_watch_folder(settings):
     reconcile_orphaned_packing_jobs_in_process()
     watch = Path(settings.get("packing_watch_root") or settings.get("dest_root") or "/media/dest")
+    cache_key = f"scan:packing:{watch}"
+    cached = SCAN_CACHE.get(cache_key)
+    if cached is not None:
+        inc("prepac_scan_cache_hits", 1, kind="packing")
+        return cached
+    inc("prepac_scan_cache_misses", 1, kind="packing")
+    started = time.time()
     jobs = []
     if not watch.exists():
         return jobs
@@ -157,7 +167,8 @@ def scan_watch_folder(settings):
             "estimated_parts": choose_volume_size(size)[1],
             "estimated_par2_percent": choose_par2_percent(size),
         })
-    return jobs
+    observe("prepac_scan_seconds", max(0.0, time.time() - started), kind="packing")
+    return SCAN_CACHE.set(cache_key, jobs, ttl_seconds=15)
 
 def choose_volume_size(total_bytes):
     estimates = [(s, math.ceil(total_bytes / s) if s else 0) for s in ALLOWED_VOLUMES]
@@ -750,39 +761,11 @@ def append_joblist(csv_path: Path, row):
         w.writerow(row)
 
 def run_cmd(cmd, cwd=None):
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    out = []
-    for line in proc.stdout:
-        out.append(line)
-    rc = proc.wait()
-    return rc, "".join(out)
+    return run_command_with_output(cmd, cwd=cwd, retries=1)
 
 def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None):
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
-    if job_id is not None:
-        register_packing_proc(job_id, proc)
-    out_lines = []
-    last_tick = 0.0
-    while True:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
-            out_lines.append(line)
-        now_ts = time.time()
-        if on_tick and (now_ts - last_tick >= tick_seconds):
-            try:
-                on_tick()
-            except Exception:
-                pass
-            last_tick = now_ts
-        if proc.poll() is not None:
-            # drain remaining
-            if proc.stdout:
-                rest = proc.stdout.read()
-                if rest:
-                    out_lines.append(rest)
-            break
-        time.sleep(0.2)
-    return proc.returncode, "".join(out_lines)
+    rc, output = run_command_with_output(cmd, cwd=cwd, retries=2, retry_delay=1.5, on_tick=on_tick, tick_seconds=tick_seconds, start_new_session=True)
+    return rc, output
 
 
 
@@ -1017,6 +1000,8 @@ def run_packing_job(job_id, source_path, settings):
                 raise RuntimeError(f"Packed successfully but failed to delete source folder: {delete_error}")
 
         finish_packing(job_id, True, "Packing complete")
+        SCAN_CACHE.invalidate_prefix("scan:packing")
+        SCAN_CACHE.invalidate_prefix("scan:posting")
         add_packing_event(job_id, "complete", "Packing complete", 100)
     except Exception as e:
         finish_packing(job_id, False, str(e))
@@ -1069,5 +1054,6 @@ def start_packing_job_async(source_path, settings):
         finally:
             _mark_packing_job_inactive(job_id)
 
+    SCAN_CACHE.invalidate_prefix("scan:packing")
     threading.Thread(target=_runner, daemon=True).start()
     return job_id

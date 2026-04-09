@@ -50,6 +50,20 @@
     <p><strong>Provider 2 Jobs:</strong> {{ posting_summary.provider2_jobs }}</p>
   </section>
   <section class="card">
+    <h2>Share Stats</h2>
+    <p><strong>Total Share Jobs:</strong> {{ share_summary.total_jobs }}</p>
+    <p><strong>Successful Shares:</strong> {{ share_summary.done_jobs }}</p>
+    <p><strong>Failed Shares:</strong> {{ share_summary.failed_jobs }}</p>
+    <p><strong>Queued Shares:</strong> {{ share_summary.queued_jobs }}</p>
+    <p><strong>Running Shares:</strong> {{ share_summary.running_jobs }}</p>
+    <p><strong>Destinations Used:</strong> {{ share_summary.destination_count }}</p>
+    <p><strong>From Posting:</strong> {{ share_summary.posting_jobs }}</p>
+    <p><strong>From Import:</strong> {{ share_summary.imported_jobs }}</p>
+  </section>
+</div>
+
+<div class="grid two">
+  <section class="card">
     <h2>Clean Stats</h2>
     <p><strong>Total Clean Actions Logged:</strong> {{ clean_summary.total_actions }}</p>
     <p><strong>Dry Runs:</strong> {{ clean_summary.dry_runs }}</p>

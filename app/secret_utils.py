@@ -22,6 +22,10 @@ SECRET_SPECS = {
         "env": "PREPAC_PASSWORD_RESET_TOKEN",
         "file": "/run/secrets/prepac_password_reset_token",
     },
+    "share_destinations_json": {
+        "env": "PREPAC_SHARE_DESTINATIONS_JSON",
+        "file": "/run/secrets/prepac_share_destinations_json",
+    },
 }
 
 def resolve_secret(setting_key, settings=None):

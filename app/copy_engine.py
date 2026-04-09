@@ -1,28 +1,34 @@
-import os, shutil, subprocess
+import os, shutil
 from pathlib import Path
 from app.helpers import human_bytes, video_stats
 from app.jobs import add_job_event, set_job_status, finish_job, register_prepare_proc, unregister_prepare_proc, get_prepare_job_status
 from app.history_db import save_prepared_item
+from app.subprocess_utils import run_command_with_output, terminate_process
 
 VIDEO_EXTS = ("mkv","mp4","avi","mov","m4v","ts","m2ts","wmv","mpg","mpeg","webm")
 
 def _run_rsync(cmd, job_id):
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
-    register_prepare_proc(job_id, proc)
-    try:
-        if proc.stdout:
-            for line in proc.stdout:
-                msg = line.strip()
-                if msg: add_job_event(job_id, "copying", msg[:400], None)
-                if get_prepare_job_status(job_id).lower() == 'cancelled':
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                    break
-        return proc.wait()
-    finally:
-        unregister_prepare_proc(job_id, proc)
+    import subprocess
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+        register_prepare_proc(job_id, proc)
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    msg = line.strip()
+                    if msg:
+                        add_job_event(job_id, "copying", msg[:400], None)
+                    if get_prepare_job_status(job_id).lower() == 'cancelled':
+                        terminate_process(proc)
+                        break
+            rc = proc.wait()
+        finally:
+            unregister_prepare_proc(job_id, proc)
+        if rc == 0 or get_prepare_job_status(job_id).lower() == 'cancelled' or attempt >= attempts:
+            return rc
+        add_job_event(job_id, "copying", f"rsync attempt {attempt} failed with exit code {rc}; retrying once", None)
+    return rc
 
 def _chmod_chown(dest_path, settings):
     try:

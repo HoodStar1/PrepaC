@@ -1,1 +1,30 @@
-{% extends 'base.html' %}{% block content %}<section class='card'><h2>Setup Step {{step}}</h2>{% if step==1 %}<form method='post'><input name='username'><input name='password'><input name='secret'><button>Continue</button></form>{% elif step==2 %}<form method='post'><input name='tv_root'><input name='movie_root'><input name='dest_root'><input name='recycle_bin_root'><button>Continue</button><button name='skip' value='1'>Skip</button></form>{% elif step==3 %}<form method='post'><a href='/plex/signin'>Sign in Plex</a><button name='skip' value='1'>Skip</button></form>{% else %}<form method='post'><button>Finish</button></form>{% endif %}</section>{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Initial Setup</h2>
+  <p>Create the local admin account used to sign in to PrepaC.</p>
+
+  <form method="post" class="stack" autocomplete="off">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" value="{{ request.form.get('username', '') }}" required autofocus>
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required>
+
+    <label for="confirm_password">Confirm password</label>
+    <input id="confirm_password" name="confirm_password" type="password" required>
+
+    <label for="recovery_secret">Recovery secret</label>
+    <input id="recovery_secret" name="recovery_secret" type="password" required>
+
+    <label for="confirm_recovery_secret">Confirm recovery secret</label>
+    <input id="confirm_recovery_secret" name="confirm_recovery_secret" type="password" required>
+
+    <p class="muted">Use a recovery secret with at least 8 characters. It is required to reset the password later.</p>
+
+    <div class="actions">
+      <button type="submit">Finish setup</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

@@ -4,6 +4,9 @@ services:
     container_name: prepac
     ports:
       - "1234:1234"
+    environment:
+      PREPAC_LOG_LEVEL: INFO
+      PREPAC_LOG_JSON: "false"
     volumes:
       - /mnt/user/Systems/appdata/prepac:/config
       - /mnt/user/TV Shows:/media/tv
@@ -12,12 +15,12 @@ services:
       - /mnt/user/TBP/Jobs:/media/dest
       - /mnt:/host_mnt
     restart: unless-stopped
+    stop_grace_period: 45s
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-
 
 # Optional secret sources (choose either env vars or bind-mounted files under /run/secrets)
 # environment:
@@ -31,4 +34,3 @@ services:
 #   - /path/to/prepac_posting_provider2_password:/run/secrets/prepac_posting_provider2_password:ro
 #   - /path/to/prepac_plex_token:/run/secrets/prepac_plex_token:ro
 #   - /path/to/prepac_packing_freeimage_api_key:/run/secrets/prepac_packing_freeimage_api_key:ro
-

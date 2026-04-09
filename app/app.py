@@ -2,6 +2,7 @@
 import csv
 import io
 import os
+import logging
 import pathlib
 import json
 import re
@@ -32,9 +33,16 @@ from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats
 from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
+from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, maybe_auto_share_posting_job, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
+from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
 from app.version import APP_NAME, APP_VERSION, BUILD_NUMBER, FULL_VERSION, DISPLAY_VERSION, BUILD_DISPLAY
+from app.logging_utils import setup_logging
+from app.metrics import inc, observe, render_prometheus, set_gauge
+from app.config_validation import normalize_settings
+from app.auth_state import auth_is_initialized
+from app.fs_watcher import start_watchers, stop_watchers
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -65,6 +73,9 @@ def _load_or_create_flask_secret() -> str:
     except Exception:
         return secrets.token_urlsafe(64)
 
+setup_logging()
+LOG = logging.getLogger(__name__)
+
 app = Flask(__name__, template_folder="../templates", static_folder="../static")
 app.secret_key = _load_or_create_flask_secret()
 app.config.update(
@@ -90,7 +101,7 @@ def inject_version_info():
 
 def auth_initialized(settings=None):
     settings = settings or load_settings()
-    return str(settings.get("auth_initialized", "false")).lower() == "true" and bool(str(settings.get("auth_username", "") or "").strip()) and bool(str(settings.get("auth_password_hash", "") or "").strip())
+    return auth_is_initialized(settings)
 
 def auth_username(settings=None):
     settings = settings or load_settings()
@@ -133,6 +144,18 @@ def _safe_next_url(candidate: str | None):
 
 
 @app.before_request
+def _track_request_start():
+    request._prepac_started_at = time.time()
+
+@app.after_request
+def _track_request_metrics(response):
+    started_at = getattr(request, "_prepac_started_at", None)
+    if started_at:
+        observe("prepac_http_request_seconds", max(0.0, time.time() - started_at), method=request.method, endpoint=request.endpoint or "unknown")
+    inc("prepac_http_requests", 1, method=request.method, status=str(response.status_code))
+    return response
+
+@app.before_request
 def enforce_authentication():
     endpoint = request.endpoint or ""
     allowed = {"health_page", "login_page", "setup_page", "reset_password_page", "logout_page", "static"}
@@ -159,6 +182,10 @@ APP_RUNTIME_STATE = {
     "draining": False,
     "shutdown_marked": False,
 }
+try:
+    start_watchers(load_settings())
+except Exception as exc:
+    LOG.warning("Unable to start file-system watchers: %s", exc)
 
 def mark_running_jobs_interrupted(reason="Interrupted by container shutdown", recovery=False):
     if APP_RUNTIME_STATE.get("shutdown_marked") and not recovery:
@@ -596,6 +623,30 @@ def parse_posting_log_stats(log_path):
             stats["eta"] = "calculating..."
         return stats
     return stats
+
+
+def summarize_share_stats(share_jobs):
+    rows = list(share_jobs or [])
+    total_jobs = len(rows)
+    done_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "done")
+    failed_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "failed")
+    queued_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "queued")
+    running_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "running")
+    destinations = sorted({str(row.get("destination_name") or row.get("destination_id") or "").strip() for row in rows if str(row.get("destination_name") or row.get("destination_id") or "").strip()})
+    imported_jobs = sum(1 for row in rows if str(row.get("source_type", "")).lower() == "imported")
+    posting_jobs = sum(1 for row in rows if str(row.get("source_type", "")).lower() == "posting")
+    return {
+        "total_jobs": total_jobs,
+        "done_jobs": done_jobs,
+        "failed_jobs": failed_jobs,
+        "queued_jobs": queued_jobs,
+        "running_jobs": running_jobs,
+        "destination_count": len(destinations),
+        "imported_jobs": imported_jobs,
+        "posting_jobs": posting_jobs,
+    }
+
+
 def summarize_running_jobs(prepare_jobs, packing_jobs, posting_jobs):
     running = []
     for j in prepare_jobs:
@@ -861,6 +912,7 @@ def api_version_check():
 @app.route("/health")
 def health_page():
     healthy, payload = _evaluate_health_state()
+    set_gauge("prepac_health_failure_count", float(HEALTH_FAILURE_STATE["count"]))
     if healthy:
         HEALTH_FAILURE_STATE["count"] = 0
         HEALTH_FAILURE_STATE["reason"] = ""
@@ -879,6 +931,15 @@ def health_page():
 def workflow_auto_chain_enabled(settings=None):
     settings = settings or load_settings()
     return str(settings.get("workflow_auto_chain_enabled", "false")).lower() == "true"
+
+@app.route("/metrics")
+def metrics_page():
+    healthy, payload = _evaluate_health_state()
+    set_gauge("prepac_running_jobs", payload.get("running", {}).get("prepare", 0), kind="prepare")
+    set_gauge("prepac_running_jobs", payload.get("running", {}).get("packing", 0), kind="packing")
+    set_gauge("prepac_running_jobs", payload.get("running", {}).get("posting", 0), kind="posting")
+    return Response(render_prometheus(), mimetype="text/plain; version=0.0.4")
+
 
 def _prepare_has_auto_chain_event(job):
     return any((ev.get("phase") == "auto_chain") for ev in (job.get("events") or []))
@@ -1003,7 +1064,7 @@ def setup_page():
             flash("Admin account created. Please sign in.", "success")
             return redirect(url_for("login_page"))
 
-    return render_template("setup.html")
+    return render_template("setup.html", step=1)
 
 start_auto_chain_thread_once()
 
@@ -1092,10 +1153,12 @@ def dashboard():
     all_clean_logs = list_clean_actions(5000)
     all_packing_jobs = list_packing_jobs(5000)
     all_posting_jobs = list_posting_jobs(5000)
+    all_share_jobs = list_share_history(5000)
     clean_summary = summarize_clean_logs(all_clean_logs)
     prepare_summary = summarize_prepare_stats(all_history, all_jobs)
     packing_summary = summarize_packing_stats(all_packing_jobs)
     posting_summary = summarize_posting_stats(all_posting_jobs)
+    share_summary = summarize_share_stats(all_share_jobs)
     current_running = summarize_running_jobs(all_jobs, all_packing_jobs, all_posting_jobs)
     recent_actions = build_recent_actions(all_history, all_clean_logs, all_packing_jobs, all_posting_jobs, 10)
     return render_template(
@@ -1108,6 +1171,7 @@ def dashboard():
         prepare_summary=prepare_summary,
         packing_summary=packing_summary,
         posting_summary=posting_summary,
+        share_summary=share_summary,
         current_running=current_running,
         recent_actions=recent_actions,
     )
@@ -1127,6 +1191,7 @@ HELP_TOPICS = [
     {"slug": "prepare", "title": "Prepare"},
     {"slug": "packing", "title": "Packing"},
     {"slug": "posting", "title": "Posting"},
+    {"slug": "share", "title": "Share"},
     {"slug": "clean", "title": "Clean"},
     {"slug": "settings", "title": "Settings"},
 ]
@@ -1145,7 +1210,10 @@ def settings_page():
     for key in SECRET_SPECS.keys():
         display_settings[key] = masked_secret_value(key, settings)
         display_settings[key + "_source"] = secret_source(key, settings)
-    return render_template("settings.html", settings=display_settings)
+    share_destinations_source = secret_source("share_destinations_json", settings)
+    display_settings["share_destinations_editor"] = settings.get("share_destinations_json", "[]") if share_destinations_source == "saved_setting" else ""
+    display_settings["share_destinations_source"] = share_destinations_source
+    return render_template("settings.html", settings=display_settings, share_destinations=get_share_destinations(settings), share_category_options=CATEGORY_KEY_OPTIONS)
 
 @app.route("/plex")
 def plex_page():
@@ -1163,7 +1231,7 @@ def clean_logs_page():
 def api_settings_save():
     current = load_settings()
     data = dict(current)
-    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","auth_username","github_repo_owner","github_repo_name"]:
+    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","auth_username","github_repo_owner","github_repo_name","share_import_root","share_request_timeout","share_destinations_json"]:
         if k in request.form:
             incoming = request.form.get(k, current.get(k, "")).strip()
             if k in SECRET_SPECS and incoming.startswith("********"):
@@ -1183,7 +1251,15 @@ def api_settings_save():
     data["posting_provider2_ssl"] = "true" if request.form.get("posting_provider2_ssl") else "false"
     data["workflow_auto_chain_enabled"] = "true" if request.form.get("workflow_auto_chain_enabled") else "false"
     data["update_check_enabled"] = "true" if request.form.get("update_check_enabled") else "false"
+    data["share_auto_after_posting"] = "true" if request.form.get("share_auto_after_posting") else "false"
+    data, warnings = normalize_settings(data)
     save_settings(data)
+    try:
+        start_watchers(data)
+    except Exception as exc:
+        LOG.warning("Unable to refresh file-system watchers after settings save: %s", exc)
+    for warning in warnings:
+        flash(warning, "warning")
     flash("Settings saved.", "success")
     return redirect(url_for("settings_page"))
 
@@ -1401,7 +1477,10 @@ def packing_page():
 @app.route("/api/packing/scan", methods=["POST"])
 def api_packing_scan():
     settings = load_settings()
-    return jsonify({"ok": True, "results": scan_watch_folder(settings)})
+    results = scan_watch_folder(settings)
+    inc("prepac_scan_requests", 1, kind="packing")
+    set_gauge("prepac_last_scan_results", len(results), kind="packing")
+    return jsonify({"ok": True, "results": results})
 
 @app.route("/api/packing/start", methods=["POST"])
 def api_packing_start():
@@ -1440,7 +1519,10 @@ def posting_page():
 @app.route("/api/posting/scan", methods=["POST"])
 def api_posting_scan():
     settings = load_settings()
-    return jsonify({"ok": True, "results": scan_posting_candidates(settings)})
+    results = scan_posting_candidates(settings)
+    inc("prepac_scan_requests", 1, kind="posting")
+    set_gauge("prepac_last_scan_results", len(results), kind="posting")
+    return jsonify({"ok": True, "results": results})
 
 @app.route("/api/posting/start", methods=["POST"])
 def api_posting_start():
@@ -1481,6 +1563,106 @@ def api_posting_output(job_id):
 def clean_result_page():
     return render_template("clean_result.html")
 
+
+@app.route("/share")
+def share_page():
+    settings = load_settings()
+    return render_template("share.html", settings=settings, category_options=CATEGORY_KEY_OPTIONS)
+
+@app.route("/api/share/candidates")
+def api_share_candidates():
+    settings = load_settings()
+    destinations = public_share_destinations(settings)
+    results = build_share_candidates(settings)
+    for item in results:
+        item["resolved_categories"] = build_resolved_category_preview(destinations, item.get("category_key") or "movie_hd")
+    return jsonify({"ok": True, "results": results, "destinations": destinations, "category_options": CATEGORY_KEY_OPTIONS})
+
+@app.route("/api/share/jobs")
+def api_share_jobs():
+    return jsonify({"ok": True, "jobs": list_share_jobs(500)})
+
+@app.route("/api/share/jobs/stream")
+def api_share_jobs_stream():
+    return _event_stream(lambda: {"jobs": list_share_jobs(500)})
+
+
+@app.route("/api/share/review", methods=["POST"])
+def api_share_review():
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("items") or []
+    destination_ids = payload.get("destination_ids") or []
+    review = build_share_submission_review(items, destination_ids, load_settings())
+    return jsonify({"ok": True, **review})
+
+@app.route("/api/share/start", methods=["POST"])
+def api_share_start():
+    draining = reject_if_draining()
+    if draining:
+        return draining
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("items") or []
+    destination_ids = payload.get("destination_ids") or []
+    result = queue_share_jobs(items, destination_ids, load_settings())
+    return jsonify({"ok": True, **result})
+
+@app.route("/api/share/retry", methods=["POST"])
+def api_share_retry():
+    payload = request.get_json(silent=True) or {}
+    job_id = int(payload.get("job_id") or 0)
+    job = get_share_job(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Share job not found"}), 404
+    increment_share_retry(job_id)
+    start_share_job_async(job_id, load_settings())
+    return jsonify({"ok": True, "job_id": job_id})
+
+@app.route("/api/share/import", methods=["POST"])
+def api_share_import():
+    nzb_rar_file = request.files.get("nzb_rar")
+    template_file = request.files.get("template_file")
+    mediainfo_file = request.files.get("mediainfo_file")
+    release_name = (request.form.get("release_name", "") or "").strip()
+    if not nzb_rar_file or not template_file:
+        return jsonify({"ok": False, "error": "NZB RAR and template file are required"}), 400
+    bundle_id = import_share_bundle(nzb_rar_file, template_file, mediainfo_file, release_name)
+    return jsonify({"ok": True, "bundle_id": bundle_id})
+
+@app.route("/api/share/import-bulk", methods=["POST"])
+def api_share_import_bulk():
+    nzb_rar_files = request.files.getlist("nzb_rar_files")
+    template_files = request.files.getlist("template_files")
+    mediainfo_files = request.files.getlist("mediainfo_files")
+    if not nzb_rar_files or not template_files:
+        return jsonify({"ok": False, "error": "RARred NZBs and template files are required"}), 400
+    result = import_share_bundles_bulk(nzb_rar_files, template_files, mediainfo_files)
+    return jsonify({"ok": True, **result})
+
+@app.route("/api/share/candidate/remove", methods=["POST"])
+def api_share_candidate_remove():
+    payload = request.get_json(silent=True) or {}
+    candidate_id = str(payload.get("candidate_id") or "").strip()
+    if not candidate_id:
+        return jsonify({"ok": False, "error": "candidate_id is required"}), 400
+    result = remove_share_candidate(candidate_id, load_settings())
+    return jsonify({"ok": True, **result})
+
+@app.route("/api/share/caps/refresh", methods=["POST"])
+def api_share_caps_refresh():
+    return jsonify({"ok": True, "results": refresh_share_caps(load_settings())})
+
+@app.route("/api/share/destination/test", methods=["POST"])
+def api_share_destination_test():
+    payload = request.get_json(silent=True) or {}
+    destination = payload.get("destination") or {}
+    if not isinstance(destination, dict):
+        return jsonify({"ok": False, "error": "Invalid destination payload"}), 400
+    try:
+        categories = fetch_destination_caps(destination, timeout=15)
+        return jsonify({"ok": True, "count": len(categories), "categories": categories[:50]})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
 @app.route("/history")
 def history_page():
     return render_template("history_index.html")
@@ -1500,6 +1682,10 @@ def history_packing_page():
 @app.route("/history/posting")
 def history_posting_page():
     return render_template("posting_history.html", jobs=list_posting_history(5000))
+
+@app.route("/history/share")
+def history_share_page():
+    return render_template("share_history.html", jobs=list_share_history(5000))
 
 @app.route("/api/history/export.csv")
 def api_history_export():
@@ -1541,6 +1727,17 @@ def api_posting_history_export():
     for r in rows:
         writer.writerow([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("packed_root"), r.get("posted_root"), r.get("status"), r.get("phase"), r.get("percent"), r.get("size_bytes"), r.get("provider_used"), r.get("nzb_path"), r.get("message")])
     return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_posting_history.csv"})
+
+
+@app.route("/api/share/history/export.csv")
+def api_share_history_export():
+    rows = list_share_history(10000)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id","created_at","started_at","finished_at","job_name","destination_name","selected_category_label","status","remote_id","remote_guid","message"])
+    for r in rows:
+        writer.writerow([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("destination_name"), r.get("selected_category_label"), r.get("status"), r.get("remote_id"), r.get("remote_guid"), r.get("message")])
+    return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_share_history.csv"})
 
 @app.route("/api/prepare/tv/search")
 def api_prepare_tv_search():

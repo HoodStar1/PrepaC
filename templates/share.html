@@ -1,0 +1,440 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-panel"><div><h2>Share</h2><p>Review share candidates, import bundles, and submit to Newznab-compatible destinations.</p></div></section>
+<section class="card">
+  <h2>Share</h2>
+  <div class="row">
+    <button type="button" onclick="refreshShareCandidates()">Refresh share candidates</button>
+    <button type="button" onclick="refreshShareCaps()">Refresh destination categories</button>
+  </div>
+  <div id="shareDestinations" class="row" style="margin-top:1rem;"><p class="muted">No destinations loaded yet.</p></div>
+  <div class="row" style="margin-top:1rem;align-items:end;">
+    <label style="min-width:260px;"><span>Filter candidates by destination</span><select id="shareDestinationFilter" onchange="applyShareCandidateFilters()"><option value="">All selected destinations</option></select></label>
+  </div>
+  <div id="shareSummaryBar" class="card-subtle" style="margin-top:1rem;"><p class="muted">Select destinations and candidates to see readiness summary.</p></div>
+  <div id="shareActionNotice" style="margin-top:1rem;"><p class="muted">No share action has been started yet.</p></div>
+  <p class="muted">Each candidate shows the actual category ID and label that will be used for the currently selected destinations.</p>
+  <div id="shareCandidates"><p class="muted">No share scan run yet.</p></div>
+  <div class="row action-toolbar action-toolbar-bottom">
+    <button type="button" onclick="openShareReviewModal()">Submit selected shares</button>
+  </div>
+</section>
+
+
+<section class="card">
+  <h2>Import for Share</h2>
+  <div class="grid two">
+    <form id="shareImportForm" enctype="multipart/form-data">
+      <h3>Single import</h3>
+      <div class="form-grid">
+        <label><span>Release Name (optional)</span><input type="text" name="release_name"></label>
+        <label><span>RARred NZB</span><input type="file" name="nzb_rar" required></label>
+        <label><span>Template File</span><input type="file" name="template_file" required></label>
+        <label><span>MediaInfo XML Override (optional)</span><input type="file" name="mediainfo_file"></label>
+      </div>
+      <div class="row" style="margin-top:1rem;"><button type="submit">Import bundle</button></div>
+    </form>
+    <form id="shareBulkImportForm" enctype="multipart/form-data">
+      <h3>Mass import</h3>
+      <p class="muted">Upload many RARred NZBs and template files at once. PrepaC pairs them automatically using filename matching and template-content matching, so files do not need identical names.</p>
+      <div class="form-grid">
+        <label><span>RARred NZBs</span><input type="file" name="nzb_rar_files" multiple required></label>
+        <label><span>Template Files</span><input type="file" name="template_files" multiple required></label>
+        <label><span>MediaInfo XML files (optional)</span><input type="file" name="mediainfo_files" multiple></label>
+      </div>
+      <div class="row" style="margin-top:1rem;"><button type="submit">Mass import bundles</button></div>
+    </form>
+  </div>
+  <pre id="shareImportResult">No import performed yet.</pre>
+</section>
+
+
+
+<div id="shareReviewModal" class="modal-backdrop" hidden>
+  <div class="modal-card">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <h3 style="margin:0;">Review share submission</h3>
+      <button type="button" onclick="closeShareReviewModal()">Close</button>
+    </div>
+    <p class="muted">Review the final queue before submit.</p>
+    <div id="shareReviewSummary" class="card-subtle"></div>
+    <div id="shareReviewList" class="share-review-list"></div>
+    <div class="row" style="margin-top:1rem;justify-content:flex-end;">
+      <button type="button" onclick="closeShareReviewModal()">Cancel</button>
+      <button type="button" id="shareReviewConfirmBtn" onclick="confirmSelectedShare()">Confirm submit</button>
+    </div>
+  </div>
+</div>
+
+<section class="card">
+  <h2>Active Share Jobs</h2>
+  <div id="shareJobs"><p class="muted">Loading share jobs...</p></div>
+</section>
+
+<style>
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:1rem;z-index:1000;opacity:1;visibility:visible;pointer-events:auto;}
+.modal-backdrop[hidden]{display:none !important;opacity:0 !important;visibility:hidden !important;pointer-events:none !important;}
+.modal-card{background:linear-gradient(180deg,var(--bg-card),var(--bg-card-2));max-width:920px;width:100%;max-height:88vh;overflow:auto;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:1rem;box-shadow:0 20px 60px rgba(0,0,0,.35);}
+.share-review-list{display:grid;gap:.75rem;margin-top:1rem;}
+.job-danger{border-color:#7f1d1d;background:rgba(127,29,29,.12);}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.75rem;}
+.summary-pill{padding:.75rem;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(255,255,255,.03);}
+</style>
+<script>
+let shareCandidates = [];
+let shareDestinations = [];
+let shareCategoryOptions = {{ category_options|tojson }};
+
+function gb(v){ return ((v||0)/(1024**3)).toFixed(2)+' GB'; }
+function esc(v){ return String(v || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function formatPairingLabel(value){
+  const map = {
+    filename: 'Filename match',
+    template_content_high: 'Template content (high confidence)',
+    template_content_medium: 'Template content (medium confidence)',
+    template_content_low: 'Template content (low confidence)'
+  };
+  return map[String(value||'').trim()] || value || 'Unknown';
+}
+
+function renderShareDestinations(){
+  const box = document.getElementById('shareDestinations');
+  const filter = document.getElementById('shareDestinationFilter');
+  if(!shareDestinations.length){ box.innerHTML = '<p class="muted">No destinations configured.</p>'; filter.innerHTML = '<option value="">All selected destinations</option>'; return; }
+  box.innerHTML = shareDestinations.map((dest, idx) => `
+    <label class="checkbox"><input type="checkbox" class="share-dest" value="${esc(dest.id)}" ${idx===0 ? 'checked' : ''} onchange="onShareSelectionChanged()"><span>${esc(dest.name || dest.id)} (${esc(dest.mode || 'manual')})</span></label>
+  `).join('');
+  filter.innerHTML = `<option value="">All selected destinations</option>${shareDestinations.map(dest => `<option value="${esc(dest.id)}">${esc(dest.name || dest.id)}</option>`).join('')}`;
+}
+
+function categorySelect(candidateId, selectedValue){
+  return `<select class="share-category" data-candidate-id="${esc(candidateId)}" onchange="onShareSelectionChanged(); updateResolvedCategoryPreview(this.dataset.candidateId)">${shareCategoryOptions.map(opt => `<option value="${opt.value}" ${opt.value===selectedValue?'selected':''}>${opt.label}</option>`).join('')}</select>`;
+}
+
+function selectedDestinationIds(){
+  return Array.from(document.querySelectorAll('.share-dest:checked')).map(el => el.value);
+}
+
+function resolveForDestination(dest, categoryKey){
+  const standard = {
+    movie_sd: {id:'2030', label:'Movies SD'},
+    movie_hd: {id:'2040', label:'Movies HD'},
+    movie_uhd: {id:'2045', label:'Movies UHD'},
+    tv_sd: {id:'5030', label:'TV SD'},
+    tv_hd: {id:'5040', label:'TV HD'},
+    tv_uhd: {id:'5045', label:'TV UHD'}
+  };
+  const std = standard[categoryKey] || {id:'', label:categoryKey};
+  const overrides = dest.category_overrides || {};
+  const cache = dest.categories_cache || [];
+  const overrideId = String(overrides[categoryKey] || '').trim();
+  if(overrideId){
+    const hit = cache.find(item => String(item.id) === overrideId);
+    return { id: overrideId, label: hit ? (hit.label || std.label) : `Override (${categoryKey})`, source: 'override' };
+  }
+  const exact = cache.find(item => String(item.id) === std.id);
+  if(exact){
+    return { id: String(exact.id || std.id), label: exact.label || std.label, source: 'caps' };
+  }
+  const normalized = cache.map(item => ({ id: String(item.id || ''), label: String(item.label || '') }));
+  const fuzzy = normalized.find(item => {
+    const label = item.label.toLowerCase();
+    if(categoryKey.endsWith('uhd') && (label.includes('uhd') || label.includes('2160'))) return true;
+    if(categoryKey.endsWith('hd') && (label.includes('hd') || label.includes('1080') || label.includes('720'))) return true;
+    if(categoryKey.startsWith('tv') && (label.includes('tv') || label.includes('series'))) return true;
+    if(categoryKey.startsWith('movie') && (label.includes('movie') || label.includes('film'))) return true;
+    return false;
+  });
+  if(fuzzy){
+    return { id: fuzzy.id, label: fuzzy.label || std.label, source: 'caps' };
+  }
+  return { id: std.id, label: std.label, source: 'standard' };
+}
+
+function updateResolvedCategoryPreview(candidateId){
+  const holder = document.querySelector(`.resolved-preview[data-candidate-id="${CSS.escape(candidateId)}"]`);
+  if(!holder) return;
+  const categoryEl = document.querySelector(`.share-category[data-candidate-id="${CSS.escape(candidateId)}"]`);
+  const categoryKey = categoryEl ? categoryEl.value : 'movie_hd';
+  const destIds = new Set(selectedDestinationIds());
+  const selected = shareDestinations.filter(dest => destIds.has(dest.id));
+  if(!selected.length){
+    holder.innerHTML = '<p class="muted">Select one or more destinations to preview the resolved category ID and label.</p>';
+    return;
+  }
+  holder.innerHTML = `
+    <p><strong>Resolved category preview</strong></p>
+    <ul class="list-reset">${selected.map(dest => {
+      const resolved = resolveForDestination(dest, categoryKey);
+      return `<li><strong>${esc(dest.name || dest.id)}</strong>: <code>${esc(resolved.id || '')}</code> — ${esc(resolved.label || '')} <span class="muted">(${esc(resolved.source)})</span></li>`;
+    }).join('')}</ul>
+  `;
+}
+
+function updateAllResolvedCategoryPreviews(){
+  shareCandidates.forEach(item => updateResolvedCategoryPreview(item.candidate_id));
+}
+
+function getActiveDestinationFilter(){
+  const el = document.getElementById('shareDestinationFilter');
+  return el ? el.value : "";
+}
+
+function applyShareCandidateFilters(){
+  const filterId = getActiveDestinationFilter();
+  const selectedIds = new Set(selectedDestinationIds());
+  document.querySelectorAll('.share-candidate-card').forEach(card => {
+    const candidateId = card.dataset.candidateId || '';
+    const candidate = shareCandidates.find(item => item.candidate_id === candidateId) || {};
+    const shared = Array.isArray(candidate.shared_destinations) ? candidate.shared_destinations : [];
+    const sharedIds = new Set(shared.map(item => String(item.destination_id || '')));
+    const selectedShared = shared.filter(item => selectedIds.has(String(item.destination_id || '')));
+    const sharedNames = selectedShared.map(item => item.destination_name || item.destination_id).filter(Boolean);
+    const statusEl = card.querySelector('.share-selected-status');
+    if(statusEl){
+      if(!selectedIds.size){
+        statusEl.innerHTML = '<span class="muted">Select one or more destinations to see share status.</span>';
+      } else if(sharedNames.length){
+        statusEl.innerHTML = `<strong>Already shared to selected:</strong> ${esc(sharedNames.join(', '))}`;
+      } else {
+        statusEl.innerHTML = '<span class="muted">Not shared to selected destinations yet.</span>';
+      }
+    }
+    const fullySharedToSelected = selectedIds.size > 0 && Array.from(selectedIds).every(id => sharedIds.has(id));
+    const filterHidden = !!filterId && selectedIds.has(filterId) && sharedIds.has(filterId);
+    card.hidden = fullySharedToSelected || filterHidden;
+  });
+  updateShareSummaryBar();
+}
+
+function onShareSelectionChanged(){
+  updateAllResolvedCategoryPreviews();
+  applyShareCandidateFilters();
+  debouncedRefreshShareReviewSummary();
+}
+
+let reviewSummaryDebounce = null;
+
+function renderShareCandidates(){
+  const box = document.getElementById('shareCandidates');
+  if(!shareCandidates.length){ box.innerHTML = '<p class="muted">No share candidates found.</p>'; return; }
+  box.innerHTML = shareCandidates.map((item, idx) => {
+    const sharedIds = (item.shared_destinations || []).map(dest => String(dest.destination_id || '')).filter(Boolean);
+    return `
+    <article class="job share-candidate-card" data-candidate-id="${esc(item.candidate_id)}" data-filter-dest="${esc((item.resolved_categories||[])[0]?.destination_id || '')}" data-selected-destinations="|${esc(sharedIds.join('|'))}|">
+      <div class="row" style="justify-content:space-between;align-items:center;gap:.75rem;">
+        <label class="checkbox"><input type="checkbox" class="share-cand" value="${idx}" onchange="onShareSelectionChanged()"><span>Select</span></label>
+        <button type="button" class="mini-remove" onclick="removeShareCandidate('${esc(item.candidate_id)}')">Remove</button>
+      </div>
+      <h3>${esc(item.release_name || item.job_name)}</h3>
+      <p><strong>Source:</strong> ${esc(item.source_type)}</p>
+      <p><strong>NZB RAR:</strong> <code>${esc(item.nzb_rar_path)}</code></p>
+      <p><strong>Template:</strong> <code>${esc(item.template_path)}</code></p>
+      <p><strong>Type:</strong> ${esc(item.media_type || 'unknown')} | <strong>Resolution:</strong> ${esc(item.resolution || 'unknown')} | <strong>Size:</strong> ${esc(item.template_declared_size || gb(item.size_bytes))}</p>
+      <p><strong>Episodes:</strong> ${esc(item.episode_count || '')} ${item.episode_range ? `| <strong>Range:</strong> ${esc(item.episode_range)}` : ""} ${item.template_first_title ? `| <strong>First file:</strong> ${esc(item.template_first_title)}` : ""}</p>
+      ${item.matched_by ? `<p><strong>Pairing:</strong> ${esc(formatPairingLabel(item.matched_by))} | <strong>Confidence:</strong> ${esc(item.match_score)}%</p>` : ""}
+      <p><strong>Groups:</strong> <code>${esc(item.groups_csv || 'Unknown')}</code></p>
+      ${item.hdr_flags && item.hdr_flags.length ? `<p><strong>HDR Flags:</strong> ${esc(item.hdr_flags.join(', '))}</p>` : ""}
+      ${(item.video_codec || item.audio_codec) ? `<p><strong>Codec:</strong> ${esc(item.video_codec || 'Unknown video')} ${item.audio_codec ? `| <strong>Audio Codec:</strong> ${esc(item.audio_codec)}` : ""}</p>` : ""}
+      ${item.video_summary ? `<p><strong>Video:</strong> ${esc(item.video_summary)}</p>` : ""}
+      ${item.audio_summary ? `<p><strong>Audio:</strong> ${esc(item.audio_summary)}</p>` : ""}
+      <label><span>Category</span>${categorySelect(item.candidate_id, item.category_key || 'movie_hd')}</label>
+      <div class="resolved-preview card-subtle" data-candidate-id="${esc(item.candidate_id)}"></div>
+      <p class="share-selected-status muted" style="margin-top:.75rem;"></p>
+    </article>
+  `;}).join('');
+  updateAllResolvedCategoryPreviews();
+}
+
+async function refreshShareCandidates(){
+  const r = await fetch('/api/share/candidates');
+  const d = await r.json();
+  shareCandidates = d.results || [];
+  shareDestinations = d.destinations || [];
+  shareCategoryOptions = d.category_options || shareCategoryOptions;
+  renderShareDestinations();
+  renderShareCandidates();
+  applyShareCandidateFilters();
+  debouncedRefreshShareReviewSummary();
+}
+
+async function refreshShareCaps(){
+  const r = await fetch('/api/share/caps/refresh', {method:'POST'});
+  const d = await r.json();
+  setShareActionNotice(d.ok === false ? 'error' : 'info', d.ok === false ? (d.error || 'Could not refresh destination categories.') : 'Destination categories refreshed.');
+  await refreshShareCandidates();
+}
+
+function collectSelectedSharePayload(){
+  const destination_ids = Array.from(document.querySelectorAll('.share-dest:checked')).map(el => el.value);
+  const items = Array.from(document.querySelectorAll('.share-cand:checked')).map(el => {
+    const candidate = shareCandidates[parseInt(el.value, 10)];
+    const category = document.querySelector(`.share-category[data-candidate-id="${candidate.candidate_id}"]`);
+    return {candidate_id: candidate.candidate_id, category_key: category ? category.value : candidate.category_key};
+  });
+  return {destination_ids, items};
+}
+
+
+function setShareActionNotice(kind, message){
+  const box = document.getElementById('shareActionNotice');
+  box.innerHTML = `<div class="flash ${kind || 'info'}">${esc(message || '')}</div>`;
+}
+
+function closeShareReviewModal(){
+  document.getElementById('shareReviewModal').hidden = true;
+}
+
+async function openShareReviewModal(){
+  const payload = collectSelectedSharePayload();
+  if(!payload.destination_ids.length){ setShareActionNotice('error', 'Select at least one destination.'); return; }
+  if(!payload.items.length){ setShareActionNotice('error', 'Select at least one candidate.'); return; }
+  const r = await fetch('/api/share/review', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  const summary = d.summary || {};
+  document.getElementById('shareReviewSummary').innerHTML = `
+    <p><strong>Ready:</strong> ${summary.ready || 0} &nbsp; <strong>Blocked:</strong> ${summary.blocked || 0} &nbsp; <strong>Warnings:</strong> ${summary.warnings || 0}</p>
+    <p class="muted">Blocked items will not be queued if you continue.</p>
+  `;
+  const rows = (d.reviews || []).map(item => `
+    <article class="job ${item.status === 'blocked' ? 'job-danger' : ''}">
+      <h4>${esc(item.release_name || '')}</h4>
+      <p><strong>Destination:</strong> ${esc(item.destination_name || item.destination_id || '')}</p>
+      <p><strong>Category:</strong> <code>${esc(item.selected_category_id || '')}</code> — ${esc(item.selected_category_label || '')} <span class="muted">(${esc(item.match_source || 'standard')})</span></p>
+      <p><strong>NFO:</strong> ${item.nfo ? 'Yes' : 'No'} | <strong>MediaInfo:</strong> ${item.mediainfo ? 'Yes' : 'No'}</p>
+      <p><strong>Status:</strong> ${esc(item.status || '')}</p>
+      ${item.warning ? `<p class="muted"><strong>Warning:</strong> ${esc(item.warning)}</p>` : ''}
+    </article>
+  `).join('');
+  document.getElementById('shareReviewList').innerHTML = rows || '<p class="muted">Nothing selected.</p>';
+  document.getElementById('shareReviewConfirmBtn').dataset.payload = JSON.stringify(payload);
+  document.getElementById('shareReviewModal').hidden = false;
+}
+
+async function confirmSelectedShare(){
+  const btn = document.getElementById('shareReviewConfirmBtn');
+  const payload = JSON.parse(btn.dataset.payload || '{}');
+  const r = await fetch('/api/share/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  closeShareReviewModal();
+  const queued = d.queued || 0;
+  const blocked = d.blocked || 0;
+  setShareActionNotice('info', `Share queued: ${queued} item(s).${blocked ? ` Blocked: ${blocked}.` : ''}`);
+  await refreshShareJobs();
+  await refreshShareCandidates();
+}
+
+
+async function refreshShareReviewSummary(){
+  const payload = collectSelectedSharePayload();
+  const box = document.getElementById('shareSummaryBar');
+  if(!payload.destination_ids.length || !payload.items.length){
+    updateShareSummaryBar();
+    return;
+  }
+  const r = await fetch('/api/share/review', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  const perDest = {};
+  (d.reviews || []).forEach(item => {
+    const id = item.destination_id || '';
+    if(!perDest[id]) perDest[id] = {name: item.destination_name || id, ready: 0, blocked: 0};
+    if(item.status === 'blocked') perDest[id].blocked += 1; else perDest[id].ready += 1;
+  });
+  box.innerHTML = `
+    <div class="summary-grid">
+      <div class="summary-pill"><strong>Selected candidates</strong><div>${payload.items.length}</div></div>
+      <div class="summary-pill"><strong>Destinations</strong><div>${payload.destination_ids.length}</div></div>
+      <div class="summary-pill"><strong>Ready</strong><div>${d.summary?.ready || 0}</div></div>
+      <div class="summary-pill"><strong>Blocked</strong><div>${d.summary?.blocked || 0}</div></div>
+    </div>
+    <div style="margin-top:.75rem;">${Object.values(perDest).map(item => `<div><strong>${esc(item.name)}</strong>: ready ${item.ready}, blocked ${item.blocked}</div>`).join('') || '<span class="muted">No review data yet.</span>'}</div>
+  `;
+}
+
+function debouncedRefreshShareReviewSummary(){
+  clearTimeout(reviewSummaryDebounce);
+  reviewSummaryDebounce = setTimeout(() => { refreshShareReviewSummary().catch(() => updateShareSummaryBar()); }, 180);
+}
+
+function updateShareSummaryBar(){
+  const box = document.getElementById('shareSummaryBar');
+  const selectedCount = document.querySelectorAll('.share-cand:checked').length;
+  const destCount = selectedDestinationIds().length;
+  box.innerHTML = `<div class="summary-grid">
+    <div class="summary-pill"><strong>Selected candidates</strong><div>${selectedCount}</div></div>
+    <div class="summary-pill"><strong>Destinations</strong><div>${destCount}</div></div>
+    <div class="summary-pill"><strong>Visible cards</strong><div>${Array.from(document.querySelectorAll('.share-candidate-card')).filter(card => !card.hidden).length}</div></div>
+    <div class="summary-pill"><strong>Status</strong><div>${selectedCount && destCount ? 'Checking…' : 'Select items'}</div></div>
+  </div>`;
+}
+
+async function refreshShareJobs(){
+  const r = await fetch('/api/share/jobs');
+  const d = await r.json();
+  const allJobs = d.jobs || [];
+  const jobs = allJobs.filter(j => ['queued','running','failed'].includes(String(j.status || '').toLowerCase()));
+  const box = document.getElementById('shareJobs');
+  if(!jobs.length){ box.innerHTML = '<p class="muted">No active or failed share jobs right now.</p>'; return; }
+  box.innerHTML = jobs.map(job => `
+    <article class="job">
+      <h3>${esc(job.job_name || '')}</h3>
+      <p><strong>Status:</strong> ${esc(job.status || '')}</p>
+      <p><strong>Destination:</strong> ${esc(job.destination_name || job.destination_id || '')}</p>
+      <p><strong>Category:</strong> ${esc(job.selected_category_label || job.selected_category_id || '')}</p>
+      <p><strong>Phase:</strong> ${esc(job.phase || '')}</p>
+      <p><strong>Message:</strong> ${esc(job.message || '')}</p>
+      <div class="progress"><div class="bar" style="width:${job.percent || 0}%"></div></div>
+      <p><strong>Remote ID:</strong> <code>${esc(job.remote_id || '')}</code> <strong>GUID:</strong> <code>${esc(job.remote_guid || '')}</code></p>
+      <div class="row">${String(job.status||'').toLowerCase()==='failed' ? `<button type="button" onclick="retryShareJob(${job.id})">Retry</button>` : ''}</div>
+    </article>
+  `).join('');
+}
+
+async function retryShareJob(jobId){
+  const r = await fetch('/api/share/retry', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({job_id: jobId})});
+  const d = await r.json();
+  if(!d.ok){ setShareActionNotice('error', d.error || 'Retry failed.'); return; }
+  setShareActionNotice('success', 'Retry queued.');
+  await refreshShareJobs();
+}
+
+async function removeShareCandidate(candidateId){
+  if(!confirm('Remove this share candidate from the Share tab?')) return;
+  const r = await fetch('/api/share/candidate/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({candidate_id: candidateId})});
+  const d = await r.json();
+  if(!d.ok){ setShareActionNotice('error', d.error || 'Remove failed.'); return; }
+  setShareActionNotice('success', 'Share candidate removed.');
+  await refreshShareCandidates();
+}
+
+document.getElementById('shareImportForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const fd = new FormData(form);
+  const r = await fetch('/api/share/import', {method:'POST', body: fd});
+  const d = await r.json();
+  document.getElementById('shareImportResult').textContent = JSON.stringify(d, null, 2);
+  setShareActionNotice(d.ok ? 'success' : 'error', d.ok ? 'Bundle imported for Share.' : (d.error || 'Import failed.'));
+  if(d.ok){ form.reset(); await refreshShareCandidates(); }
+});
+
+
+document.getElementById('shareBulkImportForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const fd = new FormData(form);
+  const r = await fetch('/api/share/import-bulk', {method:'POST', body: fd});
+  const d = await r.json();
+  document.getElementById('shareImportResult').textContent = JSON.stringify(d, null, 2);
+  setShareActionNotice(d.ok ? 'success' : 'error', d.ok ? `Mass import completed: ${d.imported || 0} imported, ${d.skipped || 0} skipped.` : (d.error || 'Mass import failed.'));
+  if(d.ok){ form.reset(); await refreshShareCandidates(); }
+});
+
+document.addEventListener('DOMContentLoaded', () => { closeShareReviewModal(); });
+refreshShareCandidates();
+refreshShareJobs();
+let shareStream = new EventSource('/api/share/jobs/stream');
+shareStream.onmessage = () => refreshShareJobs();
+</script>
+{% endblock %}

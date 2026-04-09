@@ -83,7 +83,11 @@ DEFAULT_SETTINGS = {
     "workflow_auto_chain_enabled": "false",
     "github_repo_owner": "HoodStar1",
     "github_repo_name": "PrepaC",
-    "update_check_enabled": "true"
+    "update_check_enabled": "true",
+    "share_destinations_json": "[]",
+    "share_import_root": "/media/dest/_share/imports",
+    "share_auto_after_posting": "true",
+    "share_request_timeout": "120"
 }
 
 def get_conn():
@@ -219,6 +223,58 @@ def init_db():
         created_at TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending'
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS imported_share_bundles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        release_name TEXT NOT NULL,
+        nzb_rar_path TEXT NOT NULL,
+        template_path TEXT NOT NULL,
+        mediainfo_override_path TEXT,
+        size_bytes INTEGER DEFAULT 0,
+        matched_by TEXT DEFAULT '',
+        match_score INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS share_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_type TEXT NOT NULL,
+        source_ref_id TEXT,
+        posting_job_id INTEGER,
+        import_bundle_id INTEGER,
+        job_name TEXT NOT NULL,
+        release_name TEXT NOT NULL,
+        nzb_rar_path TEXT NOT NULL,
+        template_path TEXT NOT NULL,
+        generated_nfo_path TEXT,
+        generated_mediainfo_path TEXT,
+        detected_type TEXT,
+        resolution_tier TEXT,
+        category_key TEXT,
+        selected_category_id TEXT,
+        selected_category_label TEXT,
+        destination_id TEXT NOT NULL,
+        destination_name TEXT,
+        status TEXT NOT NULL,
+        phase TEXT,
+        percent INTEGER,
+        nzb_hash TEXT,
+        job_hash TEXT,
+        message TEXT,
+        remote_id TEXT,
+        remote_guid TEXT,
+        raw_response TEXT,
+        retry_count INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS share_job_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_job_id INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        message TEXT NOT NULL,
+        percent INTEGER
+    )""")
     conn.commit()
 
     for stmt in [
@@ -227,6 +283,8 @@ def init_db():
         "ALTER TABLE packing_jobs ADD COLUMN rar_time_seconds INTEGER",
         "ALTER TABLE packing_jobs ADD COLUMN par2_size_bytes INTEGER",
         "ALTER TABLE packing_jobs ADD COLUMN par2_time_seconds INTEGER",
+        "ALTER TABLE imported_share_bundles ADD COLUMN matched_by TEXT DEFAULT ''",
+        "ALTER TABLE imported_share_bundles ADD COLUMN match_score INTEGER DEFAULT 0",
     ]:
         try:
             cur.execute(stmt)
@@ -251,6 +309,11 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_posting_job_events_job_id_id ON posting_job_events(posting_job_id, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_clean_actions_created_at ON clean_actions(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_clean_actions_reason_media ON clean_actions(reason, media_type, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_imported_share_bundles_created_at ON imported_share_bundles(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_share_jobs_status_id ON share_jobs(status, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_share_jobs_dest_job ON share_jobs(destination_id, job_name)",
+        "CREATE INDEX IF NOT EXISTS idx_share_jobs_nzb_hash ON share_jobs(nzb_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_share_job_events_job_id_id ON share_job_events(share_job_id, id DESC)",
     ]:
         try:
             cur.execute(stmt)
