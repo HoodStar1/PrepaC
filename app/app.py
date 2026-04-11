@@ -30,11 +30,11 @@ from app.plex_notify import notify_after_clean
 from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
 from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
-from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats
+from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats, get_posting_providers
 from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
 from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, maybe_auto_share_posting_job, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
-from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry
+from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry, cancel_share_job
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
 from app.version import APP_NAME, APP_VERSION, BUILD_NUMBER, FULL_VERSION, DISPLAY_VERSION, BUILD_DISPLAY
@@ -44,6 +44,64 @@ from app.config_validation import normalize_settings
 from app.auth_state import auth_is_initialized
 from app.fs_watcher import start_watchers, stop_watchers
 
+
+
+
+def _provider_slug(value, fallback_idx):
+    value = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return value or f"provider{fallback_idx}"
+
+
+def _default_posting_provider(idx):
+    return {
+        "id": f"provider{idx}",
+        "name": f"Provider {idx}",
+        "enabled": False,
+        "host": "",
+        "port": "563",
+        "ssl": True,
+        "username": "",
+        "password": "",
+        "connections": "25",
+        "max_connections": "25",
+        "priority_up_to_gb": "0" if idx == 1 else "0",
+    }
+
+
+def _display_posting_providers(settings, display_settings):
+    source = secret_source("posting_providers_json", settings)
+    providers = get_posting_providers(settings)
+    normalized = []
+    for idx, provider in enumerate(providers, start=1):
+        item = dict(_default_posting_provider(idx))
+        item.update(provider or {})
+        item["id"] = _provider_slug(item.get("id") or item.get("name"), idx)
+        item["name"] = str(item.get("name") or f"Provider {idx}").strip() or f"Provider {idx}"
+        item["password"] = "" if source in {"secret_file", "env_var"} else (display_settings.get(f"posting_provider{idx}_password") if idx <= 2 else ("********" if str(item.get("password") or "").strip() else ""))
+        item["password_source"] = display_settings.get(f"posting_provider{idx}_password_source", "saved_setting" if str(provider.get("password") or "").strip() else "unset") if idx <= 2 else ("saved_setting" if str(provider.get("password") or "").strip() else "unset")
+        item["priority_up_to_gb"] = str(item.get("priority_up_to_gb", "0") or "0").strip() or "0"
+        normalized.append(item)
+    while len(normalized) < 2:
+        normalized.append(_default_posting_provider(len(normalized) + 1))
+    editor_value = settings.get("posting_providers_json", "[]") if source == "saved_setting" else ""
+    return normalized, editor_value, source
+
+
+def _sync_legacy_posting_provider_settings(data, providers):
+    providers = list(providers or [])
+    for idx in (1, 2):
+        provider = dict(_default_posting_provider(idx))
+        if len(providers) >= idx and isinstance(providers[idx - 1], dict):
+            provider.update(providers[idx - 1])
+        prefix = f"posting_provider{idx}_"
+        data[prefix + "enabled"] = "true" if provider.get("enabled") else "false"
+        data[prefix + "host"] = str(provider.get("host", "") or "").strip()
+        data[prefix + "port"] = str(provider.get("port", "563") or "563").strip()
+        data[prefix + "ssl"] = "true" if provider.get("ssl", True) else "false"
+        data[prefix + "username"] = str(provider.get("username", "") or "").strip()
+        data[prefix + "password"] = str(provider.get("password", "") or "")
+        data[prefix + "connections"] = str(provider.get("connections", "25") or "25").strip()
+        data[prefix + "max_connections"] = str(provider.get("max_connections", provider.get("connections", "25")) or provider.get("connections", "25") or "25").strip()
 
 def _bool_env(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -1213,7 +1271,10 @@ def settings_page():
     share_destinations_source = secret_source("share_destinations_json", settings)
     display_settings["share_destinations_editor"] = settings.get("share_destinations_json", "[]") if share_destinations_source == "saved_setting" else ""
     display_settings["share_destinations_source"] = share_destinations_source
-    return render_template("settings.html", settings=display_settings, share_destinations=get_share_destinations(settings), share_category_options=CATEGORY_KEY_OPTIONS)
+    posting_providers, posting_providers_editor, posting_providers_source = _display_posting_providers(settings, display_settings)
+    display_settings["posting_providers_editor"] = posting_providers_editor
+    display_settings["posting_providers_source"] = posting_providers_source
+    return render_template("settings.html", settings=display_settings, posting_providers=posting_providers, share_destinations=get_share_destinations(settings), share_category_options=CATEGORY_KEY_OPTIONS)
 
 @app.route("/plex")
 def plex_page():
@@ -1231,7 +1292,7 @@ def clean_logs_page():
 def api_settings_save():
     current = load_settings()
     data = dict(current)
-    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","auth_username","github_repo_owner","github_repo_name","share_import_root","share_request_timeout","share_destinations_json"]:
+    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","posting_providers_json","auth_username","github_repo_owner","github_repo_name","share_import_root","share_request_timeout","share_destinations_json"]:
         if k in request.form:
             incoming = request.form.get(k, current.get(k, "")).strip()
             if k in SECRET_SPECS and incoming.startswith("********"):
@@ -1245,13 +1306,49 @@ def api_settings_save():
     data["packing_auto_par2"] = "true" if request.form.get("packing_auto_par2") else "false"
     data["posting_embed_password_in_nzb"] = "true" if request.form.get("posting_embed_password_in_nzb") else "false"
     data["posting_post_check"] = "true" if request.form.get("posting_post_check") else "false"
-    data["posting_provider1_enabled"] = "true" if request.form.get("posting_provider1_enabled") else "false"
-    data["posting_provider1_ssl"] = "true" if request.form.get("posting_provider1_ssl") else "false"
-    data["posting_provider2_enabled"] = "true" if request.form.get("posting_provider2_enabled") else "false"
-    data["posting_provider2_ssl"] = "true" if request.form.get("posting_provider2_ssl") else "false"
     data["workflow_auto_chain_enabled"] = "true" if request.form.get("workflow_auto_chain_enabled") else "false"
     data["update_check_enabled"] = "true" if request.form.get("update_check_enabled") else "false"
     data["share_auto_after_posting"] = "true" if request.form.get("share_auto_after_posting") else "false"
+
+    provider_source = secret_source("posting_providers_json", current)
+    try:
+        raw_providers = request.form.get("posting_providers_json", data.get("posting_providers_json", "[]"))
+        provider_items = json.loads(raw_providers or "[]") if provider_source != "secret_file" and provider_source != "env_var" else get_posting_providers(current)
+        if not isinstance(provider_items, list):
+            raise ValueError("posting_providers_json must be a list")
+    except Exception:
+        flash("Posting providers could not be parsed, so the previous provider list was kept.", "warning")
+        provider_items = get_posting_providers(current)
+
+    existing_providers = get_posting_providers(current)
+    normalized_providers = []
+    for idx, item in enumerate(provider_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        merged = dict(_default_posting_provider(idx))
+        merged.update(item)
+        merged["id"] = _provider_slug(merged.get("id") or merged.get("name"), idx)
+        merged["name"] = str(merged.get("name") or f"Provider {idx}").strip() or f"Provider {idx}"
+        merged["enabled"] = bool(merged.get("enabled"))
+        merged["ssl"] = bool(merged.get("ssl", True))
+        merged["host"] = str(merged.get("host", "") or "").strip()
+        merged["port"] = str(merged.get("port", "563") or "563").strip()
+        merged["username"] = str(merged.get("username", "") or "").strip()
+        merged["connections"] = str(merged.get("connections", "25") or "25").strip()
+        merged["max_connections"] = str(merged.get("max_connections", merged.get("connections", "25")) or merged.get("connections", "25") or "25").strip()
+        merged["priority_up_to_gb"] = str(merged.get("priority_up_to_gb", "0") or "0").strip() or "0"
+        password_value = str(merged.get("password", "") or "")
+        if password_value.startswith("********"):
+            if idx <= len(existing_providers):
+                password_value = str(existing_providers[idx - 1].get("password", "") or "")
+            else:
+                password_value = ""
+        merged["password"] = password_value
+        normalized_providers.append(merged)
+
+    data["posting_providers_json"] = json.dumps(normalized_providers, ensure_ascii=False, indent=2)
+    _sync_legacy_posting_provider_settings(data, normalized_providers)
+
     data, warnings = normalize_settings(data)
     save_settings(data)
     try:
@@ -1615,6 +1712,17 @@ def api_share_retry():
         return jsonify({"ok": False, "error": "Share job not found"}), 404
     increment_share_retry(job_id)
     start_share_job_async(job_id, load_settings())
+    return jsonify({"ok": True, "job_id": job_id})
+
+@app.route("/api/share/cancel", methods=["POST"])
+def api_share_cancel():
+    payload = request.get_json(silent=True) or {}
+    job_id = int(payload.get("job_id") or 0)
+    if not job_id:
+        return jsonify({"ok": False, "error": "job_id is required"}), 400
+    changed = cancel_share_job(job_id, reason="Cancelled by user")
+    if not changed:
+        return jsonify({"ok": False, "error": "Share job could not be cancelled"}), 400
     return jsonify({"ok": True, "job_id": job_id})
 
 @app.route("/api/share/import", methods=["POST"])

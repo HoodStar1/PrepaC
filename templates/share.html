@@ -376,19 +376,36 @@ async function refreshShareJobs(){
   const jobs = allJobs.filter(j => ['queued','running','failed'].includes(String(j.status || '').toLowerCase()));
   const box = document.getElementById('shareJobs');
   if(!jobs.length){ box.innerHTML = '<p class="muted">No active or failed share jobs right now.</p>'; return; }
-  box.innerHTML = jobs.map(job => `
-    <article class="job">
-      <h3>${esc(job.job_name || '')}</h3>
-      <p><strong>Status:</strong> ${esc(job.status || '')}</p>
-      <p><strong>Destination:</strong> ${esc(job.destination_name || job.destination_id || '')}</p>
-      <p><strong>Category:</strong> ${esc(job.selected_category_label || job.selected_category_id || '')}</p>
-      <p><strong>Phase:</strong> ${esc(job.phase || '')}</p>
-      <p><strong>Message:</strong> ${esc(job.message || '')}</p>
-      <div class="progress"><div class="bar" style="width:${job.percent || 0}%"></div></div>
-      <p><strong>Remote ID:</strong> <code>${esc(job.remote_id || '')}</code> <strong>GUID:</strong> <code>${esc(job.remote_guid || '')}</code></p>
-      <div class="row">${String(job.status||'').toLowerCase()==='failed' ? `<button type="button" onclick="retryShareJob(${job.id})">Retry</button>` : ''}</div>
-    </article>
-  `).join('');
+  box.innerHTML = jobs.map(job => {
+    const status = String(job.status || '').toLowerCase();
+    const actionLabel = status === 'running' ? 'Cancel' : 'Remove';
+    return `
+      <article class="job">
+        <div class="row" style="justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
+          <h3 style="margin:0;">${esc(job.job_name || '')}</h3>
+          <div class="row" style="gap:.5rem;flex-wrap:wrap;">
+            ${status === 'failed' ? `<button type="button" onclick="retryShareJob(${job.id})">Retry</button>` : ''}
+            <button type="button" onclick="cancelShareJob(${job.id}, '${actionLabel}')">${actionLabel}</button>
+          </div>
+        </div>
+        <p><strong>Status:</strong> ${esc(job.status || '')}</p>
+        <p><strong>Destination:</strong> ${esc(job.destination_name || job.destination_id || '')}</p>
+        <p><strong>Category:</strong> ${esc(job.selected_category_label || job.selected_category_id || '')}</p>
+        <p><strong>Phase:</strong> ${esc(job.phase || '')}</p>
+        <p><strong>Message:</strong> ${esc(job.message || '')}</p>
+        <div class="progress"><div class="bar" style="width:${job.percent || 0}%"></div></div>
+        <p><strong>Remote ID:</strong> <code>${esc(job.remote_id || '')}</code> <strong>GUID:</strong> <code>${esc(job.remote_guid || '')}</code></p>
+      </article>
+    `;
+  }).join('');
+}
+
+async function cancelShareJob(jobId, actionLabel){
+  const r = await fetch('/api/share/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({job_id: jobId})});
+  const d = await r.json();
+  if(!d.ok){ setShareActionNotice('error', d.error || `${actionLabel} failed.`); return; }
+  setShareActionNotice('success', `${actionLabel} completed. The job was moved to Share History.`);
+  await refreshShareJobs();
 }
 
 async function retryShareJob(jobId){

@@ -43,6 +43,75 @@ GB = 1024 ** 3
 POSTING_ACTIVE_JOB_IDS = set()
 
 
+def _provider_id(value, fallback_idx):
+    value = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return value or f"provider{fallback_idx}"
+
+
+def _normalized_provider_dict(item, idx, fallback_priority_up_to_gb="0"):
+    item = dict(item or {})
+    priority_value = item.get("priority_up_to_gb", fallback_priority_up_to_gb)
+    return {
+        "id": _provider_id(item.get("id") or item.get("name"), idx),
+        "name": str(item.get("name") or f"Provider {idx}").strip() or f"Provider {idx}",
+        "enabled": bool(item.get("enabled", False)),
+        "host": str(item.get("host", "") or "").strip(),
+        "port": str(item.get("port", "563") or "563").strip(),
+        "ssl": bool(item.get("ssl", True)),
+        "username": str(item.get("username", "") or "").strip(),
+        "password": str(item.get("password", "") or ""),
+        "connections": str(item.get("connections", "25") or "25").strip(),
+        "max_connections": str(item.get("max_connections", item.get("connections", "25")) or item.get("connections", "25") or "25").strip(),
+        "priority_up_to_gb": str(priority_value if priority_value is not None else "0").strip() or "0",
+    }
+
+
+def get_posting_providers(settings):
+    raw = resolve_secret("posting_providers_json", settings)
+    providers = []
+    legacy_provider2_priority = str(settings.get("posting_provider2_max_gb_when_busy", "25") or "25").strip() or "25"
+    try:
+        data = json.loads(raw or "[]")
+        if isinstance(data, list):
+            for idx, item in enumerate(data, start=1):
+                if isinstance(item, dict):
+                    fallback_priority = legacy_provider2_priority if idx == 2 else "0"
+                    providers.append(_normalized_provider_dict(item, idx, fallback_priority_up_to_gb=fallback_priority))
+    except Exception:
+        providers = []
+    if providers:
+        return providers
+    legacy = []
+    for idx in (1, 2):
+        prefix = f"posting_provider{idx}_"
+        legacy_priority = legacy_provider2_priority if idx == 2 else "0"
+        legacy.append(_normalized_provider_dict({
+            "id": f"provider{idx}",
+            "name": f"Provider {idx}",
+            "enabled": str(settings.get(prefix + "enabled", "false")).lower() == "true",
+            "host": settings.get(prefix + "host", ""),
+            "port": settings.get(prefix + "port", "563"),
+            "ssl": str(settings.get(prefix + "ssl", "true")).lower() == "true",
+            "username": settings.get(prefix + "username", ""),
+            "password": resolve_secret(prefix + "password", settings),
+            "connections": settings.get(prefix + "connections", "25"),
+            "max_connections": settings.get(prefix + "max_connections", settings.get(prefix + "connections", "25")),
+            "priority_up_to_gb": legacy_priority,
+        }, idx, fallback_priority_up_to_gb=legacy_priority))
+    return legacy
+
+
+def posting_provider_config_by_index(settings, idx):
+    providers = get_posting_providers(settings)
+    if 1 <= int(idx) <= len(providers):
+        provider = dict(providers[int(idx) - 1])
+    else:
+        provider = _normalized_provider_dict({}, int(idx))
+    provider["name"] = provider.get("id") or f"provider{idx}"
+    return provider
+
+
+
 def _mark_posting_job_active(job_id):
     POSTING_ACTIVE_JOB_IDS.add(int(job_id))
 
@@ -235,18 +304,7 @@ def scan_posting_candidates(settings):
 
 
 def provider_config(settings, idx):
-    prefix = f"posting_provider{idx}_"
-    return {
-        "name": f"provider{idx}",
-        "enabled": str(settings.get(prefix + "enabled", "false")).lower() == "true",
-        "host": settings.get(prefix + "host", "").strip(),
-        "port": settings.get(prefix + "port", "563").strip(),
-        "ssl": str(settings.get(prefix + "ssl", "true")).lower() == "true",
-        "username": settings.get(prefix + "username", "").strip(),
-        "password": resolve_secret(prefix + "password", settings),
-        "connections": settings.get(prefix + "connections", "50").strip(),
-        "max_connections": settings.get(prefix + "max_connections", settings.get(prefix + "connections", "50")).strip(),
-    }
+    return posting_provider_config_by_index(settings, idx)
 
 
 
@@ -369,21 +427,32 @@ def validate_posting_inputs(settings, provider, packed_root: Path, output_files_
 def post_check_enabled(settings):
     return str(settings.get("posting_post_check", "false")).lower() == "true"
 
-def provider1_should_defer_small_job(settings, size_bytes, job_id):
+def _provider_priority_threshold(provider: dict, default: float = 0.0) -> float:
     try:
-        threshold_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 0)
+        return max(0.0, float(str((provider or {}).get("priority_up_to_gb", "0") or "0").strip()))
     except Exception:
-        threshold_gb = 0.0
-    if threshold_gb <= 0:
-        return False
-    threshold_bytes = int(threshold_gb * GB)
-    if int(size_bytes or 0) >= threshold_bytes:
-        return False
-    if has_large_running_packing_job(threshold_bytes):
-        return True
-    if has_large_queued_posting_job(threshold_bytes, exclude_job_id=job_id):
-        return True
-    return False
+        return default
+
+
+def _provider_priority_candidates(settings, size_bytes):
+    providers = list(get_posting_providers(settings) or [])
+    size_gb = float(int(size_bytes or 0)) / float(GB) if int(size_bytes or 0) > 0 else 0.0
+    positive_matches = []
+    zero_pool = []
+    for idx, provider in enumerate(providers):
+        if not provider.get("enabled"):
+            continue
+        threshold_gb = _provider_priority_threshold(provider, 0.0)
+        candidate = dict(provider, name=provider.get("id") or f"provider{idx + 1}", provider_index=idx)
+        if idx > 0 and threshold_gb > 0:
+            if size_gb <= threshold_gb:
+                positive_matches.append((threshold_gb, idx, candidate))
+        else:
+            zero_pool.append(candidate)
+    positive_matches.sort(key=lambda item: (item[0], item[1]))
+    ordered = [candidate for _, _, candidate in positive_matches]
+    ordered.extend(sorted(zero_pool, key=lambda item: (0 if int(item.get("provider_index", 0)) == 0 else 1, int(item.get("provider_index", 0)))))
+    return ordered
 
 
 def effective_connections(settings, provider: dict):
@@ -395,24 +464,8 @@ def effective_connections(settings, provider: dict):
     return effective, clamped_total, reserve
 def wait_for_provider(settings, size_bytes, job_id):
     reconcile_orphaned_posting_jobs_in_process()
-    provider1 = provider_config(settings, 1)
-    provider2 = provider_config(settings, 2)
-    try:
-        size_limit_gb = float(settings.get("posting_provider2_max_gb_when_busy", "25") or 0)
-    except Exception:
-        size_limit_gb = 0.0
-    threshold_bytes = int(size_limit_gb * GB) if size_limit_gb > 0 else 0
     while True:
-        provider1_deferred = False
-        candidates = []
-        if provider1["enabled"]:
-            provider1_deferred = provider1_should_defer_small_job(settings, size_bytes, job_id)
-            if not provider1_deferred:
-                candidates.append(provider1)
-        provider2_can_take = provider2["enabled"] and (threshold_bytes <= 0 or int(size_bytes or 0) < threshold_bytes)
-        if provider2_can_take:
-            candidates.append(provider2)
-
+        candidates = _provider_priority_candidates(settings, size_bytes)
         for provider in candidates:
             if try_claim_posting_provider(job_id, provider["name"]):
                 return provider
@@ -420,8 +473,9 @@ def wait_for_provider(settings, size_bytes, job_id):
         update_posting_job(job_id, status="queued", provider_used="")
         if get_posting_job_status(job_id).lower() == "cancelled":
             raise RuntimeError("Posting job cancelled")
-        if provider1_deferred:
-            msg = "Waiting for larger posting work to clear so Provider 1 can prioritize bigger jobs"
+        if candidates:
+            priority_names = ", ".join(str(provider.get("name") or provider.get("id") or "provider") for provider in candidates[:4])
+            msg = f"Waiting for an available posting provider (priority order: {priority_names})"
         else:
             msg = "Waiting for an available posting provider"
         add_posting_event(job_id, "queued", msg, None)

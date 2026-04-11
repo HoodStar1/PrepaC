@@ -15,9 +15,12 @@ PrepaC organizes the workflow into clear stages:
 
 - TV and movie preparation flows
 - Packing and posting job management
+- Dynamic posting provider management in Settings
+- Per-provider small-job priority routing with “Prioritize jobs up to (GB)” for providers after Provider 1
 - Share destinations with category detection and manual override
 - Single import and mass import for Share
 - Generated NFO and metadata XML for Share submissions
+- Active Share job controls with cancel or remove actions
 - Share history and retry support
 - Optional Plex integration for cleanup workflows
 - Docker-based deployment
@@ -52,7 +55,7 @@ http://localhost:1234
 1. Create the first admin account.
 2. Open **Settings**.
 3. Configure your paths.
-4. Configure posting providers if you want to use Posting.
+4. Configure one or more posting providers if you want to use Posting.
 5. Configure Share destinations if you want to use Share.
 
 ## How to use PrepaC
@@ -64,10 +67,10 @@ Scan your TV or movie roots and create working jobs.
 Build release output from prepared jobs.
 
 ### Posting
-Start uploads from packed jobs.
+Start uploads from packed jobs. For providers after Provider 1, use **Prioritize jobs up to (GB)** to prefer smaller jobs on specific providers first. Set the value to **0** to keep that provider in the same default availability pool as Provider 1.
 
 ### Share
-Submit successful posting output or import RARred NZB + template bundles for submission.
+Submit successful posting output or import RARred NZB + template bundles for submission. Active Share jobs can be cancelled or removed from the Share screen, and completed or cancelled jobs are available in Share History.
 
 ### Clean
 Review deletion candidates before removing content.
@@ -82,4 +85,4 @@ Review deletion candidates before removing content.
 
 ## License
 
-Private software. All rights reserved.
+Licensed under the GNU General Public License v3.0. See the `LICENSE` file for details.

@@ -23,6 +23,7 @@ from app.share_jobs import (
     finish_share,
     get_existing_active_share_job_ids,
     get_share_job,
+    get_share_job_status,
     list_imported_share_bundles,
     list_share_history,
     update_share_job,
@@ -876,17 +877,23 @@ def run_share_job(job_id, settings=None):
     ACTIVE_SHARE_JOB_IDS.add(int(job_id))
     try:
         update_share_job(job_id, status="running", started_at=__import__("datetime").datetime.now().isoformat(timespec="seconds"))
+        if get_share_job_status(job_id).lower() == "cancelled":
+            return
         add_share_event(job_id, "prepare", "Preparing share payload", 5)
         template_info = parse_template_info(Path(job.get("template_path") or ""))
         with tempfile.TemporaryDirectory(prefix="prepac_share_") as td:
             workdir = Path(td)
             extracted_nzb = _extract_nzb_from_rar(Path(job["nzb_rar_path"]), workdir / "extract")
+            if get_share_job_status(job_id).lower() == "cancelled":
+                return
             add_share_event(job_id, "prepare", "Extracted NZB from RAR", 15)
             nfo_path = workdir / f"{Path(job['job_name']).stem}.nfo"
             nfo_path.write_text(generate_nfo_text(_build_candidate_for_job(job), template_info), encoding="utf-8")
             xml_path = workdir / f"{Path(job['job_name']).stem}.xml"
             xml_path.write_text(generate_metadata_xml(_build_candidate_for_job(job), template_info), encoding="utf-8")
             update_share_job(job_id, generated_nfo_path=str(nfo_path), generated_mediainfo_path=str(xml_path))
+            if get_share_job_status(job_id).lower() == "cancelled":
+                return
             add_share_event(job_id, "upload", "Submitting NZB to destination", 35)
             api_key = str(destination.get("api_key", "") or "").strip()
             base_url = str(destination.get("base_url", "") or "").strip().rstrip("/")
@@ -914,6 +921,8 @@ def run_share_job(job_id, settings=None):
                     file_tuple[1].close()
                 except Exception:
                     pass
+            if get_share_job_status(job_id).lower() == "cancelled":
+                return
             if not r.ok:
                 raise RuntimeError(f"Share upload failed: HTTP {r.status_code} - {body[:500]}")
             remote_id = ""
@@ -931,6 +940,8 @@ def run_share_job(job_id, settings=None):
             if persisted_xml_path:
                 update_fields["generated_mediainfo_path"] = persisted_xml_path
             update_share_job(job_id, **update_fields)
+            if get_share_job_status(job_id).lower() == "cancelled":
+                return
             add_share_event(job_id, "complete", "Destination accepted share upload", 100)
             finish_share(job_id, True, "Share complete")
     except Exception as exc:

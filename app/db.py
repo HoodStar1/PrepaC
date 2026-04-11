@@ -76,6 +76,7 @@ DEFAULT_SETTINGS = {
     "posting_provider2_password": "",
     "posting_provider2_connections": "25",
     "posting_provider2_max_connections": "25",
+    "posting_providers_json": "[]",
     "auth_initialized": "false",
     "auth_username": "",
     "auth_password_hash": "",

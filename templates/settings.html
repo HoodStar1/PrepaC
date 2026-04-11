@@ -171,36 +171,20 @@
     <label><span>Retries</span><input type="number" name="posting_retries" value="{{ settings['posting_retries'] }}"></label>
     <label><span>Retry Delay</span><input type="text" name="posting_retry_delay" value="{{ settings['posting_retry_delay'] }}"></label>
     <label><span>Comment</span><input type="text" name="posting_comment" value="{{ settings['posting_comment'] }}"></label>
-    <label><span>Provider 2 max job size when provider 1 is busy (GB)</span><input type="number" step="0.1" name="posting_provider2_max_gb_when_busy" value="{{ settings['posting_provider2_max_gb_when_busy'] }}"></label>
+    <label><span>Providers Source</span><input type="text" value="{{ settings['posting_providers_source'] }}" readonly></label>
     <label class="checkbox"><input type="checkbox" name="posting_embed_password_in_nzb" {% if settings.posting_embed_password_in_nzb == 'true' %}checked{% endif %}><span>Embed password in NZB</span></label>
     <label class="checkbox"><input type="checkbox" name="posting_post_check" {% if settings.posting_post_check == 'true' %}checked{% endif %}><span>Enable post-check verification</span></label>
   </div>
-  <div class="grid two provider-grid">
-    <section class="card inset-card">
-      <h4>Provider 1</h4>
-      <div class="form-grid">
-        <label class="checkbox"><input type="checkbox" name="posting_provider1_enabled" {% if settings.posting_provider1_enabled == 'true' %}checked{% endif %}><span>Enable Provider 1</span></label>
-        <label class="checkbox"><input type="checkbox" name="posting_provider1_ssl" {% if settings.posting_provider1_ssl == 'true' %}checked{% endif %}><span>Use SSL</span></label>
-        <label><span>Host</span><input type="text" name="posting_provider1_host" value="{{ settings['posting_provider1_host'] }}"></label>
-        <label><span>Port</span><input type="text" name="posting_provider1_port" value="{{ settings['posting_provider1_port'] }}"></label>
-        <label><span>Username</span><input type="text" name="posting_provider1_username" value="{{ settings['posting_provider1_username'] }}"></label>
-        <label><span>Password</span><input type="password" name="posting_provider1_password" value="{{ settings['posting_provider1_password'] }}"><small class="muted">Source: {{ settings['posting_provider1_password_source'] }}</small></label>
-        <label><span>Connections</span><input type="number" name="posting_provider1_connections" value="{{ settings['posting_provider1_connections'] }}"></label>
-      </div>
-    </section>
-    <section class="card inset-card">
-      <h4>Provider 2</h4>
-      <div class="form-grid">
-        <label class="checkbox"><input type="checkbox" name="posting_provider2_enabled" {% if settings.posting_provider2_enabled == 'true' %}checked{% endif %}><span>Enable Provider 2</span></label>
-        <label class="checkbox"><input type="checkbox" name="posting_provider2_ssl" {% if settings.posting_provider2_ssl == 'true' %}checked{% endif %}><span>Use SSL</span></label>
-        <label><span>Host</span><input type="text" name="posting_provider2_host" value="{{ settings['posting_provider2_host'] }}"></label>
-        <label><span>Port</span><input type="text" name="posting_provider2_port" value="{{ settings['posting_provider2_port'] }}"></label>
-        <label><span>Username</span><input type="text" name="posting_provider2_username" value="{{ settings['posting_provider2_username'] }}"></label>
-        <label><span>Password</span><input type="password" name="posting_provider2_password" value="{{ settings['posting_provider2_password'] }}"><small class="muted">Source: {{ settings['posting_provider2_password_source'] }}</small></label>
-        <label><span>Connections</span><input type="number" name="posting_provider2_connections" value="{{ settings['posting_provider2_connections'] }}"></label>
-      </div>
-    </section>
+  <p class="muted">Configure one or more posting providers here. Existing Provider 1 and Provider 2 settings are carried forward automatically, so current users do not need to re-enter credentials. For every provider after Provider 1, use <strong>Prioritize jobs up to (GB)</strong> to reserve that provider for smaller jobs first. Set it to <strong>0</strong> to give that provider the same routing priority as Provider 1.</p>
+  <textarea id="postingProvidersJson" name="posting_providers_json" style="display:none;">{{ settings['posting_providers_editor'] }}</textarea>
+  <div class="row" style="margin: 1rem 0;">
+    <button type="button" onclick="addPostingProvider()">Add provider</button>
   </div>
+  <div id="postingProvidersBuilder"></div>
+  <details style="margin-top: 1rem;">
+    <summary>Advanced: current generated JSON</summary>
+    <pre id="postingProvidersPreview">[]</pre>
+  </details>
   <p class="muted">Posting reads <code>template.txt</code> from <code>{{ settings['packing_output_root'] }}/output files/&lt;jobname&gt;</code>, updates the actual posted groups, moves output files to <code>{{ settings['posting_posted_root'] }}/&lt;jobname&gt;</code>, deletes <code>{{ settings['packing_output_root'] }}/&lt;jobname&gt;</code> after success, and stores the NZB as a RAR in <code>{{ settings['posting_nzb_root'] }}/&lt;jobname&gt;.rar</code>.</p>
 </section>
 
@@ -239,10 +223,169 @@
 
 
 const shareCategoryOptions = {{ share_category_options|tojson }};
+let postingProvidersState = {{ posting_providers|tojson }};
 let shareDestinationsState = {{ share_destinations|tojson }};
 let draggedShareDestinationIndex = null;
 
 function escHtml(v){ return String(v ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
+
+
+function slugifyPostingProviderId(value, fallbackIndex){
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('provider' + fallbackIndex);
+}
+
+function normalizedPostingProvider(provider, idx){
+  const result = Object.assign({
+    id: 'provider' + (idx + 1),
+    name: 'Provider ' + (idx + 1),
+    enabled: false,
+    host: '',
+    port: '563',
+    ssl: true,
+    username: '',
+    password: '',
+    connections: '25',
+    max_connections: '25',
+    priority_up_to_gb: '0'
+  }, provider || {});
+  result.id = slugifyPostingProviderId(result.id || result.name, idx + 1);
+  result.name = String(result.name || ('Provider ' + (idx + 1))).trim() || ('Provider ' + (idx + 1));
+  result.port = String(result.port || '563');
+  result.connections = String(result.connections || '25');
+  result.max_connections = String(result.max_connections || result.connections || '25');
+  return result;
+}
+
+postingProvidersState = (Array.isArray(postingProvidersState) ? postingProvidersState : []).map((provider, idx) => normalizedPostingProvider(provider, idx));
+
+function defaultPostingProvider(){
+  return normalizedPostingProvider({}, postingProvidersState.length);
+}
+
+function syncPostingProvidersJson(){
+  postingProvidersState = postingProvidersState.map((provider, idx) => normalizedPostingProvider(provider, idx));
+  const hidden = document.getElementById('postingProvidersJson');
+  const preview = document.getElementById('postingProvidersPreview');
+  const serialized = JSON.stringify(postingProvidersState, null, 2);
+  if(hidden) hidden.value = serialized;
+  if(preview) preview.textContent = serialized;
+}
+
+function postingProviderCard(provider, idx){
+  return `
+    <article class="job share-destination-card" style="margin-bottom:1rem;" draggable="true"
+      data-posting-provider-index="${idx}"
+      ondragstart="startPostingProviderDrag(event, ${idx})"
+      ondragover="allowPostingProviderDrop(event, ${idx})"
+      ondrop="dropPostingProvider(event, ${idx})"
+      ondragend="endPostingProviderDrag()">
+      <div class="row" style="justify-content:space-between; align-items:center; gap:.75rem; flex-wrap:wrap;">
+        <div class="row" style="gap:.75rem; align-items:center; flex-wrap:wrap;">
+          <span title="Drag to reorder" style="cursor:grab; font-size:1.25rem; user-select:none;">☰</span>
+          <h4 style="margin:0;">Provider ${idx + 1}</h4>
+          <code>${escHtml(provider.id)}</code>
+        </div>
+        <div class="row" style="gap:.5rem; flex-wrap:wrap;">
+          <button type="button" onclick="movePostingProvider(${idx}, -1)" ${idx === 0 ? 'disabled' : ''}>Move up</button>
+          <button type="button" onclick="movePostingProvider(${idx}, 1)" ${idx === postingProvidersState.length - 1 ? 'disabled' : ''}>Move down</button>
+          <button type="button" onclick="clonePostingProvider(${idx})">Clone</button>
+          <button type="button" onclick="removePostingProvider(${idx})">Remove</button>
+        </div>
+      </div>
+      <div class="form-grid" style="margin-top:1rem;">
+        <label class="checkbox"><input type="checkbox" ${provider.enabled ? 'checked' : ''} onchange="updatePostingProvider(${idx}, 'enabled', this.checked)"><span>Enabled</span></label>
+        <label><span>Display Name</span><input type="text" value="${escHtml(provider.name)}" oninput="updatePostingProvider(${idx}, 'name', this.value)"></label>
+        <label><span>ID</span><input type="text" value="${escHtml(provider.id)}" oninput="updatePostingProvider(${idx}, 'id', this.value)"></label>
+        <label class="checkbox"><input type="checkbox" ${provider.ssl ? 'checked' : ''} onchange="updatePostingProvider(${idx}, 'ssl', this.checked)"><span>Use SSL</span></label>
+        <label><span>Host</span><input type="text" value="${escHtml(provider.host)}" oninput="updatePostingProvider(${idx}, 'host', this.value)"></label>
+        <label><span>Port</span><input type="text" value="${escHtml(provider.port)}" oninput="updatePostingProvider(${idx}, 'port', this.value)"></label>
+        <label><span>Username</span><input type="text" value="${escHtml(provider.username)}" oninput="updatePostingProvider(${idx}, 'username', this.value)"></label>
+        <label><span>Password</span><input type="password" value="${escHtml(provider.password || '')}" oninput="updatePostingProvider(${idx}, 'password', this.value)"></label>
+        <label><span>Connections</span><input type="number" value="${escHtml(provider.connections)}" oninput="updatePostingProvider(${idx}, 'connections', this.value)"></label>
+        <label><span>Max Connections</span><input type="number" value="${escHtml(provider.max_connections)}" oninput="updatePostingProvider(${idx}, 'max_connections', this.value)"></label>
+        ${idx === 0 ? '<label><span>Prioritize jobs up to (GB)</span><input type="number" step="0.1" value="0" disabled><small class="muted">Provider 1 stays in the default availability pool.</small></label>' : `<label><span>Prioritize jobs up to (GB)</span><input type="number" step="0.1" min="0" value="${escHtml(provider.priority_up_to_gb || '0')}" oninput="updatePostingProvider(${idx}, 'priority_up_to_gb', this.value)"><small class="muted">Set 0 to give this provider the same routing priority as Provider 1.</small></label>`}
+      </div>
+    </article>
+  `;
+}
+
+function renderPostingProvidersBuilder(){
+  const box = document.getElementById('postingProvidersBuilder');
+  if(!box) return;
+  if(!postingProvidersState.length){
+    box.innerHTML = '<p class="muted">No posting providers configured yet.</p>';
+  } else {
+    box.innerHTML = postingProvidersState.map((provider, idx) => postingProviderCard(provider, idx)).join('');
+  }
+  syncPostingProvidersJson();
+}
+
+function addPostingProvider(){
+  postingProvidersState.push(defaultPostingProvider());
+  renderPostingProvidersBuilder();
+}
+
+function clonePostingProvider(idx){
+  const source = normalizedPostingProvider(postingProvidersState[idx], idx);
+  const copy = JSON.parse(JSON.stringify(source));
+  copy.name = `${source.name || 'Provider'} Copy`;
+  copy.id = slugifyPostingProviderId(copy.name, postingProvidersState.length + 1);
+  postingProvidersState.splice(idx + 1, 0, copy);
+  renderPostingProvidersBuilder();
+}
+
+function removePostingProvider(idx){
+  postingProvidersState.splice(idx, 1);
+  renderPostingProvidersBuilder();
+}
+
+function movePostingProvider(idx, delta){
+  const target = idx + delta;
+  if(target < 0 || target >= postingProvidersState.length) return;
+  const [item] = postingProvidersState.splice(idx, 1);
+  postingProvidersState.splice(target, 0, item);
+  renderPostingProvidersBuilder();
+}
+
+let draggedPostingProviderIndex = null;
+
+function startPostingProviderDrag(event, idx){
+  draggedPostingProviderIndex = idx;
+  if(event.dataTransfer){
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(idx));
+  }
+}
+
+function allowPostingProviderDrop(event){
+  event.preventDefault();
+  if(event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+}
+
+function dropPostingProvider(event, idx){
+  event.preventDefault();
+  const sourceIdx = draggedPostingProviderIndex;
+  if(sourceIdx === null || sourceIdx === idx) return;
+  const [item] = postingProvidersState.splice(sourceIdx, 1);
+  postingProvidersState.splice(idx, 0, item);
+  draggedPostingProviderIndex = null;
+  renderPostingProvidersBuilder();
+}
+
+function endPostingProviderDrag(){
+  draggedPostingProviderIndex = null;
+}
+
+function updatePostingProvider(idx, key, value){
+  postingProvidersState[idx][key] = value;
+  if(key === 'name' && (!postingProvidersState[idx].id || String(postingProvidersState[idx].id).startsWith('provider') || String(postingProvidersState[idx].id) === slugifyPostingProviderId(postingProvidersState[idx].name, idx + 1))){
+    postingProvidersState[idx].id = slugifyPostingProviderId(value, idx + 1);
+  }
+  if(key === 'id'){
+    postingProvidersState[idx].id = slugifyPostingProviderId(value, idx + 1);
+  }
+  syncPostingProvidersJson();
+}
 
 function slugifyDestinationId(value, fallbackIndex){
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('destination' + fallbackIndex);
@@ -491,6 +634,9 @@ async function refreshShareCaps(){
     } catch (e) {}
   }
 }
+renderPostingProvidersBuilder();
+renderShareDestinationsBuilder();
+
 async function loadServers(){
   const box = document.getElementById('serversBox');
   box.innerHTML = '<p>Loading servers...</p>';

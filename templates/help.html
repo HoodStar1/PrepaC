@@ -32,7 +32,7 @@
       <ol class="help-list">
         <li>Create the first admin account during the setup flow.</li>
         <li>Open <strong>Settings</strong> and configure your paths before running jobs.</li>
-        <li>Configure posting providers if you plan to use the Posting screen.</li>
+        <li>Configure one or more posting providers if you plan to use the Posting screen.</li>
         <li>Configure Share destinations if you want uploads sent to Newznab-compatible indexers after posting or by manual import.</li>
         <li>Start with a small job before processing larger batches.</li>
       </ol>
@@ -73,7 +73,9 @@
       <h2>Post packed releases with your configured providers</h2>
       <p>The Posting screen scans packed jobs, starts provider-backed uploads, and shows live progress and transfer state.</p>
       <ul class="help-list">
-        <li>Provider 1 and Provider 2 can be enabled independently.</li>
+        <li>Posting providers are managed from the dynamic provider builder in Settings.</li>
+        <li>Existing Provider 1 and Provider 2 setups carry forward automatically for current users.</li>
+        <li>For providers after Provider 1, use <strong>Prioritize jobs up to (GB)</strong> to prefer smaller jobs on specific providers first. Set it to <strong>0</strong> to keep that provider in the same default availability pool as Provider 1.</li>
         <li>Posting tracks phase, transfer rate, transferred amount, percent complete, and ETA.</li>
         <li>Completed posting output becomes eligible for Share.</li>
         <li>Finished posting jobs move to Posting History.</li>
@@ -97,8 +99,10 @@
         <li>Single import handles one RARred NZB and one template at a time.</li>
         <li>Mass import can pair many NZBs and templates using filename matching and template-content matching.</li>
         <li>Share generates an NFO and metadata XML for submission when enabled by the destination.</li>
+        <li>Active Share jobs can be cancelled or removed directly from the Active Share Jobs card.</li>
         <li>Failed Share jobs can be retried from the Share page.</li>
         <li>Removed Share candidates stay hidden, but importing the same bundle again creates a fresh candidate.</li>
+        <li>Share History keeps a record of completed, failed, and cancelled Share jobs.</li>
       </ul>
 
     {% elif active_topic == "clean" %}
@@ -127,7 +131,8 @@
       </div>
       <ul class="help-list">
         <li>Configure destination paths before using Prepare, Packing, Posting, or Share.</li>
-        <li>Set posting providers before starting uploads from Posting.</li>
+        <li>Use the provider builder to add, remove, clone, or reorder posting providers before starting uploads.</li>
+        <li>Use <strong>Prioritize jobs up to (GB)</strong> on providers after Provider 1 when you want smaller jobs to prefer specific providers first.</li>
         <li>Refresh Share destination categories after adding or changing a destination.</li>
       </ul>
     {% endif %}

@@ -69,7 +69,14 @@ def add_share_event(job_id, phase, message, percent=None):
 
 
 def finish_share(job_id, success=True, message=""):
-    update_share_job(int(job_id), status=("done" if success else "failed"), finished_at=now(), message=message, percent=(100 if success else None))
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT status FROM share_jobs WHERE id=?", (int(job_id),))
+    row = cur.fetchone()
+    if row and str(row[0] or "").lower() == "cancelled":
+        conn.close()
+        return
+    cur.execute("UPDATE share_jobs SET status=?, finished_at=?, message=?, percent=? WHERE id=?", (("done" if success else "failed"), now(), message, (100 if success else None), int(job_id)))
+    conn.commit(); conn.close()
 
 
 def list_share_jobs(limit=500):
@@ -128,3 +135,21 @@ def get_existing_active_share_job_ids(source_ref_id, destination_id):
     cur.execute("SELECT id FROM share_jobs WHERE source_ref_id=? AND destination_id=? AND status IN ('queued','running') ORDER BY id DESC", (source_ref_id, destination_id))
     rows = [int(r[0]) for r in cur.fetchall()]
     conn.close(); return rows
+
+
+def get_share_job_status(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT status FROM share_jobs WHERE id=?", (int(job_id),))
+    row = cur.fetchone()
+    conn.close()
+    return str(row[0]) if row else ""
+
+
+def cancel_share_job(job_id, reason="Cancelled by user"):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE share_jobs SET status='cancelled', finished_at=?, message=? WHERE id=? AND status IN ('queued','running','failed')", (now(), reason, int(job_id)))
+    changed = cur.rowcount > 0
+    if changed:
+        cur.execute("INSERT INTO share_job_events(share_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (int(job_id), now(), 'cancelled', reason, None))
+    conn.commit(); conn.close()
+    return changed

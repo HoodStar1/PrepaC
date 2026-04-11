@@ -26,6 +26,10 @@ SECRET_SPECS = {
         "env": "PREPAC_SHARE_DESTINATIONS_JSON",
         "file": "/run/secrets/prepac_share_destinations_json",
     },
+    "posting_providers_json": {
+        "env": "PREPAC_POSTING_PROVIDERS_JSON",
+        "file": "/run/secrets/prepac_posting_providers_json",
+    },
 }
 
 def resolve_secret(setting_key, settings=None):
