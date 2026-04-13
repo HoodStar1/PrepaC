@@ -24,7 +24,7 @@ def delete_prepared_by_source_path(source_path: str):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM prepared_history WHERE source_path = ?", (source_path,))
+        cur.execute("DELETE FROM prepared_items WHERE source_path = ?", (source_path,))
         conn.commit()
         return cur.rowcount
     finally:
@@ -35,7 +35,7 @@ def delete_prepared_by_id(prepared_id: int):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM prepared_history WHERE id = ?", (prepared_id,))
+        cur.execute("DELETE FROM prepared_items WHERE id = ?", (prepared_id,))
         conn.commit()
         return cur.rowcount
     finally:

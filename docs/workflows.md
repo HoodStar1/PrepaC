@@ -14,3 +14,8 @@ Submit posted or imported NZBs to configured destinations. Active Share jobs can
 
 ## Clean
 Preview candidates before deleting or recycling files.
+
+## Security and compatibility notes
+- Sign-in and password reset use temporary lockouts after repeated failed attempts.
+- Session cookie mode supports HTTP-only local/LAN and HTTPS deployments.
+- Metrics scraping can use a token when configured; otherwise metrics follow authenticated access behavior.

@@ -281,26 +281,6 @@ def scan_posting_candidates(settings):
         })
     observe("prepac_scan_seconds", max(0.0, time.time() - started), kind="posting")
     return SCAN_CACHE.set(cache_key, results, ttl_seconds=15)
-    for item in sorted(packed_root.iterdir()):
-        if not item.is_dir() or item.name == "output files":
-            continue
-        template = output_root / item.name / "template.txt"
-        if not template.exists():
-            continue
-        if has_successful_posting(item.name):
-            continue
-        size_bytes = sum(p.stat().st_size for p in item.rglob('*') if p.is_file())
-        info = parse_template_info(template)
-        results.append({
-            "job_name": item.name,
-            "packed_root": str(item),
-            "output_files_root": str(output_root / item.name),
-            "template_path": str(template),
-            "size_bytes": size_bytes,
-            "header": info.get("header", ""),
-            "password_present": bool(info.get("password")),
-        })
-    return results
 
 
 def provider_config(settings, idx):

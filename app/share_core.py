@@ -905,22 +905,25 @@ def run_share_job(job_id, settings=None):
                 "includemeta": "true" if destination.get("includemeta", True) else "false",
             }
             url = f"{base_url}/api?" + urlencode(query)
-            files = {"file": (extracted_nzb.name, open(extracted_nzb, "rb"), "application/x-nzb")}
-            if destination.get("include_nfo", True):
-                files["nfo"] = (nfo_path.name, open(nfo_path, "rb"), "text/plain")
-            if destination.get("include_mediainfo", True):
-                files["mediainfo"] = (xml_path.name, open(xml_path, "rb"), "application/xml")
-            auth = None
-            if destination.get("basic_auth") and (destination.get("username") or destination.get("password")):
-                auth = (destination.get("username", ""), destination.get("password", ""))
-            timeout = int(str(settings.get("share_request_timeout", "120") or "120"))
-            r = requests.post(url, files=files, timeout=timeout, auth=auth)
-            body = r.text
-            for _, file_tuple in files.items():
-                try:
-                    file_tuple[1].close()
-                except Exception:
-                    pass
+            files = {}
+            try:
+                files = {"file": (extracted_nzb.name, open(extracted_nzb, "rb"), "application/x-nzb")}
+                if destination.get("include_nfo", True):
+                    files["nfo"] = (nfo_path.name, open(nfo_path, "rb"), "text/plain")
+                if destination.get("include_mediainfo", True):
+                    files["mediainfo"] = (xml_path.name, open(xml_path, "rb"), "application/xml")
+                auth = None
+                if destination.get("basic_auth") and (destination.get("username") or destination.get("password")):
+                    auth = (destination.get("username", ""), destination.get("password", ""))
+                timeout = int(str(settings.get("share_request_timeout", "120") or "120"))
+                r = requests.post(url, files=files, timeout=timeout, auth=auth)
+                body = r.text
+            finally:
+                for _, file_tuple in files.items():
+                    try:
+                        file_tuple[1].close()
+                    except Exception:
+                        pass
             if get_share_job_status(job_id).lower() == "cancelled":
                 return
             if not r.ok:

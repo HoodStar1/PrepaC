@@ -14,3 +14,10 @@ Review share candidates, import bundles, and submit to your configured destinati
 
 ## Clean
 Review deletion candidates before removing content.
+
+## Sign-in behavior
+Sign-in and password reset include temporary protection against repeated failed attempts.
+
+## Self-hosted compatibility controls
+Session cookie behavior supports both HTTP-only local/LAN setups and HTTPS deployments through configurable mode settings.
+Metrics can use token-based scraping when a metrics token is configured; otherwise, metrics keep authenticated access behavior.

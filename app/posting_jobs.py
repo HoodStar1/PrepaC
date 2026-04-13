@@ -147,6 +147,20 @@ def list_posting_jobs(limit=200):
         j["events"] = [dict(r) for r in cur.fetchall()]
     conn.close(); return jobs
 
+
+def list_posting_jobs_by_status(statuses, limit=500):
+    wanted = [str(s).strip().lower() for s in (statuses or []) if str(s).strip()]
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(f"SELECT * FROM posting_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", tuple(wanted) + (int(limit),))
+    jobs = [dict(r) for r in cur.fetchall()]
+    for j in jobs:
+        cur.execute("SELECT phase,message,percent,timestamp FROM posting_job_events WHERE posting_job_id=? ORDER BY id DESC LIMIT 50", (j["id"],))
+        j["events"] = [dict(r) for r in cur.fetchall()]
+    conn.close(); return jobs
+
 def list_posting_history(limit=1000):
     return list_posting_jobs(limit)
 

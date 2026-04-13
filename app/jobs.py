@@ -94,6 +94,24 @@ def list_jobs(limit=20):
     conn.close(); return jobs
 
 
+def list_jobs_by_status(statuses, limit=500):
+    wanted = [str(s).strip().lower() for s in (statuses or []) if str(s).strip()]
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(f"SELECT * FROM prepare_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", tuple(wanted) + (int(limit),))
+    jobs = [dict(r) for r in cur.fetchall()]
+    for j in jobs:
+        cur.execute("SELECT phase, message, percent, timestamp FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 20", (j["id"],))
+        j["events"] = [dict(r) for r in cur.fetchall()]
+        if j["events"]:
+            j["phase"] = j["events"][0]["phase"]; j["message"] = j["events"][0]["message"]; j["percent"] = j["events"][0]["percent"]
+        else:
+            j["phase"] = ""; j["message"] = ""; j["percent"] = None
+    conn.close(); return jobs
+
+
 def interrupt_running_prepare_jobs(reason="Interrupted by container shutdown", recovery=False):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM prepare_jobs WHERE status='running'")

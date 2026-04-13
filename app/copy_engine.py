@@ -7,6 +7,26 @@ from app.subprocess_utils import run_command_with_output, terminate_process
 
 VIDEO_EXTS = ("mkv","mp4","avi","mov","m4v","ts","m2ts","wmv","mpg","mpeg","webm")
 
+PERMISSION_MAP = {
+    "legacy_open": {"dir": 0o777, "file": 0o666},
+    "shared_safe": {"dir": 0o775, "file": 0o664},
+    "owner_strict": {"dir": 0o750, "file": 0o640},
+}
+
+
+def _prepare_permissions_mode(settings):
+    configured = str(settings.get("prepare_permissions_mode", "") or "").strip().lower()
+    if configured in PERMISSION_MAP:
+        return configured
+    env_mode = str(os.environ.get("PREPAC_PREPARE_PERMISSIONS_MODE", "") or "").strip().lower()
+    if env_mode in PERMISSION_MAP:
+        return env_mode
+    return "legacy_open"
+
+
+def _permission_pair(settings):
+    return PERMISSION_MAP.get(_prepare_permissions_mode(settings), PERMISSION_MAP["legacy_open"])
+
 def _run_rsync(cmd, job_id):
     import subprocess
     attempts = 2
@@ -31,11 +51,12 @@ def _run_rsync(cmd, job_id):
     return rc
 
 def _chmod_chown(dest_path, settings):
+    perm = _permission_pair(settings)
     try:
         if os.path.isdir(dest_path):
-            os.chmod(dest_path, 0o777)
+            os.chmod(dest_path, perm["dir"])
         else:
-            os.chmod(dest_path, 0o666)
+            os.chmod(dest_path, perm["file"])
     except Exception:
         pass
     try:
@@ -44,20 +65,23 @@ def _chmod_chown(dest_path, settings):
         pass
 
 def _apply_open_permissions_recursive(root_path):
+    from app.db import load_settings
+    settings = load_settings()
+    perm = _permission_pair(settings)
     root_path = str(root_path)
     for current_root, dirnames, filenames in os.walk(root_path):
         for d in dirnames:
             try:
-                os.chmod(os.path.join(current_root, d), 0o777)
+                os.chmod(os.path.join(current_root, d), perm["dir"])
             except Exception:
                 pass
         for f in filenames:
             try:
-                os.chmod(os.path.join(current_root, f), 0o666)
+                os.chmod(os.path.join(current_root, f), perm["file"])
             except Exception:
                 pass
     try:
-        os.chmod(root_path, 0o777)
+        os.chmod(root_path, perm["dir"])
     except Exception:
         pass
 

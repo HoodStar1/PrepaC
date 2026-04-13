@@ -139,6 +139,20 @@ def list_packing_jobs(limit=200):
     conn.close()
     return jobs
 
+
+def list_packing_jobs_by_status(statuses, limit=500):
+    wanted = [str(s).strip().lower() for s in (statuses or []) if str(s).strip()]
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(f"SELECT * FROM packing_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", tuple(wanted) + (int(limit),))
+    jobs = [dict(r) for r in cur.fetchall()]
+    for j in jobs:
+        cur.execute("SELECT phase,message,percent,timestamp FROM packing_job_events WHERE packing_job_id=? ORDER BY id DESC LIMIT 20", (j["id"],))
+        j["events"] = [dict(r) for r in cur.fetchall()]
+    conn.close(); return jobs
+
 def has_successful_packing(source_path):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT 1 FROM packing_jobs WHERE source_path=? AND status='done' LIMIT 1", (source_path,))

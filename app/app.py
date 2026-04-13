@@ -17,7 +17,7 @@ from flask import Flask, jsonify, redirect, render_template, request, url_for, f
 from urllib.parse import urlencode, urlparse
 
 from app.db import init_db, load_settings, save_settings, get_conn
-from app.jobs import create_job, add_job_event, list_jobs, interrupt_running_prepare_jobs, try_claim_prepare_slot, cancel_prepare_job, get_prepare_job_status, register_prepare_worker, unregister_prepare_worker, reconcile_prepare_running_jobs
+from app.jobs import create_job, add_job_event, list_jobs, list_jobs_by_status, interrupt_running_prepare_jobs, try_claim_prepare_slot, cancel_prepare_job, get_prepare_job_status, register_prepare_worker, unregister_prepare_worker, reconcile_prepare_running_jobs
 from app.history_db import list_history, delete_prepared_by_source_path, delete_prepared_by_id
 from app.clean_actions import list_clean_actions
 from app.prepare_tv import search_shows, list_seasons, preview_tv
@@ -29,12 +29,13 @@ from app.plex_auth import create_pin, check_pin, list_servers_for_token, save_se
 from app.plex_notify import notify_after_clean
 from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
-from app.packing_jobs import list_packing_jobs, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
+from app.packing_jobs import list_packing_jobs, list_packing_jobs_by_status, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats, get_posting_providers
-from app.posting_jobs import list_posting_jobs, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
+from app.posting_jobs import list_posting_jobs, list_posting_jobs_by_status, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
 from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, maybe_auto_share_posting_job, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
 from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry, cancel_share_job
+from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
 from app.version import APP_NAME, APP_VERSION, BUILD_NUMBER, FULL_VERSION, DISPLAY_VERSION, BUILD_DISPLAY
@@ -110,6 +111,42 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _metrics_token() -> str:
+    return str(os.environ.get("PREPAC_METRICS_TOKEN", "") or "").strip()
+
+
+def _metrics_token_valid() -> bool:
+    configured = _metrics_token()
+    if not configured:
+        return False
+    provided = str(request.headers.get("X-Prepac-Metrics-Token", "") or request.args.get("token", "") or "").strip()
+    return bool(provided) and secrets.compare_digest(provided, configured)
+
+
+def _session_cookie_mode() -> str:
+    mode = str(os.environ.get("PREPAC_SESSION_COOKIE_MODE", "legacy") or "legacy").strip().lower()
+    return mode if mode in {"legacy", "auto", "always", "never"} else "legacy"
+
+
+def _resolve_session_cookie_secure() -> bool:
+    mode = _session_cookie_mode()
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if mode == "legacy":
+        return _bool_env("PREPAC_SESSION_COOKIE_SECURE", False)
+
+    # auto mode: enable for direct HTTPS or trusted proxy HTTPS headers.
+    if request.is_secure:
+        return True
+    if _bool_env("PREPAC_TRUST_PROXY_HEADERS", False):
+        forwarded_proto = str(request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+        if forwarded_proto == "https":
+            return True
+    return False
+
+
 def _load_or_create_flask_secret() -> str:
     env_value = (os.environ.get("PREPAC_FLASK_SECRET_KEY", "") or "").strip()
     if env_value:
@@ -142,6 +179,8 @@ app.config.update(
     SESSION_COOKIE_SECURE=_bool_env("PREPAC_SESSION_COOKIE_SECURE", False),
 )
 init_db()
+
+LOG.info("Session cookie mode: %s", _session_cookie_mode())
 
 
 
@@ -205,6 +244,11 @@ def _safe_next_url(candidate: str | None):
 def _track_request_start():
     request._prepac_started_at = time.time()
 
+
+@app.before_request
+def _apply_session_cookie_mode_per_request():
+    app.config["SESSION_COOKIE_SECURE"] = _resolve_session_cookie_secure()
+
 @app.after_request
 def _track_request_metrics(response):
     started_at = getattr(request, "_prepac_started_at", None)
@@ -216,10 +260,22 @@ def _track_request_metrics(response):
 @app.before_request
 def enforce_authentication():
     endpoint = request.endpoint or ""
-    allowed = {"health_page", "login_page", "setup_page", "reset_password_page", "logout_page", "static"}
+    allowed = {"health_page", "login_page", "setup_page", "reset_password_page", "logout_page", "static", "metrics_page"}
     settings = load_settings()
 
     if endpoint in allowed:
+        if endpoint == "metrics_page":
+            # Backward-compatible default: still require auth when no metrics token is configured.
+            # If a token is configured, allow non-interactive scraping with that token.
+            if not _metrics_token():
+                if not auth_initialized(settings):
+                    return jsonify({"ok": False, "error": "Authentication setup required"}), 403
+                if not is_authenticated():
+                    return jsonify({"ok": False, "error": "Authentication required"}), 401
+                return None
+            if _metrics_token_valid() or is_authenticated():
+                return None
+            return jsonify({"ok": False, "error": "Metrics token required"}), 401
         if endpoint == "setup_page":
             return None
         if not auth_initialized(settings) and endpoint not in {"health_page", "setup_page", "static"}:
@@ -240,6 +296,77 @@ APP_RUNTIME_STATE = {
     "draining": False,
     "shutdown_marked": False,
 }
+AUTH_RATE_STATE = {}
+AUTH_RATE_LOCK = threading.Lock()
+
+
+def _client_ip_address() -> str:
+    if _bool_env("PREPAC_TRUST_PROXY_HEADERS", False):
+        forwarded = str(request.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return str(request.remote_addr or "unknown")
+
+
+def _auth_rate_limits() -> tuple[int, int, int]:
+    try:
+        window_seconds = max(10, int(str(os.environ.get("PREPAC_AUTH_RATE_WINDOW_SECONDS", "300") or "300")))
+    except Exception:
+        window_seconds = 300
+    try:
+        max_attempts = max(3, int(str(os.environ.get("PREPAC_AUTH_RATE_MAX_ATTEMPTS", "20") or "20")))
+    except Exception:
+        max_attempts = 20
+    try:
+        lockout_seconds = max(10, int(str(os.environ.get("PREPAC_AUTH_LOCKOUT_SECONDS", "600") or "600")))
+    except Exception:
+        lockout_seconds = 600
+    return window_seconds, max_attempts, lockout_seconds
+
+
+def _auth_rate_key(kind: str, username: str) -> str:
+    return f"{kind}:{_client_ip_address()}:{str(username or '').strip().lower()}"
+
+
+def _auth_rate_check(kind: str, username: str) -> tuple[bool, int]:
+    key = _auth_rate_key(kind, username)
+    now_ts = time.time()
+    window_seconds, max_attempts, _lockout = _auth_rate_limits()
+    with AUTH_RATE_LOCK:
+        state = AUTH_RATE_STATE.get(key, {"fails": [], "locked_until": 0.0})
+        locked_until = float(state.get("locked_until", 0.0) or 0.0)
+        if locked_until > now_ts:
+            return False, int(max(1, round(locked_until - now_ts)))
+        fails = [float(ts) for ts in (state.get("fails") or []) if (now_ts - float(ts)) <= window_seconds]
+        state["fails"] = fails
+        state["locked_until"] = 0.0
+        AUTH_RATE_STATE[key] = state
+        if len(fails) >= max_attempts:
+            _window, _max, lockout_seconds = _auth_rate_limits()
+            state["locked_until"] = now_ts + lockout_seconds
+            return False, lockout_seconds
+        return True, 0
+
+
+def _auth_rate_record_failure(kind: str, username: str):
+    key = _auth_rate_key(kind, username)
+    now_ts = time.time()
+    window_seconds, max_attempts, lockout_seconds = _auth_rate_limits()
+    with AUTH_RATE_LOCK:
+        state = AUTH_RATE_STATE.get(key, {"fails": [], "locked_until": 0.0})
+        fails = [float(ts) for ts in (state.get("fails") or []) if (now_ts - float(ts)) <= window_seconds]
+        fails.append(now_ts)
+        state["fails"] = fails
+        if len(fails) >= max_attempts:
+            state["locked_until"] = now_ts + lockout_seconds
+        AUTH_RATE_STATE[key] = state
+
+
+def _auth_rate_clear(kind: str, username: str):
+    key = _auth_rate_key(kind, username)
+    with AUTH_RATE_LOCK:
+        AUTH_RATE_STATE.pop(key, None)
+
 try:
     start_watchers(load_settings())
 except Exception as exc:
@@ -377,9 +504,9 @@ def _evaluate_health_state():
     }
 
     try:
-        prepare_jobs = list_jobs(5000)
-        packing_jobs = list_packing_jobs(5000)
-        posting_jobs = list_posting_jobs(5000)
+        prepare_jobs = list_jobs_by_status(["running"], 500)
+        packing_jobs = list_packing_jobs_by_status(["running"], 500)
+        posting_jobs = list_posting_jobs_by_status(["running"], 500)
     except Exception as e:
         payload["status"] = "error"
         payload["reason"] = f"job listing failed: {e}"
@@ -429,10 +556,10 @@ def _schedule_unhealthy_exit():
 
 
 def _prepare_running_count():
-    return sum(1 for j in list_jobs(5000) if str(j.get("status","")).lower() == "running")
+    return len(list_jobs_by_status(["running"], 500))
 
 def _packing_running_count():
-    return sum(1 for j in list_packing_jobs(5000) if str(j.get("status","")).lower() == "running")
+    return len(list_packing_jobs_by_status(["running"], 500))
 
 def run_prepare_job_when_slot(job_id, media_type, settings, payload):
     register_prepare_worker(job_id)
@@ -795,13 +922,13 @@ def _event_stream(generator_fn):
     return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 def _dashboard_running_payload():
-    all_jobs = list_jobs(5000)
-    all_packing_jobs = list_packing_jobs(5000)
-    all_posting_jobs = list_posting_jobs(5000)
+    all_jobs = list_jobs_by_status(["queued", "running"], 500)
+    all_packing_jobs = list_packing_jobs_by_status(["queued", "running"], 500)
+    all_posting_jobs = list_posting_jobs_by_status(["queued", "running"], 500)
     return {"ok": True, "running": summarize_running_jobs(all_jobs, all_packing_jobs, all_posting_jobs)}
 
 def _prepare_active_jobs_payload():
-    jobs = [j for j in list_jobs(200) if str(j.get("status", "")).lower() in {"queued", "running"}]
+    jobs = list_jobs_by_status(["queued", "running"], 200)
     return {"jobs": jobs}
 
 def _prepare_history_jobs(limit=500):
@@ -1135,11 +1262,17 @@ def login_page():
     if request.method == "POST":
         username = (request.form.get("username", "") or "").strip()
         password = request.form.get("password", "") or ""
+        allowed, retry_after = _auth_rate_check("login", username)
+        if not allowed:
+            flash(f"Too many sign-in attempts. Try again in about {retry_after} seconds.", "error")
+            return render_template("login.html", next_url=next_url)
         if username == auth_username(settings) and check_password_hash(auth_password_hash(settings), password):
             session["auth_ok"] = True
             session["auth_user"] = username
+            _auth_rate_clear("login", username)
             flash("Logged in successfully.", "success")
             return redirect(_safe_next_url(next_url))
+        _auth_rate_record_failure("login", username)
         flash("Invalid username or password.", "error")
     return render_template("login.html", next_url=next_url)
 
@@ -1152,11 +1285,19 @@ def reset_password_page():
         new_password = request.form.get("new_password", "") or ""
         confirm = request.form.get("confirm_password", "") or ""
 
+        allowed, retry_after = _auth_rate_check("reset_password", username)
+        if not allowed:
+            flash(f"Too many reset attempts. Try again in about {retry_after} seconds.", "error")
+            return render_template("reset_password.html", username_value=auth_username(settings))
+
         if username != auth_username(settings):
+            _auth_rate_record_failure("reset_password", username)
             flash("Invalid username.", "error")
         elif not auth_recovery_hash(settings):
+            _auth_rate_record_failure("reset_password", username)
             flash("No recovery secret is configured for this installation.", "error")
         elif not check_password_hash(auth_recovery_hash(settings), recovery_secret):
+            _auth_rate_record_failure("reset_password", username)
             flash("Invalid recovery secret.", "error")
         elif new_password != confirm:
             flash("Passwords do not match.", "error")
@@ -1166,6 +1307,7 @@ def reset_password_page():
             data = dict(settings)
             data["auth_password_hash"] = generate_password_hash(new_password)
             save_settings(data)
+            _auth_rate_clear("reset_password", username)
             flash("Password reset successful. Please sign in.", "success")
             return redirect(url_for("login_page"))
     return render_template("reset_password.html", username_value=auth_username(settings))
@@ -1292,7 +1434,7 @@ def clean_logs_page():
 def api_settings_save():
     current = load_settings()
     data = dict(current)
-    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","posting_providers_json","auth_username","github_repo_owner","github_repo_name","share_import_root","share_request_timeout","share_destinations_json"]:
+    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","prepare_permissions_mode","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","posting_providers_json","auth_username","github_repo_owner","github_repo_name","share_import_root","share_request_timeout","share_destinations_json"]:
         if k in request.form:
             incoming = request.form.get(k, current.get(k, "")).strip()
             if k in SECRET_SPECS and incoming.startswith("********"):
@@ -1462,6 +1604,13 @@ def api_local_image():
     path = (request.args.get("path") or "").strip()
     if not path:
         return ("", 404)
+    try:
+        settings = load_settings()
+        allowed_roots = [r for r in build_allowed_roots(settings) if str(r) != "/config"]
+        assert_no_parent_traversal(path, "local image path")
+        assert_path_within_roots(path, allowed_roots, "local image path")
+    except Exception:
+        return ("", 404)
     p = pathlib.Path(path)
     if not p.exists() or not p.is_file():
         return ("", 404)
@@ -1472,6 +1621,8 @@ def api_local_image():
         ".png": "image/png",
         ".webp": "image/webp",
     }.get(ext, "application/octet-stream")
+    if mime == "application/octet-stream":
+        return ("", 404)
     try:
         return Response(p.read_bytes(), mimetype=mime, headers={"Cache-Control": "no-cache"})
     except Exception:
@@ -1513,41 +1664,47 @@ def api_plex_image():
 
 @app.route("/api/clean/reset_prepared", methods=["POST"])
 def api_clean_reset_prepared():
-    data = request.get_json(force=True)
-    prepared_item_id = data.get("prepared_item_id")
-    source_path = (data.get("source_path") or "").strip()
+    try:
+        data = request.get_json(force=True)
+        prepared_item_id = data.get("prepared_item_id")
+        source_path = (data.get("source_path") or "").strip()
 
-    removed = 0
-    removed_by = None
+        removed = 0
+        removed_by = None
 
-    if prepared_item_id not in (None, ""):
-        try:
-            removed = delete_prepared_by_id(int(prepared_item_id))
-            if removed:
-                removed_by = "id"
-        except Exception:
-            removed = 0
+        if prepared_item_id not in (None, ""):
+            try:
+                removed = delete_prepared_by_id(int(prepared_item_id))
+                if removed:
+                    removed_by = "id"
+            except Exception:
+                removed = 0
 
-    if removed == 0 and source_path:
-        removed = delete_prepared_by_source_path(source_path)
-        if removed:
-            removed_by = "source_path"
+        if removed == 0 and source_path:
+            try:
+                removed = delete_prepared_by_source_path(source_path)
+                if removed:
+                    removed_by = "source_path"
+            except Exception:
+                removed = 0
 
-    if removed == 0:
+        if removed == 0:
+            return jsonify({
+                "ok": False,
+                "error": "No prepared record was removed",
+                "prepared_item_id": prepared_item_id,
+                "source_path": source_path,
+            }), 404
+
         return jsonify({
-            "ok": False,
-            "error": "No prepared record was removed",
+            "ok": True,
+            "removed": removed,
+            "removed_by": removed_by,
             "prepared_item_id": prepared_item_id,
             "source_path": source_path,
-        }), 404
-
-    return jsonify({
-        "ok": True,
-        "removed": removed,
-        "removed_by": removed_by,
-        "prepared_item_id": prepared_item_id,
-        "source_path": source_path,
-    })
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Failed to reset prepared record: {exc}"}), 500
 
 @app.route("/prepare")
 def prepare_page():

@@ -19,6 +19,7 @@ INTEGER_LIMITS = {
     "posting_provider2_connections": (1, 128),
     "posting_provider2_max_connections": (1, 128),
     "posting_provider2_max_gb_when_busy": (0, 100000),
+    "share_request_timeout": (5, 600),
 }
 BOOLEAN_KEYS = {
     "clean_dry_run", "clean_use_recycle_bin", "packing_delete_source_after_success", "packing_header_encrypt",
@@ -30,6 +31,8 @@ PATH_KEYS = {
     "config_root", "tv_root", "movie_root", "youtube_root", "dest_root", "recycle_bin_root", "packing_watch_root",
     "packing_output_root", "posting_posted_root", "posting_nzb_root"
 }
+
+PREPARE_PERMISSION_MODES = {"legacy_open", "shared_safe", "owner_strict"}
 
 
 def _to_bool_text(value) -> str:
@@ -78,4 +81,10 @@ def normalize_settings(settings: dict) -> tuple[dict, list[str]]:
     for key in PATH_KEYS:
         if key in cleaned:
             cleaned[key] = _normalize_path(cleaned[key])
+
+    mode = str(cleaned.get("prepare_permissions_mode", "legacy_open") or "legacy_open").strip().lower()
+    if mode not in PREPARE_PERMISSION_MODES:
+        mode = "legacy_open"
+        warnings.append("Normalized prepare_permissions_mode to legacy_open")
+    cleaned["prepare_permissions_mode"] = mode
     return cleaned, warnings

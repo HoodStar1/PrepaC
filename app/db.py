@@ -15,6 +15,7 @@ DEFAULT_SETTINGS = {
     "dest_mode": "775",
     "end_tag": "PrepaC",
     "prepare_max_concurrent_jobs": "1",
+    "prepare_permissions_mode": "legacy_open",
     "packing_max_concurrent_jobs": "1",
     "max_name_len": "249",
     "win_path_warn": "240",

@@ -46,6 +46,7 @@
           <p>Most setups will follow Settings → Prepare → Packing → Posting → Share → Clean.</p>
         </article>
       </div>
+      <p class="muted">Self-hosted compatibility remains supported for HTTP-only local/LAN setups, with optional hardening controls available in Settings and environment variables.</p>
 
     {% elif active_topic == "prepare" %}
       <span class="help-kicker">Prepare</span>
@@ -134,6 +135,10 @@
         <li>Use the provider builder to add, remove, clone, or reorder posting providers before starting uploads.</li>
         <li>Use <strong>Prioritize jobs up to (GB)</strong> on providers after Provider 1 when you want smaller jobs to prefer specific providers first.</li>
         <li>Refresh Share destination categories after adding or changing a destination.</li>
+        <li>Prepare permissions mode supports compatibility and hardening options: <strong>legacy_open</strong> (default), <strong>shared_safe</strong>, and <strong>owner_strict</strong>.</li>
+        <li>Session cookie behavior supports HTTP-only local/LAN and HTTPS deployments via configurable cookie mode.</li>
+        <li>Metrics can use token-based scraping when configured; otherwise metrics use authenticated access behavior.</li>
+        <li>Sign-in and password reset use temporary lockouts after repeated failed attempts.</li>
       </ul>
     {% endif %}
   </section>

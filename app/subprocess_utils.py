@@ -1,5 +1,7 @@
 import subprocess
 import time
+import os
+import signal
 
 
 def terminate_process(proc, graceful_timeout: float = 5.0):
@@ -12,12 +14,18 @@ def terminate_process(proc, graceful_timeout: float = 5.0):
     except Exception:
         pass
     try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+    except Exception:
+        pass
+    try:
         proc.kill()
     except Exception:
         pass
 
 
-def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float = 1.0, on_output=None, on_tick=None, tick_seconds: float = 1.0, text: bool = True, start_new_session: bool = False):
+def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float = 1.0, on_output=None, on_tick=None, tick_seconds: float = 1.0, text: bool = True, start_new_session: bool = False, should_stop=None):
     attempt = 0
     last_rc = 1
     out_text = ""
@@ -44,6 +52,12 @@ def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float 
             if on_tick and (now_ts - last_tick >= tick_seconds):
                 on_tick()
                 last_tick = now_ts
+            if should_stop:
+                try:
+                    if should_stop(proc):
+                        terminate_process(proc)
+                except Exception:
+                    pass
             if proc.poll() is not None:
                 if proc.stdout:
                     rest = proc.stdout.read()

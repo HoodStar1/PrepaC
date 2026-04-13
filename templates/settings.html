@@ -124,6 +124,15 @@
   <h3>Prepare Settings</h3>
   <div class="form-grid">
     <label><span>Prepare Max Concurrent Jobs</span><input type="number" name="prepare_max_concurrent_jobs" value="{{ settings['prepare_max_concurrent_jobs'] }}"></label>
+    <label>
+      <span>Prepare Permissions Mode</span>
+      <select name="prepare_permissions_mode">
+        <option value="legacy_open" {% if settings.prepare_permissions_mode == 'legacy_open' %}selected{% endif %}>legacy_open (dirs 777, files 666)</option>
+        <option value="shared_safe" {% if settings.prepare_permissions_mode == 'shared_safe' %}selected{% endif %}>shared_safe (dirs 775, files 664)</option>
+        <option value="owner_strict" {% if settings.prepare_permissions_mode == 'owner_strict' %}selected{% endif %}>owner_strict (dirs 750, files 640)</option>
+      </select>
+      <small class="muted">Default keeps current behavior for compatibility. Switch to safer modes only after verifying downstream tooling permissions.</small>
+    </label>
   </div>
 </section>
 

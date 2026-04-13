@@ -83,6 +83,34 @@ Review deletion candidates before removing content.
 - Share mass import can pair files by filename and by template content.
 - If a Share candidate is removed, re-importing the same bundle creates a fresh candidate again.
 
+## Security and Compatibility Controls
+
+PrepaC is designed for self-hosted Docker environments. Security hardening is configurable so LAN and HTTP-only setups remain supported.
+
+- Session cookie mode (`PREPAC_SESSION_COOKIE_MODE`):
+	- `legacy` (default): preserves previous behavior (`PREPAC_SESSION_COOKIE_SECURE`, default false)
+	- `auto`: secure cookies for HTTPS requests; can trust proxy headers when `PREPAC_TRUST_PROXY_HEADERS=true`
+	- `always`: always secure cookies (recommended for HTTPS-only deployments)
+	- `never`: always non-secure cookies (HTTP-only local/LAN installs)
+- Metrics scrape token (`PREPAC_METRICS_TOKEN`):
+	- When unset: `/metrics` keeps existing authenticated behavior.
+	- When set: `/metrics` accepts `X-Prepac-Metrics-Token` header or `?token=...` for non-interactive scraping.
+- Auth abuse controls:
+	- `PREPAC_AUTH_RATE_WINDOW_SECONDS` (default `300`)
+	- `PREPAC_AUTH_RATE_MAX_ATTEMPTS` (default `20`)
+	- `PREPAC_AUTH_LOCKOUT_SECONDS` (default `600`)
+	- Applies to sign-in and password reset attempts per user/IP key.
+- Prepare permissions mode (`prepare_permissions_mode` setting or `PREPAC_PREPARE_PERMISSIONS_MODE` env):
+	- `legacy_open` (default): dirs `777`, files `666` for backward compatibility.
+	- `shared_safe`: dirs `775`, files `664`.
+	- `owner_strict`: dirs `750`, files `640`.
+
+### Self-hosted hardening guidance
+
+- If using reverse proxy TLS, prefer `PREPAC_SESSION_COOKIE_MODE=always`.
+- Keep mount scopes minimal and avoid broad host mounts when possible.
+- For non-root container operation, verify ownership/permissions of mounted paths before switching runtime user.
+
 ## License
 
 Licensed under the GNU General Public License v3.0. See the `LICENSE` file for details.

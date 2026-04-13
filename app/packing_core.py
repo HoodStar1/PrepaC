@@ -145,28 +145,6 @@ def scan_watch_folder(settings):
             "estimated_parts": choose_volume_size(size)[1],
             "estimated_par2_percent": choose_par2_percent(size),
         })
-    return jobs
-    for p in sorted([x for x in watch.iterdir() if x.is_dir()]):
-        if p.name.startswith("_packed"):
-            continue
-        if has_successful_packing(str(p)):
-            continue
-        size = folder_size(p)
-        rep = largest_video(p)
-        probe = detect_tags(str(rep)) if rep else {}
-        chosen_bracket = build_bracket_from_detected(probe) if probe else ""
-        jobs.append({
-            "source_path": str(p),
-            "job_name": p.name,
-            "size_bytes": size,
-            "size_gb": round(size / GB, 2),
-            "largest_video": str(rep) if rep else "",
-            "detected_tags": probe,
-            "chosen_bracket": chosen_bracket,
-            "estimated_volume": choose_volume_size(size)[0],
-            "estimated_parts": choose_volume_size(size)[1],
-            "estimated_par2_percent": choose_par2_percent(size),
-        })
     observe("prepac_scan_seconds", max(0.0, time.time() - started), kind="packing")
     return SCAN_CACHE.set(cache_key, jobs, ttl_seconds=15)
 
@@ -764,7 +742,20 @@ def run_cmd(cmd, cwd=None):
     return run_command_with_output(cmd, cwd=cwd, retries=1)
 
 def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None):
-    rc, output = run_command_with_output(cmd, cwd=cwd, retries=2, retry_delay=1.5, on_tick=on_tick, tick_seconds=tick_seconds, start_new_session=True)
+    def should_stop(_proc):
+        if not job_id:
+            return False
+        return get_packing_job_status(job_id).lower() == "cancelled"
+    rc, output = run_command_with_output(
+        cmd,
+        cwd=cwd,
+        retries=2,
+        retry_delay=1.5,
+        on_tick=on_tick,
+        tick_seconds=tick_seconds,
+        start_new_session=True,
+        should_stop=should_stop,
+    )
     return rc, output
 
 
@@ -849,7 +840,7 @@ def run_packing_job(job_id, source_path, settings):
 
         add_packing_event(job_id, "rar", f"Starting RAR packing for ~{est_parts} parts", 16)
         rar_started_ts = time.time()
-        rc, rar_log = run_cmd_monitored(rar_cmd, on_tick=rar_tick)
+        rc, rar_log = run_cmd_monitored(rar_cmd, on_tick=rar_tick, job_id=job_id)
         rar_elapsed = int(time.time() - rar_started_ts)
         (output_files_root/"packing.log").write_text(rar_log, encoding="utf-8", errors="replace")
         rar_files = sorted(str(pp) for pp in pack_job_root.glob(f"{token}*.rar"))
@@ -895,7 +886,7 @@ def run_packing_job(job_id, source_path, settings):
 
         add_packing_event(job_id, "par2", f"Starting PAR2 generation at {par2_pct}% redundancy", 61)
         par_started_ts = time.time()
-        rc, par_log = run_cmd_monitored(par_cmd, on_tick=par_tick)
+        rc, par_log = run_cmd_monitored(par_cmd, on_tick=par_tick, job_id=job_id)
         par_elapsed = int(time.time() - par_started_ts)
         with open(output_files_root/"packing.log","a",encoding="utf-8",errors="replace") as f:
             f.write("\n\n=== PAR2 ===\n"+par_log)
