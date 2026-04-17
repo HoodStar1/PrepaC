@@ -26,28 +26,44 @@ def terminate_process(proc, graceful_timeout: float = 5.0):
 
 
 def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float = 1.0, on_output=None, on_tick=None, tick_seconds: float = 1.0, text: bool = True, start_new_session: bool = False, should_stop=None):
+    import re as _re
     attempt = 0
     last_rc = 1
     out_text = ""
     while attempt < max(1, int(retries)):
         attempt += 1
+        # Use binary mode so we receive output as it arrives, including \r-only
+        # updates (e.g. par2 in-place progress lines).  We decode manually.
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=text,
-            bufsize=1,
+            text=False,
+            bufsize=0,
             start_new_session=start_new_session,
         )
         output_parts = []
         last_tick = 0.0
+        _leftover = b""
         while True:
-            line = proc.stdout.readline() if proc.stdout else ""
-            if line:
-                output_parts.append(line)
-                if on_output:
-                    on_output(line)
+            chunk = proc.stdout.read(256) if proc.stdout else b""
+            if chunk:
+                _leftover += chunk
+                # Split on \r or \n, keeping \n-terminated lines intact
+                segments = _re.split(b"(\r\n|\r|\n)", _leftover)
+                # segments alternates: text, delimiter, text, delimiter, ..., remainder
+                # Rebuild: emit every complete segment (text+delimiter pair)
+                complete = []
+                i = 0
+                while i + 1 < len(segments):
+                    complete.append(segments[i].decode("utf-8", errors="replace") + segments[i + 1].decode("utf-8", errors="replace"))
+                    i += 2
+                _leftover = segments[-1] if len(segments) % 2 == 1 else b""
+                for seg in complete:
+                    output_parts.append(seg)
+                    if on_output:
+                        on_output(seg)
             now_ts = time.time()
             if on_tick and (now_ts - last_tick >= tick_seconds):
                 on_tick()
@@ -58,15 +74,21 @@ def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float 
                         terminate_process(proc)
                 except Exception:
                     pass
-            if proc.poll() is not None:
+            if not chunk and proc.poll() is not None:
+                # Flush any remaining buffered bytes
                 if proc.stdout:
                     rest = proc.stdout.read()
                     if rest:
-                        output_parts.append(rest)
-                        if on_output:
-                            on_output(rest)
+                        _leftover += rest
+                if _leftover:
+                    seg = _leftover.decode("utf-8", errors="replace")
+                    output_parts.append(seg)
+                    if on_output:
+                        on_output(seg)
+                    _leftover = b""
                 break
-            time.sleep(0.1)
+            if not chunk:
+                time.sleep(0.05)
         last_rc = int(proc.wait())
         out_text = "".join(output_parts)
         if last_rc == 0:

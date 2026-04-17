@@ -5,7 +5,13 @@ from app.media_probe import detect_tags, build_bracket_from_detected
 def search_shows(tv_root, query):
     root = Path(tv_root); q = query.strip().lower()
     if not q or not root.exists(): return []
-    return sorted([p.name for p in root.iterdir() if p.is_dir() and q in p.name.lower()])
+    seen = set()
+    results = []
+    for p in root.iterdir():
+        if p.is_dir() and q in p.name.lower() and p.name not in seen:
+            seen.add(p.name)
+            results.append(p.name)
+    return sorted(results)
 
 def list_seasons(tv_root, show_name):
     show = Path(tv_root) / show_name

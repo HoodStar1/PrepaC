@@ -741,7 +741,7 @@ def append_joblist(csv_path: Path, row):
 def run_cmd(cmd, cwd=None):
     return run_command_with_output(cmd, cwd=cwd, retries=1)
 
-def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None):
+def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None, on_output=None):
     def should_stop(_proc):
         if not job_id:
             return False
@@ -753,6 +753,7 @@ def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None):
         retry_delay=1.5,
         on_tick=on_tick,
         tick_seconds=tick_seconds,
+        on_output=on_output,
         start_new_session=True,
         should_stop=should_stop,
     )
@@ -861,32 +862,53 @@ def run_packing_job(job_id, source_path, settings):
             par_cmd.append(f"-s{block}")
         par_cmd += [str(par2_base)+".par2"] + rar_files
 
-        par_tick_state = {"ticks": 0, "last_bytes": -1}
+        # Option B: honest "computing" spinner during RAM phase, fast filesystem
+        # poll for real MB-written counts once par2 starts writing to disk.
+        # stdout is still parsed solely to detect the phase transition.
+        par_state = {
+            "phase": "compute",   # "compute" | "write"
+            "last_emit_ts": 0.0,
+            "last_emit_pct": -1,
+        }
+        _EMIT_MIN_SECS = 0.5   # emit at most every 0.5s during write phase
+
+        def _maybe_emit(msg, step_pct):
+            now = time.time()
+            if (now - par_state["last_emit_ts"]) >= _EMIT_MIN_SECS:
+                overall = 60 + int(min(step_pct, 99) * 0.20)
+                add_packing_event(job_id, "par2", msg, overall)
+                par_state["last_emit_ts"] = now
+                par_state["last_emit_pct"] = step_pct
+
+        def par_output(line):
+            # Use stdout only to detect transition from compute → write phase.
+            # par2 with multiple threads does not emit incremental Constructing%
+            # lines, so we don't attempt to parse computation progress.
+            stripped = line.strip()
+            if stripped.startswith("Writing:") or "Writing recovery" in stripped:
+                par_state["phase"] = "write"
 
         def par_tick():
-            par_tick_state["ticks"] += 1
-            par_files = list(pack_job_root.glob(f"{token}*.par2"))
-            par_bytes = sum(pf.stat().st_size for pf in par_files if pf.exists())
-
-            byte_pct = int((par_bytes / max(1, est_par_bytes)) * 100) if est_par_bytes > 0 else 0
-
-            if par_bytes != par_tick_state["last_bytes"]:
-                step_pct = max(1, min(99, byte_pct))
-                par_tick_state["last_bytes"] = par_bytes
+            now = time.time()
+            if par_state["phase"] == "compute":
+                # Emit a heartbeat every 3s so the UI shows the job is alive
+                if (now - par_state["last_emit_ts"]) >= 3.0:
+                    _maybe_emit("PAR2 computing — please wait\u2026", 1)
             else:
-                step_pct = max(1, min(95, par_tick_state["ticks"] * 2))
-
-            overall = 60 + int(step_pct * 0.20)
-            add_packing_event(
-                job_id,
-                "par2",
-                f"PAR2 running: {step_pct}% of step, {len(par_files)} parity files written, {round(par_bytes/(1024**2),2)} MB created",
-                overall
-            )
+                # Writing phase: poll filesystem for actual bytes written
+                par_files = list(pack_job_root.glob(f"{token}*.par2"))
+                par_bytes = sum(pf.stat().st_size for pf in par_files if pf.exists())
+                byte_pct = int((par_bytes / max(1, est_par_bytes)) * 100)
+                step_pct = max(1, min(99, byte_pct))
+                mb_written = round(par_bytes / (1024 ** 2), 1)
+                _maybe_emit(
+                    f"PAR2 writing: {len(par_files)} files, {mb_written} MB written",
+                    step_pct,
+                )
 
         add_packing_event(job_id, "par2", f"Starting PAR2 generation at {par2_pct}% redundancy", 61)
         par_started_ts = time.time()
-        rc, par_log = run_cmd_monitored(par_cmd, on_tick=par_tick, job_id=job_id)
+        rc, par_log = run_cmd_monitored(par_cmd, on_tick=par_tick, tick_seconds=0.25, on_output=par_output, job_id=job_id)
         par_elapsed = int(time.time() - par_started_ts)
         with open(output_files_root/"packing.log","a",encoding="utf-8",errors="replace") as f:
             f.write("\n\n=== PAR2 ===\n"+par_log)
