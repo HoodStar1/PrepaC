@@ -5,6 +5,7 @@
   <p>Create the local admin account used to sign in to PrepaC.</p>
 
   <form method="post" class="stack" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="username">Username</label>
     <input id="username" name="username" type="text" value="{{ request.form.get('username', '') }}" required autofocus>
 

@@ -17,7 +17,7 @@
     </nav>
     <div class="help-side-note">
       <strong>Recommended order</strong>
-      <p>Settings → Prepare → Packing → Posting → Share → Clean</p>
+      <p>Settings -> Prepare -> Packing -> Posting -> Share -> Clean</p>
     </div>
   </aside>
 
@@ -43,7 +43,7 @@
         </article>
         <article class="help-panel">
           <h3>Workflow</h3>
-          <p>Most setups will follow Settings → Prepare → Packing → Posting → Share → Clean.</p>
+          <p>Most setups will follow Settings -> Prepare -> Packing -> Posting -> Share -> Clean.</p>
         </article>
       </div>
       <p class="muted">Self-hosted compatibility remains supported for HTTP-only local/LAN setups, with optional hardening controls available in Settings and environment variables.</p>
@@ -56,6 +56,8 @@
         <li>TV mode lets you search shows and select one or more seasons.</li>
         <li>Movie mode lets you search movie folders and build jobs from the selected results.</li>
         <li>The queue preview shows detected bracket information, target naming, and destination paths before the copy starts.</li>
+        <li>Prepare uses the configured rsync path for the copy step and now surfaces startup and transfer failures directly in job events.</li>
+        <li>Queued and running jobs are de-duplicated by source path so resubmitting the same content does not create duplicate prepare work.</li>
         <li>Prepared jobs become the source for Packing.</li>
       </ul>
 
@@ -66,6 +68,7 @@
       <ul class="help-list">
         <li>Packing writes release output to the configured packing output root.</li>
         <li>RAR and PAR2 estimates are shown during scan.</li>
+        <li>Thumbnail upload failures are recorded in events and shown in the UI so screenshot-host problems are visible immediately.</li>
         <li>The optional Freeimage key is only used for image upload related packing features and is not used for title metadata lookup.</li>
       </ul>
 
@@ -78,6 +81,8 @@
         <li>Existing Provider 1 and Provider 2 setups carry forward automatically for current users.</li>
         <li>For providers after Provider 1, use <strong>Prioritize jobs up to (GB)</strong> to prefer smaller jobs on specific providers first. Set it to <strong>0</strong> to keep that provider in the same default availability pool as Provider 1.</li>
         <li>Posting tracks phase, transfer rate, transferred amount, percent complete, and ETA.</li>
+        <li>Stalled Nyuu jobs are watched for silence and stuck article counts so blocked provider slots can be failed and recovered automatically.</li>
+        <li>Cancellation is more responsive even when the underlying posting process stops emitting output.</li>
         <li>Completed posting output becomes eligible for Share.</li>
         <li>Finished posting jobs move to Posting History.</li>
       </ul>
@@ -99,7 +104,9 @@
       <ul class="help-list">
         <li>Single import handles one RARred NZB and one template at a time.</li>
         <li>Mass import can pair many NZBs and templates using filename matching and template-content matching.</li>
+        <li>Share destinations should be clean base <strong>http://</strong> or <strong>https://</strong> URLs. Embedded credentials, query strings, and fragments are rejected.</li>
         <li>Share generates an NFO and metadata XML for submission when enabled by the destination.</li>
+        <li>Large Share imports are limited by the configured request cap to prevent accidental oversized uploads.</li>
         <li>Active Share jobs can be cancelled or removed directly from the Active Share Jobs card.</li>
         <li>Failed Share jobs can be retried from the Share page.</li>
         <li>Removed Share candidates stay hidden, but importing the same bundle again creates a fresh candidate.</li>
@@ -137,6 +144,8 @@
         <li>Refresh Share destination categories after adding or changing a destination.</li>
         <li>Prepare permissions mode supports compatibility and hardening options: <strong>legacy_open</strong> (default), <strong>shared_safe</strong>, and <strong>owner_strict</strong>.</li>
         <li>Session cookie behavior supports HTTP-only local/LAN and HTTPS deployments via configurable cookie mode.</li>
+        <li>Only enable proxy-header trust when you are actually running behind a trusted reverse proxy and have set <strong>PREPAC_TRUST_PROXY_HEADERS=true</strong>.</li>
+        <li>Share import request size can be tuned with <strong>PREPAC_SHARE_IMPORT_MAX_MB</strong> if you handle larger bundles.</li>
         <li>Metrics can use token-based scraping when configured; otherwise metrics use authenticated access behavior.</li>
         <li>Sign-in and password reset use temporary lockouts after repeated failed attempts.</li>
       </ul>

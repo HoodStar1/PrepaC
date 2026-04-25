@@ -61,7 +61,7 @@ jobs:
 
           exclude_dir_names = {
               '.git', '.github', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
-              '.venv', 'venv', 'env', 'config'
+              '.venv', 'venv', 'env', 'config', 'backups'
           }
           exclude_suffixes = {'.pyc', '.pyo', '.db', '.sqlite', '.sqlite3'}
           exclude_file_names = {'.DS_Store'}

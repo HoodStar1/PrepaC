@@ -2,6 +2,8 @@ import subprocess
 import time
 import os
 import signal
+import threading
+import queue
 
 
 def terminate_process(proc, graceful_timeout: float = 5.0):
@@ -25,7 +27,7 @@ def terminate_process(proc, graceful_timeout: float = 5.0):
         pass
 
 
-def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float = 1.0, on_output=None, on_tick=None, tick_seconds: float = 1.0, text: bool = True, start_new_session: bool = False, should_stop=None):
+def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float = 1.0, on_output=None, on_tick=None, tick_seconds: float = 1.0, text: bool = True, start_new_session: bool = False, should_stop=None, on_proc_start=None, inactivity_timeout_seconds: float = 0.0, runtime_timeout_seconds: float = 0.0):
     import re as _re
     attempt = 0
     last_rc = 1
@@ -43,13 +45,44 @@ def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float 
             bufsize=0,
             start_new_session=start_new_session,
         )
+        if on_proc_start:
+            try:
+                on_proc_start(proc)
+            except Exception:
+                pass
         output_parts = []
         last_tick = 0.0
         _leftover = b""
+        started_ts = time.time()
+        last_output_ts = started_ts
+        out_queue = queue.Queue()
+
+        def _reader_thread():
+            try:
+                while True:
+                    chunk = proc.stdout.read(256) if proc.stdout else b""
+                    if chunk:
+                        out_queue.put(chunk)
+                        continue
+                    break
+            except Exception:
+                pass
+            finally:
+                out_queue.put(None)
+
+        reader = threading.Thread(target=_reader_thread, daemon=True)
+        reader.start()
         while True:
-            chunk = proc.stdout.read(256) if proc.stdout else b""
+            try:
+                chunk = out_queue.get(timeout=0.05)
+            except queue.Empty:
+                chunk = b""
+            reader_done = chunk is None
+            if reader_done:
+                chunk = b""
             if chunk:
                 _leftover += chunk
+                last_output_ts = time.time()
                 # Split on \r or \n, keeping \n-terminated lines intact
                 segments = _re.split(b"(\r\n|\r|\n)", _leftover)
                 # segments alternates: text, delimiter, text, delimiter, ..., remainder
@@ -74,7 +107,13 @@ def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float 
                         terminate_process(proc)
                 except Exception:
                     pass
-            if not chunk and proc.poll() is not None:
+            if inactivity_timeout_seconds and proc.poll() is None:
+                if (time.time() - last_output_ts) >= float(inactivity_timeout_seconds):
+                    terminate_process(proc)
+            if runtime_timeout_seconds and proc.poll() is None:
+                if (time.time() - started_ts) >= float(runtime_timeout_seconds):
+                    terminate_process(proc)
+            if reader_done and proc.poll() is not None:
                 # Flush any remaining buffered bytes
                 if proc.stdout:
                     rest = proc.stdout.read()
@@ -94,5 +133,11 @@ def run_command_with_output(cmd, cwd=None, retries: int = 1, retry_delay: float 
         if last_rc == 0:
             return last_rc, out_text
         if attempt < max(1, int(retries)):
+            if should_stop:
+                try:
+                    if should_stop(None):
+                        break
+                except Exception:
+                    pass
             time.sleep(max(0.0, float(retry_delay)) * attempt)
     return last_rc, out_text

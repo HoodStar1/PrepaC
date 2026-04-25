@@ -16,6 +16,7 @@
   <h2>Plex Settings</h2>
   <p>You can still manually set Plex connection values if needed.</p>
   <form method="post" action="{{ url_for('api_plex_save') }}" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label><span>Plex URL</span><input type="text" name="plex_url" value="{{ settings.plex_url }}" placeholder="http://IP:32400"></label>
     <label><span>Plex Token</span><input type="text" name="plex_token" value="{{ settings.plex_token }}" placeholder="token"></label>
     <label><span>TV Library Name</span><input type="text" name="plex_tv_library" value="{{ settings.plex_tv_library }}"></label>

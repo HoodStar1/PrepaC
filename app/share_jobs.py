@@ -8,6 +8,39 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _load_share_job_events(cur, job_ids, per_job_limit=50):
+    normalized_job_ids = []
+    for job_id in job_ids or []:
+        try:
+            normalized_job_ids.append(int(job_id))
+        except Exception:
+            continue
+    normalized_job_ids = list(dict.fromkeys(normalized_job_ids))
+    if not normalized_job_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in normalized_job_ids)
+    cur.execute(
+        f"SELECT share_job_id, phase, message, percent, timestamp FROM share_job_events WHERE share_job_id IN ({placeholders}) ORDER BY share_job_id ASC, id DESC",
+        tuple(normalized_job_ids),
+    )
+    grouped = {job_id: [] for job_id in normalized_job_ids}
+    for row in cur.fetchall():
+        job_id = int(row["share_job_id"])
+        bucket = grouped.setdefault(job_id, [])
+        if len(bucket) >= per_job_limit:
+            continue
+        bucket.append(
+            {
+                "phase": row["phase"],
+                "message": row["message"],
+                "percent": row["percent"],
+                "timestamp": row["timestamp"],
+            }
+        )
+    return grouped
+
+
 def create_imported_share_bundle(release_name, nzb_rar_path, template_path, mediainfo_override_path="", size_bytes=0, matched_by="", match_score=0):
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
@@ -83,9 +116,9 @@ def list_share_jobs(limit=500):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM share_jobs ORDER BY id DESC LIMIT ?", (limit,))
     jobs = [dict(r) for r in cur.fetchall()]
+    events_by_job = _load_share_job_events(cur, [j["id"] for j in jobs])
     for j in jobs:
-        cur.execute("SELECT phase,message,percent,timestamp FROM share_job_events WHERE share_job_id=? ORDER BY id DESC LIMIT 50", (j['id'],))
-        j['events'] = [dict(r) for r in cur.fetchall()]
+        j["events"] = events_by_job.get(int(j["id"]), [])
     conn.close(); return jobs
 
 
@@ -125,8 +158,8 @@ def get_share_job(job_id):
     if not row:
         conn.close(); return None
     job = dict(row)
-    cur.execute("SELECT phase,message,percent,timestamp FROM share_job_events WHERE share_job_id=? ORDER BY id DESC LIMIT 50", (int(job_id),))
-    job['events'] = [dict(r) for r in cur.fetchall()]
+    events_by_job = _load_share_job_events(cur, [int(job_id)])
+    job["events"] = events_by_job.get(int(job_id), [])
     conn.close(); return job
 
 

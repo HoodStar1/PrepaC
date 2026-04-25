@@ -12,12 +12,13 @@ import atexit
 import time
 import secrets
 import requests
-import fcntl
 from flask import Flask, jsonify, redirect, render_template, request, url_for, flash, Response, session, stream_with_context
 from urllib.parse import urlencode, urlparse
+from jsonschema import validate, ValidationError as JsonSchemaValidationError
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from app.db import init_db, load_settings, save_settings, get_conn
-from app.jobs import create_job, add_job_event, list_jobs, list_jobs_by_status, interrupt_running_prepare_jobs, try_claim_prepare_slot, cancel_prepare_job, get_prepare_job_status, register_prepare_worker, unregister_prepare_worker, reconcile_prepare_running_jobs
+from app.jobs import create_job, add_job_event, list_jobs, list_jobs_by_status, interrupt_running_prepare_jobs, try_claim_prepare_slot, cancel_prepare_job, get_prepare_job_status, register_prepare_worker, unregister_prepare_worker, reconcile_prepare_running_jobs, finish_job
 from app.history_db import list_history, delete_prepared_by_source_path, delete_prepared_by_id
 from app.clean_actions import list_clean_actions
 from app.prepare_tv import search_shows, list_seasons, preview_tv
@@ -31,6 +32,7 @@ from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
 from app.packing_jobs import list_packing_jobs, list_packing_jobs_by_status, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats, get_posting_providers
+from app.data_sanitizer import redact_sensitive_data, redact_cli_command, sanitize_provider_param
 from app.posting_jobs import list_posting_jobs, list_posting_jobs_by_status, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
 from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, maybe_auto_share_posting_job, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
@@ -44,11 +46,54 @@ from app.metrics import inc, observe, render_prometheus, set_gauge
 from app.config_validation import normalize_settings
 from app.auth_state import auth_is_initialized
 from app.fs_watcher import start_watchers, stop_watchers
+from app.file_locks import release_lock, try_acquire_lock
+from app.web_security import (
+    build_external_base_url,
+    csrf_token_matches,
+    ensure_csrf_token,
+    is_unsafe_http_method,
+    share_import_limit_bytes,
+    share_import_limit_mebibytes,
+)
 
 
 
+
+# JSON Schema for posting provider validation
+_POSTING_PROVIDER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "maxLength": 256},
+        "name": {"type": "string", "maxLength": 256},
+        "enabled": {"type": "boolean"},
+        "host": {"type": "string", "minLength": 1, "maxLength": 256},
+        "port": {"type": ["string", "integer"], "minimum": 1, "maximum": 65535},
+        "ssl": {"type": "boolean"},
+        "username": {"type": "string", "maxLength": 256},
+        "password": {"type": "string", "maxLength": 128},
+        "connections": {"type": ["string", "integer"], "minimum": 1, "maximum": 1000},
+        "max_connections": {"type": ["string", "integer"], "minimum": 1, "maximum": 1000},
+        "priority_up_to_gb": {"type": ["string", "integer"], "minimum": 0, "maximum": 999999},
+    },
+    "additionalProperties": False,
+}
+
+def _validate_posting_providers(provider_items):
+    """Validate posting provider list against schema."""
+    if not isinstance(provider_items, list):
+        raise JsonSchemaValidationError("Providers must be a list")
+    
+    for idx, item in enumerate(provider_items):
+        if not isinstance(item, dict):
+            raise JsonSchemaValidationError(f"Provider {idx} is not a dict")
+        
+        try:
+            validate(instance=item, schema=_POSTING_PROVIDER_SCHEMA)
+        except JsonSchemaValidationError as e:
+            raise JsonSchemaValidationError(f"Provider {idx}: {e.message}")
 
 def _provider_slug(value, fallback_idx):
+
     value = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
     return value or f"provider{fallback_idx}"
 
@@ -176,7 +221,8 @@ app.secret_key = _load_or_create_flask_secret()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=_bool_env("PREPAC_SESSION_COOKIE_SECURE", False),
+    SESSION_COOKIE_SECURE=_bool_env("PREPAC_SESSION_COOKIE_SECURE", True),  # Changed default to True
+    MAX_CONTENT_LENGTH=share_import_limit_bytes(os.environ.get("PREPAC_SHARE_IMPORT_MAX_MB")),
 )
 init_db()
 
@@ -194,6 +240,7 @@ def inject_version_info():
         "full_version": FULL_VERSION,
         "display_version": DISPLAY_VERSION,
         "build_display": BUILD_DISPLAY,
+        "csrf_token": ensure_csrf_token(session),
     }
 
 def auth_initialized(settings=None):
@@ -221,9 +268,13 @@ def is_authenticated():
 
 
 def current_external_base_url():
-    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
-    host = request.headers.get("X-Forwarded-Host", request.host)
-    return f"{proto}://{host}".rstrip("/")
+    return build_external_base_url(
+        request.scheme,
+        request.host,
+        forwarded_proto=request.headers.get("X-Forwarded-Proto", ""),
+        forwarded_host=request.headers.get("X-Forwarded-Host", ""),
+        trust_proxy=_bool_env("PREPAC_TRUST_PROXY_HEADERS", False),
+    )
 
 
 def _safe_next_url(candidate: str | None):
@@ -240,6 +291,15 @@ def _safe_next_url(candidate: str | None):
     return target
 
 
+def _current_request_relative_url():
+    query = request.query_string.decode("utf-8", errors="ignore")
+    return f"{request.path}?{query}" if query else request.path
+
+
+def _share_import_limit_mib():
+    return share_import_limit_mebibytes(os.environ.get("PREPAC_SHARE_IMPORT_MAX_MB"))
+
+
 @app.before_request
 def _track_request_start():
     request._prepac_started_at = time.time()
@@ -249,6 +309,32 @@ def _track_request_start():
 def _apply_session_cookie_mode_per_request():
     app.config["SESSION_COOKIE_SECURE"] = _resolve_session_cookie_secure()
 
+
+@app.before_request
+def _ensure_csrf_session_token():
+    ensure_csrf_token(session)
+
+
+@app.before_request
+def _enforce_csrf():
+    if not is_unsafe_http_method(request.method):
+        return None
+
+    provided = (
+        request.headers.get("X-CSRF-Token")
+        or request.headers.get("X-XSRF-Token")
+        or request.form.get("csrf_token")
+    )
+    if csrf_token_matches(session, provided):
+        return None
+
+    message = "Security check failed. Reload the page and try again."
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({"ok": False, "error": message}), 400
+
+    flash(message, "error")
+    return redirect(_safe_next_url(_current_request_relative_url()))
+
 @app.after_request
 def _track_request_metrics(response):
     started_at = getattr(request, "_prepac_started_at", None)
@@ -256,6 +342,21 @@ def _track_request_metrics(response):
         observe("prepac_http_request_seconds", max(0.0, time.time() - started_at), method=request.method, endpoint=request.endpoint or "unknown")
     inc("prepac_http_requests", 1, method=request.method, status=str(response.status_code))
     return response
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def _handle_request_entity_too_large(_exc):
+    limit_mib = _share_import_limit_mib()
+    if request.endpoint in {"api_share_import", "api_share_import_bulk"}:
+        return jsonify({
+            "ok": False,
+            "error": f"Upload too large. Share imports are limited to {limit_mib} MiB per request. Adjust PREPAC_SHARE_IMPORT_MAX_MB if needed.",
+            "limit_mib": limit_mib,
+        }), 413
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Request body too large"}), 413
+    flash("Request body too large", "error")
+    return redirect(_safe_next_url(_current_request_relative_url()))
 
 @app.before_request
 def enforce_authentication():
@@ -367,9 +468,20 @@ def _auth_rate_clear(kind: str, username: str):
     with AUTH_RATE_LOCK:
         AUTH_RATE_STATE.pop(key, None)
 
+_WATCHER_LOCK_FILE = "/config/prepac_watcher.lock"
+_WATCHER_LOCK_HANDLE = None
 try:
+    _WATCHER_LOCK_HANDLE = try_acquire_lock(_WATCHER_LOCK_FILE)
+    if _WATCHER_LOCK_HANDLE is None:
+        raise OSError("Watcher lock already held")
     start_watchers(load_settings())
+except OSError:
+    # Another worker already holds the watcher lock — skip starting watchers in this worker
+    release_lock(_WATCHER_LOCK_HANDLE)
+    _WATCHER_LOCK_HANDLE = None
 except Exception as exc:
+    release_lock(_WATCHER_LOCK_HANDLE)
+    _WATCHER_LOCK_HANDLE = None
     LOG.warning("Unable to start file-system watchers: %s", exc)
 
 def mark_running_jobs_interrupted(reason="Interrupted by container shutdown", recovery=False):
@@ -409,6 +521,49 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
         pass
 
 atexit.register(lambda: begin_graceful_shutdown(reason="Application exiting"))
+
+# Start background job reconciliation to detect and recover stuck jobs (one worker only via flock)
+_RECONCILIATION_LOCK_FILE = "/config/prepac_reconciliation.lock"
+_RECONCILIATION_LOCK_HANDLE = None
+try:
+    _RECONCILIATION_LOCK_HANDLE = try_acquire_lock(_RECONCILIATION_LOCK_FILE)
+    if _RECONCILIATION_LOCK_HANDLE is None:
+        raise OSError("Reconciliation lock already held")
+    from app.job_reconciliation import background_reconciliation_loop
+    threading.Thread(target=background_reconciliation_loop, daemon=True).start()
+except OSError:
+    # Another worker already runs reconciliation — skip in this worker
+    release_lock(_RECONCILIATION_LOCK_HANDLE)
+    _RECONCILIATION_LOCK_HANDLE = None
+except Exception as exc:
+    release_lock(_RECONCILIATION_LOCK_HANDLE)
+    _RECONCILIATION_LOCK_HANDLE = None
+    LOG.warning("Unable to start background job reconciliation: %s", exc)
+
+
+@app.context_processor
+def _inject_db_status():
+    from app.db import db_is_corrupt
+    return {"db_corrupt": db_is_corrupt()}
+
+
+@app.route("/api/db/integrity")
+def api_db_integrity():
+    if not is_authenticated():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    from app.db import run_db_integrity_check
+    return jsonify(run_db_integrity_check())
+
+
+@app.route("/api/db/repair", methods=["POST"])
+def api_db_repair():
+    """Rebuild all DB indexes in-place (REINDEX). Safe; no data is modified."""
+    if not is_authenticated():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    from app.db import run_db_reindex
+    result = run_db_reindex()
+    status_code = 200 if result.get("ok") else 500
+    return jsonify(result), status_code
 
 
 @app.template_filter("prettyjson")
@@ -561,8 +716,26 @@ def _prepare_running_count():
 def _packing_running_count():
     return len(list_packing_jobs_by_status(["running"], 500))
 
+def _find_active_prepare_job(source_path):
+    """Return job_id if source_path already has a queued or running prepare job, else None."""
+    active = list_jobs_by_status(["queued", "running"], 500)
+    for j in active:
+        if j.get("source_path") == source_path:
+            return j["id"]
+    return None
+
 def run_prepare_job_when_slot(job_id, media_type, settings, payload):
     register_prepare_worker(job_id)
+    last_wait_event_ts = 0.0
+    last_wait_max_jobs = None
+    wait_started_ts = time.monotonic()
+    try:
+        wait_cfg = load_settings().get("prepare_slot_wait_timeout_seconds", "")
+        if str(wait_cfg or "").strip() == "":
+            wait_cfg = os.environ.get("PREPAC_PREPARE_SLOT_WAIT_TIMEOUT_SECONDS", "7200")
+        max_wait_seconds = max(300, int(str(wait_cfg or "7200").strip()))
+    except Exception:
+        max_wait_seconds = 7200
     try:
         while True:
             current = load_settings()
@@ -573,9 +746,18 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
             reconcile_prepare_running_jobs()
             if get_prepare_job_status(job_id).lower() == "cancelled":
                 return
+            waited = int(time.monotonic() - wait_started_ts)
+            if waited >= max_wait_seconds:
+                add_job_event(job_id, "failed", f"Timed out waiting for prepare slot after {waited} seconds.", None)
+                finish_job(job_id, False)
+                return
             if try_claim_prepare_slot(job_id, max_jobs):
                 break
-            add_job_event(job_id, "queued", f"Waiting for prepare slot ({max_jobs} max concurrent jobs).", 0)
+            now_ts = time.monotonic()
+            if (now_ts - last_wait_event_ts) >= 15.0 or last_wait_max_jobs != max_jobs:
+                add_job_event(job_id, "queued", f"Waiting for prepare slot ({max_jobs} max concurrent jobs).", 0)
+                last_wait_event_ts = now_ts
+                last_wait_max_jobs = max_jobs
             time.sleep(1)
         if media_type == "tv":
             run_tv_prepare(job_id, load_settings(), payload)
@@ -928,8 +1110,35 @@ def _dashboard_running_payload():
     return {"ok": True, "running": summarize_running_jobs(all_jobs, all_packing_jobs, all_posting_jobs)}
 
 def _prepare_active_jobs_payload():
-    jobs = list_jobs_by_status(["queued", "running"], 200)
-    return {"jobs": jobs}
+    try:
+        active_jobs = list_jobs_by_status(["queued", "running"], 500)
+        try:
+            recent_window_seconds = max(10, int(str(os.environ.get("PREPAC_PREPARE_RECENT_TERMINAL_SECONDS", "120") or "120")))
+        except Exception:
+            recent_window_seconds = 120
+        terminal_jobs = list_jobs_by_status(["done", "failed", "cancelled"], 200)
+        now_dt = datetime.now()
+        recent_terminal_jobs = []
+        for job in terminal_jobs:
+            last_activity = _latest_job_activity(job)
+            if not last_activity:
+                continue
+            age_seconds = int((now_dt - last_activity).total_seconds())
+            if age_seconds < 0 or age_seconds > recent_window_seconds:
+                continue
+            item = dict(job)
+            item["recent_terminal"] = True
+            item["seconds_since_terminal"] = age_seconds
+            recent_terminal_jobs.append(item)
+        jobs = active_jobs + recent_terminal_jobs
+        jobs.sort(key=lambda j: int(j.get("id") or 0), reverse=True)
+    except Exception as e:
+        return {"jobs": [], "ok": False, "error": f"prepare job listing failed: {e}"}
+    return {
+        "jobs": jobs,
+        "ok": True,
+        "recent_terminal_window_seconds": recent_window_seconds,
+    }
 
 def _prepare_history_jobs(limit=500):
     jobs = [j for j in list_jobs(limit) if str(j.get("status", "")).lower() in {"done", "failed", "cancelled"}]
@@ -1126,6 +1335,92 @@ def metrics_page():
     return Response(render_prometheus(), mimetype="text/plain; version=0.0.4")
 
 
+@app.route("/api/debug/job-status")
+def api_debug_job_status():
+    """Debug endpoint showing current job queue state and stuck jobs."""
+    try:
+        from app.job_reconciliation import STALE_THRESHOLDS
+        from datetime import datetime
+        
+        def get_job_age_seconds(job):
+            """Get how long a job has been in current state."""
+            times = []
+            for field in ("finished_at", "started_at", "created_at"):
+                try:
+                    dt = datetime.fromisoformat(job.get(field)) if job.get(field) else None
+                    if dt:
+                        times.append(dt)
+                except Exception:
+                    pass
+            if times:
+                return int((datetime.now() - max(times)).total_seconds())
+            return None
+        
+        prepare_jobs = list_jobs_by_status(["running"], 100)
+        packing_jobs = list_packing_jobs_by_status(["running"], 100)
+        posting_jobs = list_posting_jobs_by_status(["running"], 100)
+        
+        result = {
+            "timestamp": datetime.now().isoformat(),
+            "prepare": {
+                "running_count": len(prepare_jobs),
+                "stale_threshold_seconds": STALE_THRESHOLDS.get("prepare", 1800),
+                "jobs": []
+            },
+            "packing": {
+                "running_count": len(packing_jobs),
+                "stale_threshold_seconds": STALE_THRESHOLDS.get("packing", 2700),
+                "jobs": []
+            },
+            "posting": {
+                "running_count": len(posting_jobs),
+                "stale_threshold_seconds": STALE_THRESHOLDS.get("posting", 1200),
+                "jobs": []
+            }
+        }
+        
+        for job in prepare_jobs:
+            age = get_job_age_seconds(job)
+            result["prepare"]["jobs"].append({
+                "id": job.get("id"),
+                "source_path": job.get("source_path"),
+                "status": job.get("status"),
+                "age_seconds": age,
+                "phase": job.get("phase", ""),
+                "message": job.get("message", ""),
+                "is_stale": age and age > STALE_THRESHOLDS.get("prepare", 1800)
+            })
+        
+        for job in packing_jobs:
+            age = get_job_age_seconds(job)
+            result["packing"]["jobs"].append({
+                "id": job.get("id"),
+                "source_path": job.get("source_path"),
+                "status": job.get("status"),
+                "age_seconds": age,
+                "phase": job.get("phase", ""),
+                "message": job.get("message", ""),
+                "is_stale": age and age > STALE_THRESHOLDS.get("packing", 2700)
+            })
+        
+        for job in posting_jobs:
+            age = get_job_age_seconds(job)
+            result["posting"]["jobs"].append({
+                "id": job.get("id"),
+                "job_name": job.get("job_name"),
+                "status": job.get("status"),
+                "provider_used": job.get("provider_used", ""),
+                "age_seconds": age,
+                "phase": job.get("phase", ""),
+                "message": job.get("message", ""),
+                "is_stale": age and age > STALE_THRESHOLDS.get("posting", 1200)
+            })
+        
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def _prepare_has_auto_chain_event(job):
     return any((ev.get("phase") == "auto_chain") for ev in (job.get("events") or []))
 
@@ -1201,11 +1496,8 @@ def start_auto_chain_thread_once():
     global AUTO_CHAIN_LOCK_HANDLE
     if AUTO_CHAIN_LOCK_HANDLE is not None:
         return
-    try:
-        pathlib.Path("/config").mkdir(parents=True, exist_ok=True)
-        AUTO_CHAIN_LOCK_HANDLE = open(AUTO_CHAIN_LOCK_FILE, "w")
-        fcntl.flock(AUTO_CHAIN_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
+    AUTO_CHAIN_LOCK_HANDLE = try_acquire_lock(AUTO_CHAIN_LOCK_FILE)
+    if AUTO_CHAIN_LOCK_HANDLE is None:
         AUTO_CHAIN_LOCK_HANDLE = None
         return
     threading.Thread(target=auto_chain_loop, daemon=True).start()
@@ -1348,12 +1640,36 @@ def change_recovery_secret_page():
 @app.route("/")
 def dashboard():
     settings = load_settings()
-    all_jobs = list_jobs(5000)
-    all_history = list_history(5000)
-    all_clean_logs = list_clean_actions(5000)
-    all_packing_jobs = list_packing_jobs(5000)
-    all_posting_jobs = list_posting_jobs(5000)
-    all_share_jobs = list_share_history(5000)
+    try:
+        all_jobs = list_jobs(5000)
+    except Exception as exc:
+        LOG.error("Dashboard prepare jobs read failed: %s", exc)
+        all_jobs = []
+    try:
+        all_history = list_history(5000)
+    except Exception as exc:
+        LOG.error("Dashboard prepare history read failed: %s", exc)
+        all_history = []
+    try:
+        all_clean_logs = list_clean_actions(5000)
+    except Exception as exc:
+        LOG.error("Dashboard clean log read failed: %s", exc)
+        all_clean_logs = []
+    try:
+        all_packing_jobs = list_packing_jobs(5000)
+    except Exception as exc:
+        LOG.error("Dashboard packing jobs read failed: %s", exc)
+        all_packing_jobs = []
+    try:
+        all_posting_jobs = list_posting_jobs(5000)
+    except Exception as exc:
+        LOG.error("Dashboard posting jobs read failed: %s", exc)
+        all_posting_jobs = []
+    try:
+        all_share_jobs = list_share_history(5000)
+    except Exception as exc:
+        LOG.error("Dashboard share history read failed: %s", exc)
+        all_share_jobs = []
     clean_summary = summarize_clean_logs(all_clean_logs)
     prepare_summary = summarize_prepare_stats(all_history, all_jobs)
     packing_summary = summarize_packing_stats(all_packing_jobs)
@@ -1458,8 +1774,13 @@ def api_settings_save():
         provider_items = json.loads(raw_providers or "[]") if provider_source != "secret_file" and provider_source != "env_var" else get_posting_providers(current)
         if not isinstance(provider_items, list):
             raise ValueError("posting_providers_json must be a list")
-    except Exception:
-        flash("Posting providers could not be parsed, so the previous provider list was kept.", "warning")
+        # Validate against schema
+        _validate_posting_providers(provider_items)
+    except JsonSchemaValidationError as e:
+        flash(f"Posting providers validation failed: {e.message}. Previous provider list was kept.", "warning")
+        provider_items = get_posting_providers(current)
+    except Exception as e:
+        flash(f"Posting providers could not be parsed: {str(e)[:200]}. Previous provider list was kept.", "warning")
         provider_items = get_posting_providers(current)
 
     existing_providers = get_posting_providers(current)
@@ -2021,17 +2342,34 @@ def api_prepare_tv_seasons():
 
 @app.route("/api/prepare/tv/preview", methods=["POST"])
 def api_prepare_tv_preview():
-    data = request.get_json(force=True)
-    return jsonify(preview_tv(load_settings(), data["show_name"], data["season_name"], data.get("bracket_override","")))
+    data = request.get_json(silent=True) or {}
+    show_name = str(data.get("show_name") or "").strip()
+    season_name = str(data.get("season_name") or "").strip()
+    if not show_name or not season_name:
+        return jsonify({"ok": False, "error": "show_name and season_name are required"}), 400
+    try:
+        payload = preview_tv(load_settings(), show_name, season_name, data.get("bracket_override", ""))
+        payload["ok"] = True
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route("/api/prepare/tv/start", methods=["POST"])
 def api_prepare_tv_start():
     blocked = reject_if_draining()
     if blocked:
         return blocked
-    payload = request.get_json(force=True)
+    payload = request.get_json(silent=True) or {}
+    source_path = str(payload.get("source_path") or "").strip()
+    dest_path = str(payload.get("dest_path") or "").strip()
+    if not source_path or not dest_path:
+        return jsonify({"ok": False, "error": "Invalid preview payload. Rebuild queue preview and try again."}), 400
     settings = load_settings()
-    job_id = create_job("tv", payload["source_path"], payload["dest_path"])
+    # Deduplicate: if this source_path already has a queued or running job, reuse it
+    existing = _find_active_prepare_job(source_path)
+    if existing:
+        return jsonify({"ok": True, "job_id": existing, "duplicate": True})
+    job_id = create_job("tv", source_path, dest_path)
     add_job_event(job_id, "queued", "TV prepare job queued.", 0)
     threading.Thread(target=run_prepare_job_when_slot, args=(job_id, "tv", settings, payload), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
@@ -2049,17 +2387,33 @@ def api_prepare_movie_search():
 
 @app.route("/api/prepare/movie/preview", methods=["POST"])
 def api_prepare_movie_preview():
-    data = request.get_json(force=True)
-    return jsonify(preview_movie(load_settings(), data["movie_name"], data.get("bracket_override","")))
+    data = request.get_json(silent=True) or {}
+    movie_name = str(data.get("movie_name") or "").strip()
+    if not movie_name:
+        return jsonify({"ok": False, "error": "movie_name is required"}), 400
+    try:
+        payload = preview_movie(load_settings(), movie_name, data.get("bracket_override", ""))
+        payload["ok"] = True
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route("/api/prepare/movie/start", methods=["POST"])
 def api_prepare_movie_start():
     blocked = reject_if_draining()
     if blocked:
         return blocked
-    payload = request.get_json(force=True)
+    payload = request.get_json(silent=True) or {}
+    source_path = str(payload.get("source_path") or "").strip()
+    dest_path = str(payload.get("dest_path") or "").strip()
+    if not source_path or not dest_path:
+        return jsonify({"ok": False, "error": "Invalid preview payload. Rebuild queue preview and try again."}), 400
     settings = load_settings()
-    job_id = create_job("movie", payload["source_path"], payload["dest_path"])
+    # Deduplicate: if this source_path already has a queued or running job, reuse it
+    existing = _find_active_prepare_job(source_path)
+    if existing:
+        return jsonify({"ok": True, "job_id": existing, "duplicate": True})
+    job_id = create_job("movie", source_path, dest_path)
     add_job_event(job_id, "queued", "Movie prepare job queued.", 0)
     threading.Thread(target=run_prepare_job_when_slot, args=(job_id, "movie", settings, payload), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})

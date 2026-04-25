@@ -1,7 +1,39 @@
 from datetime import datetime
+import time
 from app.db import get_conn
 
 ACTIVE_PACKING_PROCS = {}
+
+class TTLDict:
+    """Dictionary with time-to-live for entries to prevent unbounded growth."""
+    def __init__(self, ttl_seconds=3600):
+        self.ttl = ttl_seconds
+        self.data = {}
+    
+    def get(self, key, default=None):
+        """Get value, cleaning expired entries."""
+        self._cleanup()
+        value, _ = self.data.get(key, (default, None))
+        return value
+    
+    def __getitem__(self, key):
+        """Dict-style access."""
+        self._cleanup()
+        return self.data[key][0]
+    
+    def __setitem__(self, key, value):
+        """Dict-style setting."""
+        self._cleanup()
+        self.data[key] = (value, time.time())
+    
+    def _cleanup(self):
+        """Remove expired entries."""
+        now = time.time()
+        expired = [k for k, (_, ts) in self.data.items() if now - ts > self.ttl]
+        for k in expired:
+            del self.data[k]
+
+_PACKING_EVENT_THROTTLE_STATE = TTLDict(ttl_seconds=3600)
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -84,6 +116,8 @@ def count_running_packing_jobs():
 def try_claim_packing_slot(job_id, max_jobs):
     conn = get_conn(); cur = conn.cursor()
     try:
+        # Set a timeout to prevent hanging on database locks
+        conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
         cur.execute("BEGIN IMMEDIATE")
         cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status='running'")
         running = int(cur.fetchone()[0] or 0)
@@ -96,12 +130,14 @@ def try_claim_packing_slot(job_id, max_jobs):
         conn.commit()
         conn.close()
         return claimed
-    except Exception:
+    except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
         conn.close()
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to claim packing slot for job {job_id}: {e}")
         return False
 
 def update_packing_job(job_id, **fields):
@@ -114,6 +150,19 @@ def update_packing_job(job_id, **fields):
     conn.commit(); conn.close()
 
 def add_packing_event(job_id, phase, message, percent=None):
+    phase_norm = str(phase or "").strip().lower()
+    throttle_window_seconds = 0.0
+    if phase_norm in {"queued", "rar", "par2", "stability"}:
+        throttle_window_seconds = 1.0
+    if throttle_window_seconds > 0:
+        # Throttle by job+phase+percent band to keep useful progress while avoiding spam.
+        percent_band = None if percent is None else int(percent)
+        key = (int(job_id), phase_norm, percent_band)
+        now_mono = time.monotonic()
+        last = _PACKING_EVENT_THROTTLE_STATE.get(key, 0.0)
+        if (now_mono - last) < throttle_window_seconds:
+            return
+        _PACKING_EVENT_THROTTLE_STATE[key] = now_mono
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
         "INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
@@ -130,28 +179,103 @@ def finish_packing(job_id, success=True, message=""):
     update_packing_job(job_id, status="done" if success else "failed", finished_at=now(), message=message, percent=100 if success else None)
 
 def list_packing_jobs(limit=200):
+    """Fetch packing jobs with events - optimized to avoid N+1 queries."""
     conn = get_conn(); cur = conn.cursor()
+    
+    # Fetch jobs
     cur.execute("SELECT * FROM packing_jobs ORDER BY id DESC LIMIT ?", (limit,))
     jobs = [dict(r) for r in cur.fetchall()]
-    for j in jobs:
-        cur.execute("SELECT phase,message,percent,timestamp FROM packing_job_events WHERE packing_job_id=? ORDER BY id DESC LIMIT 20", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all events in a single query
+    placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT packing_job_id, phase, message, percent, timestamp, id 
+        FROM packing_job_events 
+        WHERE packing_job_id IN ({placeholders})
+        ORDER BY packing_job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
     conn.close()
+    
+    # Group events by job_id
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["packing_job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 20:
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs
+    for j in jobs:
+        j["events"] = events_by_job.get(j["id"], [])
+    
     return jobs
 
 
 def list_packing_jobs_by_status(statuses, limit=500):
+    """Fetch packing jobs by status with events - optimized to avoid N+1 queries."""
     wanted = [str(s).strip().lower() for s in (statuses or []) if str(s).strip()]
     if not wanted:
         return []
+    
     placeholders = ",".join("?" for _ in wanted)
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(f"SELECT * FROM packing_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", tuple(wanted) + (int(limit),))
+    
+    # Fetch jobs
+    cur.execute(f"SELECT * FROM packing_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", 
+                tuple(wanted) + (int(limit),))
     jobs = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all events in a single query
+    event_placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT packing_job_id, phase, message, percent, timestamp, id 
+        FROM packing_job_events 
+        WHERE packing_job_id IN ({event_placeholders})
+        ORDER BY packing_job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
+    conn.close()
+    
+    # Group events by job_id
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["packing_job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 20:
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs
     for j in jobs:
-        cur.execute("SELECT phase,message,percent,timestamp FROM packing_job_events WHERE packing_job_id=? ORDER BY id DESC LIMIT 20", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
-    conn.close(); return jobs
+        j["events"] = events_by_job.get(j["id"], [])
+    
+    return jobs
 
 def has_successful_packing(source_path):
     conn = get_conn(); cur = conn.cursor()
@@ -162,13 +286,49 @@ def has_successful_packing(source_path):
 
 
 def list_packing_history(limit=1000):
+    """Fetch packing history with events - optimized to avoid N+1 queries."""
     conn = get_conn(); cur = conn.cursor()
+    
+    # Fetch jobs
     cur.execute("SELECT * FROM packing_jobs ORDER BY id DESC LIMIT ?", (limit,))
     jobs = [dict(r) for r in cur.fetchall()]
-    for j in jobs:
-        cur.execute("SELECT phase,message,percent,timestamp FROM packing_job_events WHERE packing_job_id=? ORDER BY id DESC LIMIT 50", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all events in a single query
+    placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT packing_job_id, phase, message, percent, timestamp, id 
+        FROM packing_job_events 
+        WHERE packing_job_id IN ({placeholders})
+        ORDER BY packing_job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
     conn.close()
+    
+    # Group events by job_id
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["packing_job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 50:  # Keep 50 for history
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs
+    for j in jobs:
+        j["events"] = events_by_job.get(j["id"], [])
+    
     return jobs
 
 

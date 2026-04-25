@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -15,6 +16,7 @@ import requests
 from app.db import load_settings
 from app.posting_jobs import list_posting_history
 from app.secret_utils import resolve_secret
+from app.web_security import normalize_service_base_url
 from app.share_jobs import (
     add_share_event,
     create_imported_share_bundle,
@@ -76,6 +78,12 @@ def get_share_destinations(settings=None):
                 entry.setdefault("includemeta", True)
                 entry.setdefault("api_key", "")
                 entry.setdefault("categories_cache", [])
+                try:
+                    entry["base_url"] = normalize_service_base_url(entry.get("base_url", ""))
+                    entry.pop("base_url_error", None)
+                except Exception as exc:
+                    entry["base_url"] = str(entry.get("base_url", "") or "").strip()
+                    entry["base_url_error"] = str(exc)
                 overrides = entry.get("category_overrides") if isinstance(entry.get("category_overrides"), dict) else {}
                 normalized_overrides = {}
                 for key in STANDARD_CATEGORY_MAP.keys():
@@ -111,6 +119,7 @@ def public_share_destinations(settings=None):
             "basic_auth": bool(destination.get("basic_auth", False)),
             "categories_cache": destination.get("categories_cache") or [],
             "category_overrides": destination.get("category_overrides") or {},
+            "base_url_error": str(destination.get("base_url_error", "") or ""),
         }
         public.append(entry)
     return public
@@ -175,7 +184,10 @@ def _template_release_title(text):
             continue
         if any(tok in plain.lower() for tok in ('header:', 'group:', 'size:', 'password:')):
             continue
-        if re.search(r'\[(?:web|blu|aac|eac3|ddp|x26|h26|2160p|1080p|720p)', plain, re.I) or re.search(r'S\d{1,2}', plain, re.I):
+        release_hint = re.search(r'\[(?:web|blu|aac|eac3|ddp|x26|h26|2160p|1080p|720p)', line, re.I)
+        episode_hint = re.search(r'\bS\d{1,2}(?:E\d{1,3})?\b', plain, re.I)
+        resolution_hint = re.search(r'\b(?:2160p|1080p|720p|480p)\b', plain, re.I)
+        if release_hint or episode_hint or resolution_hint:
             return plain
     return ''
 
@@ -306,8 +318,7 @@ def _episode_range(season_numbers, episode_numbers):
     return f"S{season:02d}E{episode_numbers[0]:02d}-E{episode_numbers[-1]:02d}"
 
 
-def parse_template_info(template_path: Path):
-    text = template_path.read_text(encoding="utf-8", errors="replace") if template_path.exists() else ""
+def _parse_template_info_text(text, source_name):
     header = _safe_line_capture(r"^Header:[^\S\r\n]*([^\r\n]*)$", text)
     groups = _safe_line_capture(r"^Group:[^\S\r\n]*([^\r\n]*)$", text)
     password = _safe_line_capture(r"^\[CODE\]([\s\S]*?)\[/CODE\]\s*$", text)
@@ -334,9 +345,9 @@ def parse_template_info(template_path: Path):
             next_line = remainder.splitlines()[1] if remainder.splitlines()[:2] else ""
             if next_line and not re.match(r"^(Size:|\[NZB\]|Password:|\[CODE\]|\[/HIDETHANKS\]|\[/SPOILER\])", next_line.strip(), re.I):
                 groups_csv = next_line.strip()
-    hdr_flags = _detect_hdr_flags(first_title, video_summary, text[:4000], template_path.name)
-    video_codec = _normalize_video_codec(" \n".join([first_title, video_summary, template_path.name]))
-    audio_codec = _normalize_audio_codec(" \n".join([first_title, audio_summary, template_path.name]))
+    hdr_flags = _detect_hdr_flags(first_title, video_summary, text[:4000], source_name)
+    video_codec = _normalize_video_codec(" \n".join([first_title, video_summary, source_name]))
+    audio_codec = _normalize_audio_codec(" \n".join([first_title, audio_summary, source_name]))
     return {
         "text": text,
         "header": header,
@@ -345,7 +356,7 @@ def parse_template_info(template_path: Path):
         "declared_size": declared_size,
         "declared_size_bytes": _parse_human_size_to_bytes(declared_size),
         "release_title": release_title,
-        "source_name": template_path.name,
+        "source_name": source_name,
         "first_title": first_title,
         "episode_count": len({(int(s), int(e)) for s, e in episode_codes}),
         "season_numbers": season_numbers,
@@ -362,6 +373,30 @@ def parse_template_info(template_path: Path):
         "tmdb_id": tmdb_id,
         "tvdb_id": tvdb_id,
     }
+
+
+def _template_info_cache_key(template_path: Path):
+    path = Path(template_path)
+    try:
+        stat = path.stat()
+        return str(path), int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return str(path), None, None
+
+
+@lru_cache(maxsize=2048)
+def _parse_template_info_cached(path_str, mtime_ns, size_bytes):
+    template_path = Path(path_str)
+    text = template_path.read_text(encoding="utf-8", errors="replace") if mtime_ns is not None else ""
+    return _parse_template_info_text(text, template_path.name)
+
+
+def parse_template_info(template_path: Path):
+    info = _parse_template_info_cached(*_template_info_cache_key(template_path))
+    result = dict(info)
+    for key in ("season_numbers", "episode_numbers", "bundle_files", "hdr_flags"):
+        result[key] = list(info.get(key) or [])
+    return result
 
 
 def infer_release_metadata(name, size_bytes=0, template_groups=""):
@@ -398,8 +433,19 @@ def infer_release_metadata(name, size_bytes=0, template_groups=""):
 
 
 def _file_sha256(path):
+    return _file_sha256_cached(*_file_hash_cache_key(path))
+
+
+def _file_hash_cache_key(path):
+    file_path = Path(path)
+    stat = file_path.stat()
+    return str(file_path), int(stat.st_mtime_ns), int(stat.st_size)
+
+
+@lru_cache(maxsize=2048)
+def _file_sha256_cached(path_str, mtime_ns, size_bytes):
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with open(path_str, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -462,7 +508,7 @@ def build_resolved_category_preview(destinations, category_key):
 
 
 def fetch_destination_caps(destination, timeout=30):
-    base_url = str(destination.get("base_url", "") or "").strip().rstrip("/")
+    base_url = normalize_service_base_url(destination.get("base_url", ""))
     api_key = str(destination.get("api_key", "") or "").strip()
     if not base_url or not api_key:
         raise RuntimeError("Destination base_url and api_key are required")
@@ -776,36 +822,42 @@ def generate_nfo_text(candidate, template_info):
 def generate_metadata_xml(candidate, template_info):
     meta = infer_release_metadata(candidate.get("release_name") or candidate.get("job_name"), candidate.get("size_bytes") or 0, template_info.get("groups", ""))
     groups = [g.strip() for g in str(template_info.get("groups", "")).split(",") if g.strip()]
-    return f'''<?xml version="1.0" encoding="UTF-8"?>
-<MediaInfo>
-  <General>
-    <ReleaseName>{candidate.get('release_name') or candidate.get('job_name')}</ReleaseName>
-    <MediaType>{meta.get('media_type') or ''}</MediaType>
-    <Resolution>{meta.get('resolution') or ''}</Resolution>
-    <Year>{meta.get('year') or ''}</Year>
-    <Season>{meta.get('season') or ''}</Season>
-    <Episode>{meta.get('episode') or ''}</Episode>
-    <EpisodeCount>{int(template_info.get('episode_count') or 0)}</EpisodeCount>
-    <EpisodeRange>{template_info.get('episode_range','')}</EpisodeRange>
-    <SizeBytes>{int(meta.get('size_bytes') or 0)}</SizeBytes>
-    <Header>{template_info.get('header','')}</Header>
-    <PasswordIncluded>{'true' if template_info.get('password') else 'false'}</PasswordIncluded>
-    <FirstTitle>{template_info.get('first_title','')}</FirstTitle>
-    <HDRFlags>{','.join(template_info.get('hdr_flags') or [])}</HDRFlags>
-    <VideoCodec>{template_info.get('video_codec','')}</VideoCodec>
-    <AudioCodec>{template_info.get('audio_codec','')}</AudioCodec>
-    <VideoSummary>{template_info.get('video_summary','')}</VideoSummary>
-    <AudioSummary>{template_info.get('audio_summary','')}</AudioSummary>
-    <DurationSummary>{template_info.get('duration_summary','')}</DurationSummary>
-    <IMDB>{template_info.get('imdb_id','')}</IMDB>
-    <TMDB>{template_info.get('tmdb_id','')}</TMDB>
-    <TVDB>{template_info.get('tvdb_id','')}</TVDB>
-  </General>
-  <Usenet>
-    <Groups>{''.join(f'<Group>{g}</Group>' for g in groups)}</Groups>
-  </Usenet>
-</MediaInfo>
-'''
+    root = ET.Element("MediaInfo")
+    general = ET.SubElement(root, "General")
+    general_fields = {
+        "ReleaseName": candidate.get("release_name") or candidate.get("job_name"),
+        "MediaType": meta.get("media_type") or "",
+        "Resolution": meta.get("resolution") or "",
+        "Year": meta.get("year") or "",
+        "Season": meta.get("season") or "",
+        "Episode": meta.get("episode") or "",
+        "EpisodeCount": int(template_info.get("episode_count") or 0),
+        "EpisodeRange": template_info.get("episode_range", ""),
+        "SizeBytes": int(meta.get("size_bytes") or 0),
+        "Header": template_info.get("header", ""),
+        "PasswordIncluded": "true" if template_info.get("password") else "false",
+        "FirstTitle": template_info.get("first_title", ""),
+        "HDRFlags": ",".join(template_info.get("hdr_flags") or []),
+        "VideoCodec": template_info.get("video_codec", ""),
+        "AudioCodec": template_info.get("audio_codec", ""),
+        "VideoSummary": template_info.get("video_summary", ""),
+        "AudioSummary": template_info.get("audio_summary", ""),
+        "DurationSummary": template_info.get("duration_summary", ""),
+        "IMDB": template_info.get("imdb_id", ""),
+        "TMDB": template_info.get("tmdb_id", ""),
+        "TVDB": template_info.get("tvdb_id", ""),
+    }
+    for tag, value in general_fields.items():
+        child = ET.SubElement(general, tag)
+        child.text = str(value)
+
+    usenet = ET.SubElement(root, "Usenet")
+    groups_node = ET.SubElement(usenet, "Groups")
+    for group in groups:
+        child = ET.SubElement(groups_node, "Group")
+        child.text = group
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True, short_empty_elements=False).decode("utf-8") + "\n"
 
 
 def _extract_nzb_from_rar(rar_path: Path, workdir: Path):
@@ -896,7 +948,7 @@ def run_share_job(job_id, settings=None):
                 return
             add_share_event(job_id, "upload", "Submitting NZB to destination", 35)
             api_key = str(destination.get("api_key", "") or "").strip()
-            base_url = str(destination.get("base_url", "") or "").strip().rstrip("/")
+            base_url = normalize_service_base_url(destination.get("base_url", ""))
             cat_id = str(job.get("selected_category_id") or "")
             query = {
                 "t": "nzbadd",

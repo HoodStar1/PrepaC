@@ -56,8 +56,14 @@ def detect_tags(path):
 
     for s in ff.get("streams", []):
         if s.get("codec_type") == "video" and width is None:
-            width = s.get("width")
-            height = s.get("height")
+            # Use the larger of display dimensions vs coded dimensions so that
+            # DV/anamorphic files with scaled display dimensions still resolve
+            # to their true encoded resolution (e.g. coded_width=3840 wins over
+            # a display width of 1920).
+            w_raw = max(int(s.get("width") or 0), int(s.get("coded_width") or 0))
+            h_raw = max(int(s.get("height") or 0), int(s.get("coded_height") or 0))
+            width = w_raw or None
+            height = h_raw or None
             vcodec = (s.get("codec_name") or "").lower()
         if s.get("codec_type") == "audio" and acodec is None:
             acodec = (s.get("codec_name") or "").lower()
@@ -73,11 +79,49 @@ def detect_tags(path):
 
     resolution = _resolution_from_dimensions(width, height)
 
-    # HDR grouping
-    has_dv = "dolby vision" in mil
-    has_hlg = "hlg" in mil
-    has_hdr10plus = "hdr10+" in mil
-    has_hdr10 = ("hdr10" in mil) or any((s.get("color_transfer") or "").lower() == "smpte2084" for s in ff.get("streams", []) if s.get("codec_type") == "video")
+    # HDR grouping — use ffprobe structured data as the authoritative source.
+    # Avoid mediainfo text substring matching for HDR flags: mediainfo output
+    # includes the filename, so a file named "Movie.HDR10.mkv" would falsely
+    # match "hdr10" even if the video stream has no HDR metadata at all.
+    _vstreams = [s for s in ff.get("streams", []) if s.get("codec_type") == "video"]
+
+    def _side_data_types():
+        types = set()
+        for s in _vstreams:
+            for sd in s.get("side_data_list", []):
+                t = (sd.get("side_data_type") or "").lower()
+                if t:
+                    types.add(t)
+        return types
+
+    _sd_types = _side_data_types()
+    _transfer = next(
+        ((s.get("color_transfer") or "").lower() for s in _vstreams if s.get("color_transfer")),
+        ""
+    )
+
+    # Dolby Vision: DOVI config in side_data, or mediainfo "dolby vision" text.
+    # mediainfo "dolby vision" is specific enough and doesn't appear in filenames.
+    has_dv = (
+        any("dovi" in t or "dolby vision" in t for t in _sd_types)
+        or "dolby vision" in mil
+    )
+
+    # HLG: arib-std-b67 is the unambiguous ffprobe value for HLG transfer.
+    has_hlg = _transfer == "arib-std-b67"
+
+    # HDR10+: side_data SMPTE 2094-40 entry, or mediainfo "hdr10+" text.
+    # "hdr10+" is specific enough to not appear accidentally in filenames.
+    has_hdr10plus = (
+        any("smpte2094" in t or "hdr10+" in t for t in _sd_types)
+        or "hdr10+" in mil
+    )
+
+    # HDR10: PQ transfer curve AND mastering display static metadata present.
+    # Both conditions required — PQ alone is shared with DV-only and HDR10Plus.
+    _has_pq = _transfer == "smpte2084"
+    _has_mastering = any("mastering" in t or "content light" in t for t in _sd_types)
+    has_hdr10 = _has_pq and _has_mastering
     if has_hlg:
         hdr_group = "HLG"
     elif has_dv and has_hdr10plus:

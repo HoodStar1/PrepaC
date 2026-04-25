@@ -1,5 +1,6 @@
 from datetime import datetime
 import subprocess
+import os
 from app.db import get_conn
 
 ACTIVE_PREPARE_PROCS = {}
@@ -42,18 +43,36 @@ def unregister_prepare_worker(job_id):
     ACTIVE_PREPARE_WORKERS.discard(int(job_id))
 
 def reconcile_prepare_running_jobs(reason="Recovered stale prepare slot"):
+    # In multi-worker gunicorn, in-memory active sets are process-local and cannot
+    # safely identify active jobs across workers. Only recover clearly stale jobs.
+    try:
+        stale_min_age = max(300, int(str(os.environ.get("PREPAC_PREPARE_RECOVERY_MIN_AGE_SECONDS", "1800") or "1800")))
+    except Exception:
+        stale_min_age = 1800
+
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id FROM prepare_jobs WHERE status='running'")
-    rows = [int(r[0]) for r in cur.fetchall()]
+    cur.execute("SELECT id, started_at FROM prepare_jobs WHERE status='running'")
+    rows = cur.fetchall()
     changed = 0
-    for jid in rows:
+    now_dt = datetime.now()
+    for row in rows:
+        jid = int(row[0])
+        started_at = None
+        try:
+            started_at = datetime.fromisoformat(str(row[1])) if row[1] else None
+        except Exception:
+            started_at = None
+        if started_at:
+            age_seconds = int((now_dt - started_at).total_seconds())
+            if age_seconds < stale_min_age:
+                continue
         if jid in ACTIVE_PREPARE_WORKERS or jid in ACTIVE_PREPARE_PROCS:
             continue
         cur.execute("UPDATE prepare_jobs SET status='failed', finished_at=? WHERE id=? AND status='running'", (now(), jid))
         if cur.rowcount:
             changed += 1
             cur.execute("INSERT INTO job_events(job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
-                        (jid, now(), 'recovered', reason, None))
+                        (jid, now(), 'recovered', f"{reason} (stale > {stale_min_age}s)", None))
     conn.commit(); conn.close()
     return changed
 
@@ -61,6 +80,8 @@ def try_claim_prepare_slot(job_id, max_jobs):
     reconcile_prepare_running_jobs()
     conn = get_conn(); cur = conn.cursor()
     try:
+        # Set a timeout to prevent hanging on database locks
+        conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
         cur.execute("BEGIN IMMEDIATE")
         cur.execute("SELECT COUNT(*) FROM prepare_jobs WHERE status='running'")
         running = int(cur.fetchone()[0] or 0)
@@ -70,46 +91,133 @@ def try_claim_prepare_slot(job_id, max_jobs):
             return False
         cur.execute("UPDATE prepare_jobs SET status='running' WHERE id=? AND status='queued'", (job_id,))
         claimed = cur.rowcount == 1
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         return claimed
-    except Exception:
+    except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
         conn.close()
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to claim prepare slot for job {job_id}: {e}")
         return False
 
 def list_jobs(limit=20):
+    """Fetch jobs with recent events - optimized to avoid N+1 queries."""
     conn = get_conn(); cur = conn.cursor()
+    
+    # Fetch job list
     cur.execute("SELECT * FROM prepare_jobs ORDER BY id DESC LIMIT ?", (limit,))
     jobs = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all recent events for these jobs in a single query
+    placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT job_id, phase, message, percent, timestamp, id 
+        FROM job_events 
+        WHERE job_id IN ({placeholders})
+        ORDER BY job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
+    conn.close()
+    
+    # Group events by job_id (maintaining order - most recent first per job)
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 10:  # Keep only last 10
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs and set latest phase/message/percent
     for j in jobs:
-        cur.execute("SELECT phase, message, percent, timestamp FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 10", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
+        j["events"] = events_by_job.get(j["id"], [])
         if j["events"]:
-            j["phase"] = j["events"][0]["phase"]; j["message"] = j["events"][0]["message"]; j["percent"] = j["events"][0]["percent"]
+            j["phase"] = j["events"][0]["phase"]
+            j["message"] = j["events"][0]["message"]
+            j["percent"] = j["events"][0]["percent"]
         else:
-            j["phase"] = ""; j["message"] = ""; j["percent"] = None
-    conn.close(); return jobs
+            j["phase"] = ""
+            j["message"] = ""
+            j["percent"] = None
+    
+    return jobs
 
 
 def list_jobs_by_status(statuses, limit=500):
+    """Fetch jobs by status with recent events - optimized to avoid N+1 queries."""
     wanted = [str(s).strip().lower() for s in (statuses or []) if str(s).strip()]
     if not wanted:
         return []
+    
     placeholders = ",".join("?" for _ in wanted)
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(f"SELECT * FROM prepare_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", tuple(wanted) + (int(limit),))
+    
+    # Fetch job list
+    cur.execute(f"SELECT * FROM prepare_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", 
+                tuple(wanted) + (int(limit),))
     jobs = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all recent events for these jobs in a single query
+    event_placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT job_id, phase, message, percent, timestamp, id 
+        FROM job_events 
+        WHERE job_id IN ({event_placeholders})
+        ORDER BY job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
+    conn.close()
+    
+    # Group events by job_id (maintaining order - most recent first per job)
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 20:  # Keep last 20 for this function
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs and set latest phase/message/percent
     for j in jobs:
-        cur.execute("SELECT phase, message, percent, timestamp FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 20", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
+        j["events"] = events_by_job.get(j["id"], [])
         if j["events"]:
-            j["phase"] = j["events"][0]["phase"]; j["message"] = j["events"][0]["message"]; j["percent"] = j["events"][0]["percent"]
+            j["phase"] = j["events"][0]["phase"]
+            j["message"] = j["events"][0]["message"]
+            j["percent"] = j["events"][0]["percent"]
         else:
-            j["phase"] = ""; j["message"] = ""; j["percent"] = None
-    conn.close(); return jobs
+            j["phase"] = ""
+            j["message"] = ""
+            j["percent"] = None
+    
+    return jobs
 
 
 def interrupt_running_prepare_jobs(reason="Interrupted by container shutdown", recovery=False):

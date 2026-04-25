@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <title>PrepaC</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="prepac-csrf-token" content="{{ csrf_token }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body class="app-shell">
@@ -47,6 +48,59 @@
       {% endif %}
     {% endwith %}
 
+<script>
+window.PREPAC_CSRF_TOKEN = {{ csrf_token|tojson }};
+(function() {
+  const csrfToken = window.PREPAC_CSRF_TOKEN || '';
+  const unsafeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+  const originalFetch = window.fetch ? window.fetch.bind(window) : null;
+
+  function requestMethod(input, init){
+    return String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+  }
+
+  function requestUrl(input){
+    if (typeof input === 'string') return input;
+    return (input && input.url) || window.location.href;
+  }
+
+  if (originalFetch) {
+    window.fetch = function(input, init) {
+      const nextInit = init ? { ...init } : {};
+      if (nextInit.credentials === undefined) nextInit.credentials = 'same-origin';
+
+      const method = requestMethod(input, nextInit);
+      if (csrfToken && unsafeMethods.has(method)) {
+        let sameOrigin = true;
+        try {
+          sameOrigin = new URL(requestUrl(input), window.location.href).origin === window.location.origin;
+        } catch (_error) {}
+        if (sameOrigin) {
+          const headers = new Headers(nextInit.headers || (input && input.headers) || undefined);
+          if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrfToken);
+          nextInit.headers = headers;
+        }
+      }
+
+      return originalFetch(input, nextInit);
+    };
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('form').forEach((form) => {
+      const method = String(form.getAttribute('method') || 'GET').toUpperCase();
+      if (!unsafeMethods.has(method)) return;
+      if (form.querySelector('input[name="csrf_token"]')) return;
+      const hidden = document.createElement('input');
+      hidden.type = 'hidden';
+      hidden.name = 'csrf_token';
+      hidden.value = csrfToken;
+      form.prepend(hidden);
+    });
+  });
+})();
+</script>
+
 {% set live_settings = settings if settings is defined else none %}
 {% if live_settings %}
   {% if not live_settings.get("tv_root") or not live_settings.get("movie_root") or not live_settings.get("dest_root") %}
@@ -57,6 +111,54 @@
   {% endif %}
 {% endif %}
 
+{% if db_corrupt %}
+<section class="flash-stack" id="dbCorruptBanner">
+  <div class="flash error">
+    <strong>&#9888; Database Corruption Detected</strong> &mdash; Some pages may show missing or incomplete data.
+    The corruption is limited to an index (your history data is intact).
+    Click <strong>Auto-Repair</strong> to rebuild indexes in-place without losing any history.
+    <span style="display:inline-flex;gap:.5rem;margin-top:.4rem;flex-wrap:wrap;align-items:center">
+      <button id="dbRepairBtn" onclick="prepacRepairDb()" style="cursor:pointer">&#128295; Auto-Repair (REINDEX)</button>
+      <a href="/api/db/integrity" target="_blank" rel="noopener" style="font-size:.85em">Check status</a>
+      <span id="dbRepairStatus" style="font-size:.85em"></span>
+    </span>
+    <details style="margin-top:.5rem;font-size:.85em">
+      <summary>Manual recovery commands (if auto-repair fails)</summary>
+      <pre style="margin:.4rem 0 0">sqlite3 /config/prepac.db '.recover' &gt; /tmp/recover.sql
+sqlite3 /config/prepac_new.db &lt; /tmp/recover.sql
+cp /config/prepac.db /config/prepac.db.bak
+mv /config/prepac_new.db /config/prepac.db</pre>
+    </details>
+  </div>
+</section>
+<script>
+async function prepacRepairDb() {
+  const btn = document.getElementById('dbRepairBtn');
+  const status = document.getElementById('dbRepairStatus');
+  btn.disabled = true;
+  btn.textContent = 'Repairing…';
+  status.textContent = '';
+  try {
+    const res = await fetch('/api/db/repair', { method: 'POST', credentials: 'same-origin' });
+    const data = await res.json();
+    if (data.ok) {
+      status.textContent = '\u2705 Repair successful — reloading…';
+      document.getElementById('dbCorruptBanner').style.display = 'none';
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      const issues = (data.issues || []).join('; ');
+      status.textContent = '\u274c Repair failed: ' + issues;
+      btn.disabled = false;
+      btn.textContent = '\uD83D\uDD27 Auto-Repair (REINDEX)';
+    }
+  } catch (e) {
+    status.textContent = '\u274c Request failed: ' + e;
+    btn.disabled = false;
+    btn.textContent = '\uD83D\uDD27 Auto-Repair (REINDEX)';
+  }
+}
+</script>
+{% endif %}
     {% block content %}{% endblock %}
   </main>
   <footer class="app-footer">

@@ -1,7 +1,39 @@
 from datetime import datetime
+import time
 from app.db import get_conn
 
 ACTIVE_POSTING_PROCS = {}
+
+class TTLDict:
+    """Dictionary with time-to-live for entries to prevent unbounded growth."""
+    def __init__(self, ttl_seconds=3600):
+        self.ttl = ttl_seconds
+        self.data = {}
+    
+    def get(self, key, default=None):
+        """Get value, cleaning expired entries."""
+        self._cleanup()
+        value, _ = self.data.get(key, (default, None))
+        return value
+    
+    def __getitem__(self, key):
+        """Dict-style access."""
+        self._cleanup()
+        return self.data[key][0]
+    
+    def __setitem__(self, key, value):
+        """Dict-style setting."""
+        self._cleanup()
+        self.data[key] = (value, time.time())
+    
+    def _cleanup(self):
+        """Remove expired entries."""
+        now = time.time()
+        expired = [k for k, (_, ts) in self.data.items() if now - ts > self.ttl]
+        for k in expired:
+            del self.data[k]
+
+_POSTING_EVENT_THROTTLE_STATE = TTLDict(ttl_seconds=3600)
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -82,6 +114,18 @@ def update_posting_job(job_id, **fields):
     conn.commit(); conn.close()
 
 def add_posting_event(job_id, phase, message, percent=None):
+    phase_norm = str(phase or "").strip().lower()
+    message_norm = str(message or "").strip()
+    throttle_window_seconds = 0.0
+    if phase_norm in {"queued", "posting", "finalizing", "postcheck"}:
+        throttle_window_seconds = 1.5
+    if throttle_window_seconds > 0:
+        key = (int(job_id), phase_norm, message_norm, str(percent))
+        now_mono = time.monotonic()
+        last = _POSTING_EVENT_THROTTLE_STATE.get(key, 0.0)
+        if (now_mono - last) < throttle_window_seconds:
+            return
+        _POSTING_EVENT_THROTTLE_STATE[key] = now_mono
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
         "INSERT INTO posting_job_events(posting_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
@@ -106,6 +150,8 @@ def try_claim_posting_provider(job_id, provider_name):
         return False
     conn = get_conn(); cur = conn.cursor()
     try:
+        # Set a timeout to prevent hanging on database locks
+        conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
         cur.execute("BEGIN IMMEDIATE")
         cur.execute("SELECT COUNT(*) FROM posting_jobs WHERE status='running' AND provider_used=?", (provider_name,))
         running = int(cur.fetchone()[0] or 0)
@@ -121,12 +167,14 @@ def try_claim_posting_provider(job_id, provider_name):
         conn.commit()
         conn.close()
         return claimed
-    except Exception:
+    except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
         conn.close()
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to claim posting provider {provider_name} for job {job_id}: {e}")
         return False
 
 def start_posting(job_id, provider_used=None):
@@ -139,27 +187,103 @@ def finish_posting(job_id, success=True, message=""):
     update_posting_job(job_id, status="done" if success else "failed", finished_at=now(), message=message, percent=100 if success else None)
 
 def list_posting_jobs(limit=200):
+    """Fetch posting jobs with events - optimized to avoid N+1 queries."""
     conn = get_conn(); cur = conn.cursor()
+    
+    # Fetch jobs
     cur.execute("SELECT * FROM posting_jobs ORDER BY id DESC LIMIT ?", (limit,))
     jobs = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all events in a single query
+    placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT posting_job_id, phase, message, percent, timestamp, id 
+        FROM posting_job_events 
+        WHERE posting_job_id IN ({placeholders})
+        ORDER BY posting_job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
+    conn.close()
+    
+    # Group events by job_id
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["posting_job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 50:
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs
     for j in jobs:
-        cur.execute("SELECT phase,message,percent,timestamp FROM posting_job_events WHERE posting_job_id=? ORDER BY id DESC LIMIT 50", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
-    conn.close(); return jobs
+        j["events"] = events_by_job.get(j["id"], [])
+    
+    return jobs
 
 
 def list_posting_jobs_by_status(statuses, limit=500):
+    """Fetch posting jobs by status with events - optimized to avoid N+1 queries."""
     wanted = [str(s).strip().lower() for s in (statuses or []) if str(s).strip()]
     if not wanted:
         return []
+    
     placeholders = ",".join("?" for _ in wanted)
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(f"SELECT * FROM posting_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", tuple(wanted) + (int(limit),))
+    
+    # Fetch jobs
+    cur.execute(f"SELECT * FROM posting_jobs WHERE lower(status) IN ({placeholders}) ORDER BY id DESC LIMIT ?", 
+                tuple(wanted) + (int(limit),))
     jobs = [dict(r) for r in cur.fetchall()]
+    
+    if not jobs:
+        conn.close()
+        return jobs
+    
+    job_ids = [j["id"] for j in jobs]
+    
+    # Fetch all events in a single query
+    event_placeholders = ",".join("?" * len(job_ids))
+    cur.execute(f"""
+        SELECT posting_job_id, phase, message, percent, timestamp, id 
+        FROM posting_job_events 
+        WHERE posting_job_id IN ({event_placeholders})
+        ORDER BY posting_job_id DESC, id DESC
+    """, job_ids)
+    
+    all_events = cur.fetchall()
+    conn.close()
+    
+    # Group events by job_id
+    events_by_job = {}
+    for event in all_events:
+        job_id = event["posting_job_id"]
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+        if len(events_by_job[job_id]) < 50:
+            events_by_job[job_id].append({
+                "phase": event["phase"],
+                "message": event["message"],
+                "percent": event["percent"],
+                "timestamp": event["timestamp"]
+            })
+    
+    # Attach events to jobs
     for j in jobs:
-        cur.execute("SELECT phase,message,percent,timestamp FROM posting_job_events WHERE posting_job_id=? ORDER BY id DESC LIMIT 50", (j["id"],))
-        j["events"] = [dict(r) for r in cur.fetchall()]
-    conn.close(); return jobs
+        j["events"] = events_by_job.get(j["id"], [])
+    
+    return jobs
 
 def list_posting_history(limit=1000):
     return list_posting_jobs(limit)

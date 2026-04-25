@@ -25,6 +25,14 @@ let packingList = [];
 function gb(v){ return ((v||0)/(1024**3)).toFixed(2)+' GB'; }
 function formatDuration(s){ s = Number(s||0); if(s < 60) return `${s}s`; const m = Math.floor(s/60); const sec = s % 60; return `${m}m ${sec}s`; }
 
+function renderThumbnailUploadBadge(job){
+  const phase = String(job.phase || '').toLowerCase();
+  const message = String(job.message || '');
+  if (phase !== 'thumbnail_link') return '';
+  if (!message.toLowerCase().includes('thumbnail upload failed')) return '';
+  return `<div class="flash error"><strong>Thumbnail upload failed:</strong> ${message.replace(/^thumbnail upload failed:\s*/i, '')}</div>`;
+}
+
 function renderPackingCandidates(){
   const box = document.getElementById('packingCandidates');
   if (!packingList.length){
@@ -98,6 +106,7 @@ async function refreshPackingJobs(){
       <p><strong>PAR2 %:</strong> ${job.par2_percent || 0}%</p>
       <p><strong>Output root:</strong> <code>${job.output_root || ''}</code></p>
       <p><strong>Output files root:</strong> <code>${job.output_files_root || ''}</code></p>
+      ${renderThumbnailUploadBadge(job)}
       <div class="row"><button type="button" onclick="stopPackingJob(${job.id})">Stop job</button></div>
       ${job.imgbox_url ? `<p><strong>Thumbnail host:</strong> <code>${job.imgbox_url}</code></p>` : ''}
     </article>
@@ -133,6 +142,7 @@ function startPackingStreams(){
         <p><strong>PAR2 %:</strong> ${job.par2_percent || 0}%</p>
         <p><strong>Output root:</strong> <code>${job.output_root || ''}</code></p>
         <p><strong>Output files root:</strong> <code>${job.output_files_root || ''}</code></p>
+        ${renderThumbnailUploadBadge(job)}
         <div class="row"><button type="button" onclick="stopPackingJob(${job.id})">Stop job</button></div>
         ${job.imgbox_url ? `<p><strong>Thumbnail host:</strong> <code>${job.imgbox_url}</code></p>` : ''}
       </article>

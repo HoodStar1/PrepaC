@@ -642,7 +642,7 @@ def redact_url_query(value):
 def upload_imgbox(collage_path, settings):
     api_key = (settings.get("packing_freeimage_api_key") or "").strip()
     if not api_key:
-        return ""
+        return "", "Freeimage API key is not configured"
 
     files = {"source": open(collage_path, "rb")}
     data = {
@@ -654,18 +654,27 @@ def upload_imgbox(collage_path, settings):
     try:
         r = requests.post("https://freeimage.host/api/1/upload", data=data, files=files, timeout=180)
         payload = r.json() if r.content else {}
+        if r.status_code >= 400:
+            api_err = ""
+            if isinstance(payload, dict):
+                status_block = payload.get("status_code")
+                status_message = payload.get("status_txt")
+                if status_block or status_message:
+                    api_err = f" ({status_block or ''} {status_message or ''})".strip()
+            return "", f"HTTP {r.status_code}{api_err}".strip()
         image = payload.get("image", {}) if isinstance(payload, dict) else {}
         direct_url = (image.get("url") or "").strip()
         if direct_url:
-            return f"[img]{direct_url}[/img]"
-    except Exception:
-        return ""
+            return f"[img]{direct_url}[/img]", ""
+        return "", "Upload returned no image URL"
+    except Exception as e:
+        return "", str(e)
     finally:
         try:
             files["source"].close()
         except Exception:
             pass
-    return ""
+    return "", "Unknown upload error"
 def resolve_thumbnail_code_second_pass(existing_code, settings):
     return existing_code or ""
 def mediainfo_summary(video_path):
@@ -741,11 +750,16 @@ def append_joblist(csv_path: Path, row):
 def run_cmd(cmd, cwd=None):
     return run_command_with_output(cmd, cwd=cwd, retries=1)
 
-def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None, on_output=None):
+def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None, on_output=None, inactivity_timeout_seconds=0, runtime_timeout_seconds=0):
     def should_stop(_proc):
         if not job_id:
             return False
         return get_packing_job_status(job_id).lower() == "cancelled"
+
+    def on_proc_start(proc):
+        if job_id:
+            register_packing_proc(job_id, proc)
+
     rc, output = run_command_with_output(
         cmd,
         cwd=cwd,
@@ -756,7 +770,12 @@ def run_cmd_monitored(cmd, cwd=None, on_tick=None, tick_seconds=1, job_id=None, 
         on_output=on_output,
         start_new_session=True,
         should_stop=should_stop,
+        on_proc_start=on_proc_start,
+        inactivity_timeout_seconds=float(inactivity_timeout_seconds or 0),
+        runtime_timeout_seconds=float(runtime_timeout_seconds or 0),
     )
+    if job_id:
+        unregister_packing_proc(job_id)
     return rc, output
 
 
@@ -799,15 +818,27 @@ def run_packing_job(job_id, source_path, settings):
     pack_job_root = packed_root / job_name
     output_files_root = packed_root / "output files" / job_name
     _prepare_clean_packing_roots(pack_job_root, output_files_root)
+    try:
+        command_silence_timeout = max(120, int(str(settings.get("packing_command_silence_timeout_seconds", os.environ.get("PREPAC_PACKING_COMMAND_SILENCE_TIMEOUT_SECONDS", "1200")) or "1200").strip()))
+    except Exception:
+        command_silence_timeout = 1200
+    try:
+        command_runtime_timeout = max(300, int(str(settings.get("packing_command_runtime_timeout_seconds", os.environ.get("PREPAC_PACKING_COMMAND_RUNTIME_TIMEOUT_SECONDS", "21600")) or "21600").strip()))
+    except Exception:
+        command_runtime_timeout = 21600
 
     try:
-        current_job = next((j for j in list_packing_jobs(5000) if int(j.get("id", 0)) == int(job_id)), None)
-        if not current_job or str(current_job.get("status", "")).lower() != "running":
+        current_status = get_packing_job_status(job_id).lower()
+        if current_status == "cancelled":
+            return
+        if current_status != "running":
             start_packing(job_id)
         add_packing_event(job_id, "stability", "Checking folder stability...", 2)
         delay = int(settings.get("packing_stability_delay","30") or 30)
         size1 = folder_size(source)
         time.sleep(min(delay, 120))
+        if get_packing_job_status(job_id).lower() == "cancelled":
+            return
         size2 = folder_size(source)
         if size1 != size2:
             add_packing_event(job_id, "stability", f"Folder changed during check. Latest size: {round(size2/GB,2)} GB", 6)
@@ -841,7 +872,13 @@ def run_packing_job(job_id, source_path, settings):
 
         add_packing_event(job_id, "rar", f"Starting RAR packing for ~{est_parts} parts", 16)
         rar_started_ts = time.time()
-        rc, rar_log = run_cmd_monitored(rar_cmd, on_tick=rar_tick, job_id=job_id)
+        rc, rar_log = run_cmd_monitored(
+            rar_cmd,
+            on_tick=rar_tick,
+            job_id=job_id,
+            inactivity_timeout_seconds=command_silence_timeout,
+            runtime_timeout_seconds=command_runtime_timeout,
+        )
         rar_elapsed = int(time.time() - rar_started_ts)
         (output_files_root/"packing.log").write_text(rar_log, encoding="utf-8", errors="replace")
         rar_files = sorted(str(pp) for pp in pack_job_root.glob(f"{token}*.rar"))
@@ -908,7 +945,15 @@ def run_packing_job(job_id, source_path, settings):
 
         add_packing_event(job_id, "par2", f"Starting PAR2 generation at {par2_pct}% redundancy", 61)
         par_started_ts = time.time()
-        rc, par_log = run_cmd_monitored(par_cmd, on_tick=par_tick, tick_seconds=0.25, on_output=par_output, job_id=job_id)
+        rc, par_log = run_cmd_monitored(
+            par_cmd,
+            on_tick=par_tick,
+            tick_seconds=0.25,
+            on_output=par_output,
+            job_id=job_id,
+            inactivity_timeout_seconds=command_silence_timeout,
+            runtime_timeout_seconds=command_runtime_timeout,
+        )
         par_elapsed = int(time.time() - par_started_ts)
         with open(output_files_root/"packing.log","a",encoding="utf-8",errors="replace") as f:
             f.write("\n\n=== PAR2 ===\n"+par_log)
@@ -937,13 +982,19 @@ def run_packing_job(job_id, source_path, settings):
         add_packing_event(job_id, "thumbnail", "Thumbnail collage ready", 88)
 
         add_packing_event(job_id, "thumbnail_link", "Resolving thumbnail host link", 89)
-        imgbox_url = upload_imgbox(collage, settings) if collage else ""
+        imgbox_url, imgbox_error = upload_imgbox(collage, settings) if collage else ("", "No collage generated")
         with open(output_files_root/"packing.log","a",encoding="utf-8",errors="replace") as f:
             f.write("\n\n=== THUMBNAIL LINK ===\n")
             f.write(f"Collage: {collage}\n")
             f.write(f"Resolved thumbnail code: {redact_url_query(imgbox_url)}\n")
+            if imgbox_error:
+                f.write(f"Upload error: {imgbox_error}\n")
         update_packing_job(job_id, collage_path=collage, imgbox_url=imgbox_url)
-        add_packing_event(job_id, "thumbnail_link", "Thumbnail link resolved" if imgbox_url else "No thumbnail host link resolved", 92)
+        if imgbox_url:
+            add_packing_event(job_id, "thumbnail_link", "Thumbnail link resolved", 92)
+        else:
+            reason = imgbox_error or "No thumbnail host link resolved"
+            add_packing_event(job_id, "thumbnail_link", f"Thumbnail upload failed: {reason}", 92)
 
         # Metadata
         add_packing_event(job_id, "metadata", "Writing output files", 94)
@@ -1047,6 +1098,16 @@ def start_packing_job_async(source_path, settings):
     import threading
 
     def _runner():
+        last_wait_event_ts = 0.0
+        last_wait_max_jobs = None
+        wait_started_ts = time.monotonic()
+        try:
+            wait_cfg = load_settings().get("packing_slot_wait_timeout_seconds", "")
+            if str(wait_cfg or "").strip() == "":
+                wait_cfg = os.environ.get("PREPAC_PACKING_SLOT_WAIT_TIMEOUT_SECONDS", "7200")
+            max_wait_seconds = max(300, int(str(wait_cfg or "7200").strip()))
+        except Exception:
+            max_wait_seconds = 7200
         while True:
             current_settings = load_settings()
             try:
@@ -1056,11 +1117,20 @@ def start_packing_job_async(source_path, settings):
             status = get_packing_job_status(job_id).lower()
             if status == "cancelled":
                 return
+            waited = int(time.monotonic() - wait_started_ts)
+            if waited >= max_wait_seconds:
+                add_packing_event(job_id, "failed", f"Timed out waiting for packing slot after {waited} seconds.", None)
+                finish_packing(job_id, False, f"Timed out waiting for packing slot after {waited} seconds.")
+                return
             reconcile_orphaned_packing_jobs_in_process()
             if try_claim_packing_slot(job_id, max_jobs):
                 _mark_packing_job_active(job_id)
                 break
-            add_packing_event(job_id, "queued", f"Waiting for packing slot ({max_jobs} max concurrent jobs).", 0)
+            now_ts = time.monotonic()
+            if (now_ts - last_wait_event_ts) >= 15.0 or last_wait_max_jobs != max_jobs:
+                add_packing_event(job_id, "queued", f"Waiting for packing slot ({max_jobs} max concurrent jobs).", 0)
+                last_wait_event_ts = now_ts
+                last_wait_max_jobs = max_jobs
             time.sleep(1)
         try:
             run_packing_job(job_id, str(source), load_settings())

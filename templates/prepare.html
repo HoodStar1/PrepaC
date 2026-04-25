@@ -53,7 +53,7 @@
 
 <section class="card">
   <h2>Active Prepare Jobs</h2>
-  <p class="muted">Only queued and running jobs appear here. Cancelled, failed, and completed jobs move to Prepare History.</p>
+  <p class="muted">Queued and running jobs appear here. Recently finished jobs are also shown briefly so failures do not disappear instantly.</p>
   <div id="prepareJobs"><p class="muted">Loading jobs...</p></div>
 </section>
 
@@ -81,22 +81,36 @@ async function refreshPrepareJobs(){
   const r = await fetch('/api/jobs');
   const d = await r.json();
   const jobs = d.jobs || [];
+  const recentWindow = Number(d.recent_terminal_window_seconds || 120);
   const box = document.getElementById('prepareJobs');
+  if (!r.ok || d.ok === false){
+    box.innerHTML = `<p class="muted">Could not load active prepare jobs: ${d.error || `HTTP ${r.status}`}</p>`;
+    return;
+  }
   if (!jobs.length){
-    box.innerHTML = '<p class="muted">No active prepare jobs right now.</p>';
+    box.innerHTML = '<p class="muted">No active or recently finished prepare jobs right now.</p>';
     return;
   }
   box.innerHTML = jobs.map(j => `
+    ${(() => {
+      const status = String(j.status || '').toLowerCase();
+      const active = status === 'queued' || status === 'running';
+      const recentTag = j.recent_terminal ? `<p><strong>Recent:</strong> finished ${j.seconds_since_terminal ?? '?'}s ago (window ${recentWindow}s)</p>` : '';
+      const stopBtn = active ? `<div class="row"><button type="button" onclick="stopPrepareJob(${j.id})">Stop job</button></div>` : '';
+      return `
     <article class="job">
       <h3>#${j.id} — ${j.media_type}</h3>
       <p><strong>Status:</strong> ${j.status || ''}</p>
+      ${recentTag}
       <p><strong>Source:</strong> <code>${j.source_path || ''}</code></p>
       <p><strong>Destination:</strong> <code>${j.dest_path || ''}</code></p>
       <p><strong>Phase:</strong> ${j.phase || ''}</p>
       <p><strong>Message:</strong> ${j.message || ''}</p>
       <p><strong>Percent:</strong> ${j.percent ?? ''}</p>
-      <div class="row"><button type="button" onclick="stopPrepareJob(${j.id})">Stop job</button></div>
-    </article>`).join('');
+      ${stopBtn}
+    </article>`;
+    })()}
+  `).join('');
 }
 
 let prepareJobsStream = null;
@@ -401,7 +415,12 @@ async function buildBatchPreview(){
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({show_name: item.show_name, season_name: item.season_name, bracket_override})
       });
-      previewData.push(await r.json());
+      const payload = await r.json();
+      if (!r.ok || payload.ok === false) {
+        previewData.push({ok: false, error: payload.error || `HTTP ${r.status}`});
+      } else {
+        previewData.push(payload);
+      }
     } else {
       setPreviewStatus(`Building queue preview... Movie ${previewData.length + 1} of ${queueItems.length}`);
       const r = await fetch('/api/prepare/movie/preview', {
@@ -409,34 +428,74 @@ async function buildBatchPreview(){
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({movie_name: item.movie_name, bracket_override})
       });
-      previewData.push(await r.json());
+      const payload = await r.json();
+      if (!r.ok || payload.ok === false) {
+        previewData.push({ok: false, error: payload.error || `HTTP ${r.status}`});
+      } else {
+        previewData.push(payload);
+      }
     }
     renderQueue();
   }
   renderQueue();
-  setPreviewStatus(`Queue preview ready for ${previewData.length} item(s).`);
+  const failedPreviews = previewData.filter(x => x && x.ok === false).length;
+  if (failedPreviews > 0) {
+    setPreviewStatus(`Queue preview ready for ${previewData.length - failedPreviews} item(s). ${failedPreviews} failed preview.`);
+  } else {
+    setPreviewStatus(`Queue preview ready for ${previewData.length} item(s).`);
+  }
 }
 
 async function startBatchJobs(){
   if (!previewData.length) return;
+  const btn = document.getElementById('startBtn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  let started = 0;
+  let skipped = 0;
+  let failed = 0;
+  const failedReasons = [];
   for (let i = 0; i < previewData.length; i++) {
     const item = previewData[i];
     const meta = queueItems[i];
+    if (!item || item.ok === false || !item.source_path || !item.dest_path) {
+      failed++;
+      failedReasons.push(`${meta?.label || 'Queue item'}: ${item?.error || 'Preview failed'}`);
+      continue;
+    }
+    let resp;
     if (meta.kind === 'tv') {
-      await fetch('/api/prepare/tv/start', {
+      resp = await fetch('/api/prepare/tv/start', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify(item)
       });
     } else {
-      await fetch('/api/prepare/movie/start', {
+      resp = await fetch('/api/prepare/movie/start', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify(item)
       });
     }
+    const d = await resp.json();
+    if (!resp.ok || d.ok === false) {
+      failed++;
+      failedReasons.push(`${meta?.label || 'Queue item'}: ${d.error || `HTTP ${resp.status}`}`);
+      continue;
+    }
+    if (d.duplicate) { skipped++; } else { started++; }
   }
-  window.location.href = '/prepare';
+  // Stay on the page — clear the queue and refresh active jobs in-place
+  // so the user can see all submitted jobs without a race-condition page reload
+  clearQueue();
+  let statusLine = `${started} job(s) queued.`;
+  if (skipped > 0) statusLine += ` ${skipped} skipped (already queued or running).`;
+  if (failed > 0) statusLine += ` ${failed} failed.`;
+  if (failedReasons.length) statusLine += ` Last error: ${failedReasons[failedReasons.length - 1]}`;
+  if (failed === 0 && started > 0) statusLine += ' Watching progress below…';
+  setPreviewStatus(statusLine);
+  btn.textContent = 'Start Queue Jobs';
+  await refreshPrepareJobs();
 }
 
 document.getElementById('tabTvBtn').addEventListener('click', () => showPrepareTab('tv'));

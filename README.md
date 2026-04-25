@@ -36,7 +36,7 @@ PrepaC organizes the workflow into clear stages:
 ## Quick start
 
 1. Clone this repository.
-2. Review `docker-compose.example.yml` or `docker-compose.yml`.
+2. Review `docker-compose.yml`.
 3. Make sure `/config` is persistent.
 4. Build and start the app:
 
@@ -92,6 +92,12 @@ PrepaC is designed for self-hosted Docker environments. Security hardening is co
 	- `auto`: secure cookies for HTTPS requests; can trust proxy headers when `PREPAC_TRUST_PROXY_HEADERS=true`
 	- `always`: always secure cookies (recommended for HTTPS-only deployments)
 	- `never`: always non-secure cookies (HTTP-only local/LAN installs)
+- Reverse proxy header trust (`PREPAC_TRUST_PROXY_HEADERS`):
+	- `false` (default): ignore `X-Forwarded-Proto` and `X-Forwarded-Host` for generated external URLs
+	- `true`: trust forwarded proto and host from your reverse proxy
+- Share import upload cap (`PREPAC_SHARE_IMPORT_MAX_MB`, default `512`):
+	- Limits single and bulk Share import request size
+	- Increase only if your import bundles genuinely require it
 - Metrics scrape token (`PREPAC_METRICS_TOKEN`):
 	- When unset: `/metrics` keeps existing authenticated behavior.
 	- When set: `/metrics` accepts `X-Prepac-Metrics-Token` header or `?token=...` for non-interactive scraping.

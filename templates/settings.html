@@ -6,6 +6,7 @@
   <p>Manage application settings.</p>
 
   <form method="post" action="{{ url_for('api_settings_save') }}" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>
       <span>TV Root <small class="muted">Real path: /mnt/user/TV Shows</small></span>
       <input type="text" name="tv_root" value="{{ settings['tv_root'] }}">

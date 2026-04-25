@@ -25,6 +25,7 @@
   <h2>Import for Share</h2>
   <div class="grid two">
     <form id="shareImportForm" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <h3>Single import</h3>
       <div class="form-grid">
         <label><span>Release Name (optional)</span><input type="text" name="release_name"></label>
@@ -35,6 +36,7 @@
       <div class="row" style="margin-top:1rem;"><button type="submit">Import bundle</button></div>
     </form>
     <form id="shareBulkImportForm" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <h3>Mass import</h3>
       <p class="muted">Upload many RARred NZBs and template files at once. PrepaC pairs them automatically using filename matching and template-content matching, so files do not need identical names.</p>
       <div class="form-grid">

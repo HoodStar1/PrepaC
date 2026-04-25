@@ -1,8 +1,15 @@
 import sqlite3
 from pathlib import Path
+import logging
+from app.file_locks import release_lock, try_acquire_lock
+
+_LOG = logging.getLogger(__name__)
 
 CONFIG_DIR = Path("/config")
 DB_PATH = CONFIG_DIR / "prepac.db"
+INTEGRITY_LOCK_PATH = CONFIG_DIR / "prepac_integrity.lock"
+_INTEGRITY_CHECKED = False
+_INTEGRITY_OK = None
 
 DEFAULT_SETTINGS = {
     "config_root": "/config",
@@ -92,6 +99,31 @@ DEFAULT_SETTINGS = {
     "share_request_timeout": "120"
 }
 
+
+def _normalized_sqlite_error_message(exc):
+    return " ".join(str(exc or "").strip().lower().split())
+
+
+def _is_ignorable_schema_migration_error(statement, exc):
+    message = _normalized_sqlite_error_message(exc)
+    normalized_statement = " ".join(str(statement or "").strip().lower().split())
+    if normalized_statement.startswith("alter table ") and " add column " in normalized_statement:
+        return "duplicate column name:" in message
+    if normalized_statement.startswith("create index") or normalized_statement.startswith("create unique index"):
+        return "already exists" in message
+    return False
+
+
+def _execute_schema_statement(cur, statement, *, operation="schema migration"):
+    try:
+        cur.execute(statement)
+        return True
+    except Exception as exc:
+        if _is_ignorable_schema_migration_error(statement, exc):
+            _LOG.info("Skipping already-applied %s: %s (%s)", operation, statement, exc)
+            return False
+        raise RuntimeError(f"Failed {operation}: {statement} ({exc})") from exc
+
 def get_conn():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -107,7 +139,115 @@ def get_conn():
         pass
     return conn
 
+def check_db_integrity():
+    """Run PRAGMA integrity_check and log a CRITICAL warning if the DB is corrupted."""
+    global _INTEGRITY_CHECKED, _INTEGRITY_OK
+    if _INTEGRITY_CHECKED:
+        return bool(_INTEGRITY_OK)
+
+    lock_handle = None
+    try:
+        # In multi-worker gunicorn, only one worker performs/logs integrity checks at startup.
+        lock_handle = try_acquire_lock(INTEGRITY_LOCK_PATH)
+        if lock_handle is None:
+            _INTEGRITY_CHECKED = True
+            _INTEGRITY_OK = True
+            return True
+
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("PRAGMA integrity_check")
+        results = cur.fetchall()
+        conn.close()
+        if results and results[0][0] != "ok":
+            issues = "; ".join(str(r[0]) for r in results[:5])
+            _LOG.critical(
+                "SQLite DB integrity check FAILED: %s. "
+                "To recover, run on the host:\n"
+                "  sqlite3 /config/prepac.db '.recover' > /tmp/recover.sql\n"
+                "  sqlite3 /config/prepac_new.db < /tmp/recover.sql\n"
+                "  cp /config/prepac.db /config/prepac.db.bak\n"
+                "  mv /config/prepac_new.db /config/prepac.db",
+                issues,
+            )
+            _INTEGRITY_CHECKED = True
+            _INTEGRITY_OK = False
+            return False
+        _INTEGRITY_CHECKED = True
+        _INTEGRITY_OK = True
+        return True
+    except Exception as exc:
+        _LOG.critical("SQLite DB integrity check error: %s", exc)
+        _INTEGRITY_CHECKED = True
+        _INTEGRITY_OK = False
+        return False
+    finally:
+        release_lock(lock_handle)
+
+def db_is_corrupt():
+    """Return True if the startup integrity check found corruption."""
+    return _INTEGRITY_CHECKED and (_INTEGRITY_OK is False)
+
+
+def run_db_integrity_check():
+    """Run a fresh PRAGMA integrity_check and return a status dict."""
+    from datetime import datetime
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("PRAGMA integrity_check")
+        results = cur.fetchall()
+        conn.close()
+        issues = [str(r[0]) for r in results]
+        ok = len(issues) == 1 and issues[0] == "ok"
+        return {
+            "ok": ok,
+            "issues": [] if ok else issues,
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    except Exception as exc:
+        from datetime import datetime
+        return {
+            "ok": False,
+            "issues": [str(exc)],
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def run_db_reindex():
+    """
+    Rebuild all SQLite indexes in-place with REINDEX.
+    Safe to run on a live database — does not modify table data.
+    If successful, resets the cached integrity state so the UI banner clears.
+    Returns a status dict compatible with run_db_integrity_check().
+    """
+    global _INTEGRITY_CHECKED, _INTEGRITY_OK
+    from datetime import datetime
+    try:
+        conn = get_conn()
+        conn.execute("REINDEX")
+        conn.close()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "issues": [f"REINDEX failed: {exc}"],
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    # Reset cached state so check_db_integrity() reruns on next call
+    _INTEGRITY_CHECKED = False
+    _INTEGRITY_OK = None
+    # Delete the lock file so the cross-worker lock is cleared for next check
+    try:
+        INTEGRITY_LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Re-run check to confirm the reindex fixed things
+    check_db_integrity()
+    return run_db_integrity_check()
+
+
 def init_db():
+    check_db_integrity()
     conn = get_conn()
     cur = conn.cursor()
 
@@ -288,10 +428,7 @@ def init_db():
         "ALTER TABLE imported_share_bundles ADD COLUMN matched_by TEXT DEFAULT ''",
         "ALTER TABLE imported_share_bundles ADD COLUMN match_score INTEGER DEFAULT 0",
     ]:
-        try:
-            cur.execute(stmt)
-        except Exception:
-            pass
+        _execute_schema_statement(cur, stmt, operation="schema migration")
 
     for k, v in DEFAULT_SETTINGS.items():
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
@@ -317,10 +454,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_share_jobs_nzb_hash ON share_jobs(nzb_hash)",
         "CREATE INDEX IF NOT EXISTS idx_share_job_events_job_id_id ON share_job_events(share_job_id, id DESC)",
     ]:
-        try:
-            cur.execute(stmt)
-        except Exception:
-            pass
+        _execute_schema_statement(cur, stmt, operation="schema index creation")
 
     conn.commit()
     conn.close()
