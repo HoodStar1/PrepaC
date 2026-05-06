@@ -1,6 +1,8 @@
 from datetime import datetime
+import os
 import time
 from app.db import get_conn
+from app.subprocess_utils import terminate_process
 
 ACTIVE_POSTING_PROCS = {}
 
@@ -71,17 +73,53 @@ def latest_successful_posting_job_id(packed_root):
 
 
 def reconcile_orphaned_running_posting_jobs(active_job_ids, reason="Recovered orphaned posting job with no active worker thread"):
-    active_ids = {int(x) for x in (active_job_ids or set()) if str(x).isdigit()}
+    active_ids = set()
+    for value in active_job_ids or set():
+        try:
+            active_ids.add(int(value))
+        except Exception:
+            pass
+    try:
+        stale_min_age = max(300, int(str(os.environ.get("PREPAC_POSTING_RECOVERY_MIN_AGE_SECONDS", "1200") or "1200")))
+    except Exception:
+        stale_min_age = 1200
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id, percent FROM posting_jobs WHERE status='running'")
+    cur.execute(
+        """
+        SELECT j.id, j.percent, j.started_at, j.created_at, MAX(e.timestamp) AS last_event_at
+        FROM posting_jobs j
+        LEFT JOIN posting_job_events e ON e.posting_job_id=j.id
+        WHERE j.status='running'
+        GROUP BY j.id
+        """
+    )
     rows = [dict(r) for r in cur.fetchall()]
     changed = 0
+    now_dt = datetime.now()
     for row in rows:
         job_id = int(row.get("id") or 0)
         if job_id in active_ids:
             continue
-        cur.execute("UPDATE posting_jobs SET status='failed', finished_at=?, message=? WHERE id=?", (now(), reason, job_id))
-        cur.execute("INSERT INTO posting_job_events(posting_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (job_id, now(), 'recovered', reason, row.get('percent')))
+        activity_times = []
+        for field in ("last_event_at", "started_at", "created_at"):
+            try:
+                ts = row.get(field)
+                if ts:
+                    activity_times.append(datetime.fromisoformat(str(ts)))
+            except Exception:
+                pass
+        if activity_times:
+            age_seconds = int((now_dt - max(activity_times)).total_seconds())
+            if age_seconds < stale_min_age:
+                continue
+        recovered_reason = f"{reason}; no persisted activity for at least {stale_min_age}s"
+        cur.execute(
+            "UPDATE posting_jobs SET status='failed', finished_at=?, message=?, provider_used='' WHERE id=? AND status='running'",
+            (now(), recovered_reason, job_id),
+        )
+        if cur.rowcount <= 0:
+            continue
+        cur.execute("INSERT INTO posting_job_events(posting_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (job_id, now(), 'recovered', recovered_reason, row.get('percent')))
         changed += 1
     conn.commit(); conn.close()
     return changed
@@ -184,7 +222,13 @@ def start_posting(job_id, provider_used=None):
     update_posting_job(job_id, **fields)
 
 def finish_posting(job_id, success=True, message=""):
-    update_posting_job(job_id, status="done" if success else "failed", finished_at=now(), message=message, percent=100 if success else None)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE posting_jobs SET status=?, finished_at=?, message=?, percent=? "
+        "WHERE id=? AND status NOT IN ('done','failed','cancelled')",
+        ("done" if success else "failed", now(), message, 100 if success else None, job_id),
+    )
+    conn.commit(); conn.close()
 
 def list_posting_jobs(limit=200):
     """Fetch posting jobs with events - optimized to avoid N+1 queries."""
@@ -320,6 +364,11 @@ def has_large_queued_posting_job(min_size_bytes, exclude_job_id=None):
 
 
 def interrupt_running_posting_jobs(reason="Interrupted by container shutdown", recovery=False):
+    for proc in list(ACTIVE_POSTING_PROCS.values()):
+        try:
+            terminate_process(proc)
+        except Exception:
+            pass
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM posting_jobs WHERE status='running'")
     rows = [dict(r) for r in cur.fetchall()]
@@ -327,7 +376,7 @@ def interrupt_running_posting_jobs(reason="Interrupted by container shutdown", r
         phase = "recovered" if recovery else "shutdown"
         message = ("Recovered after restart: previous container exited during job execution"
                    if recovery else reason)
-        cur.execute("UPDATE posting_jobs SET status='failed', finished_at=?, message=? WHERE id=?",
+        cur.execute("UPDATE posting_jobs SET status='failed', finished_at=?, message=?, provider_used='' WHERE id=?",
                     (now(), message, row["id"]))
         cur.execute("INSERT INTO posting_job_events(posting_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
                     (row["id"], now(), phase, message, row.get("percent")))

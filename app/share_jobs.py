@@ -108,7 +108,11 @@ def finish_share(job_id, success=True, message=""):
     if row and str(row[0] or "").lower() == "cancelled":
         conn.close()
         return
-    cur.execute("UPDATE share_jobs SET status=?, finished_at=?, message=?, percent=? WHERE id=?", (("done" if success else "failed"), now(), message, (100 if success else None), int(job_id)))
+    cur.execute(
+        "UPDATE share_jobs SET status=?, finished_at=?, message=?, percent=? "
+        "WHERE id=? AND status NOT IN ('done','failed','cancelled')",
+        (("done" if success else "failed"), now(), message, (100 if success else None), int(job_id)),
+    )
     conn.commit(); conn.close()
 
 

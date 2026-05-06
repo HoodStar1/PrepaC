@@ -118,6 +118,7 @@ function startPrepareJobsStream(){
   if(prepareJobsStream) prepareJobsStream.close();
   prepareJobsStream = new EventSource('/api/jobs/stream');
   prepareJobsStream.onmessage = () => refreshPrepareJobs();
+  if (window.prepacEventStreamAuthErrorHandler) prepareJobsStream.onerror = window.prepacEventStreamAuthErrorHandler(prepareJobsStream);
 }
 
 let selectedShows = new Map();

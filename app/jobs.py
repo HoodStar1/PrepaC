@@ -2,6 +2,7 @@ from datetime import datetime
 import subprocess
 import os
 from app.db import get_conn
+from app.subprocess_utils import terminate_process
 
 ACTIVE_PREPARE_PROCS = {}
 ACTIVE_PREPARE_WORKERS = set()
@@ -29,7 +30,10 @@ def add_job_event(job_id, phase, message, percent=None):
 
 def finish_job(job_id, success=True):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE prepare_jobs SET status=?, finished_at=? WHERE id=?", ("done" if success else "failed", now(), job_id))
+    cur.execute(
+        "UPDATE prepare_jobs SET status=?, finished_at=? WHERE id=? AND status NOT IN ('done','failed','cancelled')",
+        ("done" if success else "failed", now(), job_id),
+    )
     conn.commit(); conn.close()
 
 
@@ -51,19 +55,30 @@ def reconcile_prepare_running_jobs(reason="Recovered stale prepare slot"):
         stale_min_age = 1800
 
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id, started_at FROM prepare_jobs WHERE status='running'")
+    cur.execute(
+        """
+        SELECT j.id, j.started_at, MAX(e.timestamp) AS last_event_at
+        FROM prepare_jobs j
+        LEFT JOIN job_events e ON e.job_id=j.id
+        WHERE j.status='running'
+        GROUP BY j.id
+        """
+    )
     rows = cur.fetchall()
     changed = 0
     now_dt = datetime.now()
     for row in rows:
         jid = int(row[0])
-        started_at = None
-        try:
-            started_at = datetime.fromisoformat(str(row[1])) if row[1] else None
-        except Exception:
-            started_at = None
-        if started_at:
-            age_seconds = int((now_dt - started_at).total_seconds())
+        activity_times = []
+        for idx in (1, 2):
+            try:
+                ts = row[idx]
+                if ts:
+                    activity_times.append(datetime.fromisoformat(str(ts)))
+            except Exception:
+                pass
+        if activity_times:
+            age_seconds = int((now_dt - max(activity_times)).total_seconds())
             if age_seconds < stale_min_age:
                 continue
         if jid in ACTIVE_PREPARE_WORKERS or jid in ACTIVE_PREPARE_PROCS:
@@ -89,7 +104,7 @@ def try_claim_prepare_slot(job_id, max_jobs):
             conn.rollback()
             conn.close()
             return False
-        cur.execute("UPDATE prepare_jobs SET status='running' WHERE id=? AND status='queued'", (job_id,))
+        cur.execute("UPDATE prepare_jobs SET status='running', started_at=? WHERE id=? AND status='queued'", (now(), job_id))
         claimed = cur.rowcount == 1
         conn.commit()
         conn.close()
@@ -221,6 +236,11 @@ def list_jobs_by_status(statuses, limit=500):
 
 
 def interrupt_running_prepare_jobs(reason="Interrupted by container shutdown", recovery=False):
+    for proc in list(ACTIVE_PREPARE_PROCS.values()):
+        try:
+            terminate_process(proc)
+        except Exception:
+            pass
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM prepare_jobs WHERE status='running'")
     rows = [dict(r) for r in cur.fetchall()]

@@ -1,6 +1,6 @@
 from pathlib import Path
 from app.helpers import sanitize_show_name, detect_bracket_info_from_filenames, scan_videos_nonrecursive, largest_video_file, is_trailer_file, enforce_name_length
-from app.media_probe import detect_tags, build_bracket_from_detected
+from app.media_probe import detect_tags, merge_bracket_with_detected_hdr
 
 def search_movies(movie_root, query):
     root = Path(movie_root); q = query.strip().lower()
@@ -14,9 +14,11 @@ def preview_movie(settings, movie_name, bracket_override=""):
     if not files: raise ValueError("No non-trailer video files found.")
     biggest = largest_video_file(files)
     if biggest is None: raise ValueError("Could not determine biggest non-trailer video file.")
-    bracket = bracket_override.strip() or detect_bracket_info_from_filenames([biggest.name])
     tags = detect_tags(str(biggest))
-    if not bracket: bracket = build_bracket_from_detected(tags, "movie")
+    bracket = bracket_override.strip()
+    if not bracket:
+        bracket = detect_bracket_info_from_filenames([biggest.name])
+        bracket = merge_bracket_with_detected_hdr(bracket, tags, "movie")
     dest_show = sanitize_show_name(movie_name)
     folder, _, chosen_bracket = enforce_name_length(dest_show, bracket, settings["end_tag"], int(settings["max_name_len"]), "")
     dest_path = str(Path(settings["dest_root"]) / folder)

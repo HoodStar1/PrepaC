@@ -504,8 +504,9 @@ def mark_running_jobs_interrupted(reason="Interrupted by container shutdown", re
         APP_RUNTIME_STATE["shutdown_marked"] = True
     return total
 
-# Crash-safe recovery on startup: any stale running jobs from a previous process become interrupted.
-mark_running_jobs_interrupted(recovery=True)
+# Leave running jobs intact on startup. A new worker cannot know whether another
+# worker or recently orphaned subprocess is still active, so stale recovery is
+# handled by the reconciliation loop using persisted job activity.
 
 def begin_graceful_shutdown(reason="Container shutdown requested"):
     APP_RUNTIME_STATE["draining"] = True
@@ -691,10 +692,10 @@ def _evaluate_health_state():
     payload["stalled"].extend(inspect("posting", posting_jobs, thresholds["posting"]))
 
     if payload["stalled"]:
-        payload["status"] = "error"
+        payload["status"] = "degraded"
         first = payload["stalled"][0]
         payload["reason"] = f"{first['kind']} job stalled for {first['seconds_since_activity']} seconds"
-        return False, payload
+        return True, payload
 
     return True, payload
 
@@ -897,14 +898,8 @@ def summarize_posting_stats(posting_jobs):
     total_bytes = sum(int(j.get("size_bytes", 0) or 0) for j in completed)
     durations = []
     largest = 0
-    provider1_jobs = 0
-    provider2_jobs = 0
     for j in completed:
         largest = max(largest, int(j.get("size_bytes", 0) or 0))
-        if str(j.get("provider_used","")) == "provider1":
-            provider1_jobs += 1
-        if str(j.get("provider_used","")) == "provider2":
-            provider2_jobs += 1
         s = j.get("started_at")
         f = j.get("finished_at")
         if s and f:
@@ -919,8 +914,6 @@ def summarize_posting_stats(posting_jobs):
         "total_bytes": total_bytes,
         "largest_bytes": largest,
         "avg_seconds": avg_seconds,
-        "provider1_jobs": provider1_jobs,
-        "provider2_jobs": provider2_jobs,
     }
 
 
@@ -1343,17 +1336,10 @@ def api_debug_job_status():
         from datetime import datetime
         
         def get_job_age_seconds(job):
-            """Get how long a job has been in current state."""
-            times = []
-            for field in ("finished_at", "started_at", "created_at"):
-                try:
-                    dt = datetime.fromisoformat(job.get(field)) if job.get(field) else None
-                    if dt:
-                        times.append(dt)
-                except Exception:
-                    pass
-            if times:
-                return int((datetime.now() - max(times)).total_seconds())
+            """Get seconds since the latest persisted activity for this job."""
+            last_activity = _latest_job_activity(job)
+            if last_activity:
+                return int((datetime.now() - last_activity).total_seconds())
             return None
         
         prepare_jobs = list_jobs_by_status(["running"], 100)

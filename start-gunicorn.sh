@@ -4,7 +4,10 @@ set -eu
 CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)"
 
 if [ "${GUNICORN_WORKERS:-}" = "" ]; then
-  WORKERS=$((CPU_COUNT * 2 + 1))
+  # Background jobs are process-local threads with process-local active-job
+  # tracking. Keep the default to one worker unless the operator explicitly
+  # opts into multi-process behavior.
+  WORKERS=1
 else
   WORKERS="${GUNICORN_WORKERS}"
 fi
@@ -26,7 +29,7 @@ fi
 TIMEOUT="${GUNICORN_TIMEOUT:-120}"
 GRACEFUL_TIMEOUT="${GUNICORN_GRACEFUL_TIMEOUT:-30}"
 KEEPALIVE="${GUNICORN_KEEPALIVE:-5}"
-MAX_REQUESTS="${GUNICORN_MAX_REQUESTS:-1000}"
+MAX_REQUESTS="${GUNICORN_MAX_REQUESTS:-0}"
 MAX_REQUESTS_JITTER="${GUNICORN_MAX_REQUESTS_JITTER:-100}"
 BIND="${GUNICORN_BIND:-0.0.0.0:1234}"
 LOG_LEVEL="${GUNICORN_LOG_LEVEL:-info}"

@@ -17,7 +17,7 @@ from app.name_randomizer_data import RANDOMIZER_TEXT
 from app.secret_utils import resolve_secret
 from app.cache_store import SCAN_CACHE
 from app.metrics import inc, observe
-from app.subprocess_utils import run_command_with_output
+from app.subprocess_utils import run_command_with_output, terminate_process
 from app.packing_jobs import list_packing_history, has_large_running_packing_job
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.posting_jobs import (
@@ -654,7 +654,8 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
         text=False,
         cwd=str(cwd),
         env=env,
-        close_fds=True
+        close_fds=True,
+        start_new_session=True,
     )
     os.close(slave_fd)
     register_posting_proc(job_id, proc)
@@ -663,10 +664,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
     with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
         while True:
             if get_posting_job_status(job_id).lower() == "cancelled":
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                terminate_process(proc)
                 break
 
             ready, _, _ = select.select([master_fd], [], [], 1.0)
@@ -686,10 +684,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
                         state["last_output_monotonic"] = time.monotonic()
                         clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line)
                         if get_posting_job_status(job_id).lower() == "cancelled":
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
+                            terminate_process(proc)
                             break
 
                         m = UPLOAD_RE.search(clean_line)
@@ -800,10 +795,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
                     logf.write("\n=== WATCHDOG ===\n" + state["watchdog_error"] + "\n")
                     logf.flush()
                     _append_live_output(job_id, state["watchdog_error"])
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
+                    terminate_process(proc)
 
                 no_article_progress_age = now_mono - state["last_article_progress_monotonic"]
                 if (
@@ -820,10 +812,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
                     logf.write("\n=== WATCHDOG ===\n" + state["watchdog_error"] + "\n")
                     logf.flush()
                     _append_live_output(job_id, state["watchdog_error"])
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
+                    terminate_process(proc)
 
             if proc.poll() is not None:
                 if pending:
@@ -839,10 +828,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
     try:
         rc = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        terminate_process(proc, graceful_timeout=0.5)
         rc = proc.wait(timeout=5)
     unregister_posting_proc(job_id, proc)
     return rc, state
@@ -936,8 +922,12 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             no_article_progress_timeout_seconds=article_timeout,
         )
 
-        if get_posting_job_status(job_id).lower() == "cancelled":
+        status_after_upload = get_posting_job_status(job_id).lower()
+        if status_after_upload == "cancelled":
             add_posting_event(job_id, "cancelled", "Posting job stopped by user", None)
+            return
+        if status_after_upload in {"failed", "done"}:
+            add_posting_event(job_id, "stopped", f"Posting worker stopped because job is already {status_after_upload}", None)
             return
 
         with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
@@ -1015,6 +1005,13 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
                 logf.write(str(e) + "\n")
         except Exception:
             pass
+        current_status = get_posting_job_status(job_id).lower()
+        if current_status == "cancelled":
+            add_posting_event(job_id, "cancelled", "Posting job stopped by user", None)
+            return
+        if current_status in {"failed", "done"}:
+            add_posting_event(job_id, "stopped", f"Posting worker stopped because job is already {current_status}", None)
+            return
         # Always ensure provider is released on failure
         update_posting_job(job_id, provider_used="")
         finish_posting(job_id, False, str(e))

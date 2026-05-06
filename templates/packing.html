@@ -148,6 +148,7 @@ function startPackingStreams(){
       </article>
     `).join('');
   };
+  if (window.prepacEventStreamAuthErrorHandler) packingJobsStream.onerror = window.prepacEventStreamAuthErrorHandler(packingJobsStream);
 }
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){

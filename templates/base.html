@@ -86,6 +86,32 @@ window.PREPAC_CSRF_TOKEN = {{ csrf_token|tojson }};
     };
   }
 
+  window.prepacEventStreamAuthErrorHandler = function(stream) {
+    return async function() {
+      if (window.__prepacAuthRedirecting) return;
+      let authLost = false;
+      try {
+        const res = await fetch('/api/version', { credentials: 'same-origin', cache: 'no-store' });
+        authLost = res.status === 401 || res.status === 403;
+        const contentType = res.headers.get('content-type') || '';
+        if (!authLost && contentType.includes('application/json')) {
+          const data = await res.json().catch(() => ({}));
+          const error = String((data && data.error) || '').toLowerCase();
+          authLost = data && data.ok === false && error.includes('auth');
+        }
+      } catch (_error) {
+        return;
+      }
+      if (!authLost) return;
+      window.__prepacAuthRedirecting = true;
+      try {
+        if (stream && stream.close) stream.close();
+      } catch (_error) {}
+      const next = encodeURIComponent(window.location.pathname + window.location.search);
+      window.location.href = `/login?next=${next}`;
+    };
+  };
+
   document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('form').forEach((form) => {
       const method = String(form.getAttribute('method') || 'GET').toUpperCase();

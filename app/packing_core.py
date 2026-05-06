@@ -1068,6 +1068,13 @@ def run_packing_job(job_id, source_path, settings):
         SCAN_CACHE.invalidate_prefix("scan:posting")
         add_packing_event(job_id, "complete", "Packing complete", 100)
     except Exception as e:
+        current_status = get_packing_job_status(job_id).lower()
+        if current_status == "cancelled":
+            add_packing_event(job_id, "cancelled", "Packing job stopped by user", None)
+            return
+        if current_status in {"failed", "done"}:
+            add_packing_event(job_id, "stopped", f"Packing worker stopped because job is already {current_status}", None)
+            return
         finish_packing(job_id, False, str(e))
         add_packing_event(job_id, "failed", str(e), None)
 def start_packing_job_async(source_path, settings):

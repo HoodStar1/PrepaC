@@ -166,6 +166,7 @@ function startPostingStream(){
       </article>
     `).join('');
   };
+  if (window.prepacEventStreamAuthErrorHandler) postingStream.onerror = window.prepacEventStreamAuthErrorHandler(postingStream);
 }
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){

@@ -455,5 +455,6 @@ refreshShareCandidates();
 refreshShareJobs();
 let shareStream = new EventSource('/api/share/jobs/stream');
 shareStream.onmessage = () => refreshShareJobs();
+if (window.prepacEventStreamAuthErrorHandler) shareStream.onerror = window.prepacEventStreamAuthErrorHandler(shareStream);
 </script>
 {% endblock %}

@@ -36,15 +36,16 @@ PrepaC organizes the workflow into clear stages:
 ## Quick start
 
 1. Clone this repository.
-2. Review `docker-compose.yml`.
-3. Make sure `/config` is persistent.
-4. Build and start the app:
+2. Review `docker-compose.example.yml` or `docker-compose.yml`.
+3. If you want a standalone GitHub/Unraid Docker update-source folder, see [`docker/README.md`](docker/README.md).
+4. Make sure `/config` is persistent.
+5. Build and start the app:
 
 ```bash
 docker compose up -d --build
 ```
 
-5. Open the app in your browser:
+6. Open the app in your browser:
 
 ```text
 http://localhost:1234

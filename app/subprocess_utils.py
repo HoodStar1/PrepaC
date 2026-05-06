@@ -6,21 +6,41 @@ import threading
 import queue
 
 
+def _signal_own_process_group(proc, sig):
+    if not hasattr(os, "killpg"):
+        return False
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        return False
+    if pgid != proc.pid:
+        return False
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+
+
 def terminate_process(proc, graceful_timeout: float = 5.0):
     if proc.poll() is not None:
         return
+    sent_group_term = _signal_own_process_group(proc, signal.SIGTERM)
     try:
-        proc.terminate()
+        if not sent_group_term:
+            proc.terminate()
         proc.wait(timeout=max(0.1, float(graceful_timeout)))
         return
     except Exception:
         pass
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(proc.pid, signal.SIGKILL)
-            return
-    except Exception:
-        pass
+    if _signal_own_process_group(proc, signal.SIGKILL):
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+        return
     try:
         proc.kill()
     except Exception:

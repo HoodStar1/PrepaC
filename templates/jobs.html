@@ -41,6 +41,7 @@ function startJobsStream(){
         <p><strong>Percent:</strong> ${j.percent ?? ''}</p>
       </article>`).join('');
   };
+  if (window.prepacEventStreamAuthErrorHandler) jobsStream.onerror = window.prepacEventStreamAuthErrorHandler(jobsStream);
 }
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){

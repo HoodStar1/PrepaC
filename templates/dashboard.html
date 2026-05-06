@@ -46,8 +46,6 @@
     <p><strong>Total Posted Data:</strong> {{ posting_summary.total_bytes|humansize }}</p>
     <p><strong>Largest Posted Job:</strong> {{ posting_summary.largest_bytes|humansize }}</p>
     <p><strong>Average Posting Time:</strong> {{ posting_summary.avg_seconds|humanduration }}</p>
-    <p><strong>Provider 1 Jobs:</strong> {{ posting_summary.provider1_jobs }}</p>
-    <p><strong>Provider 2 Jobs:</strong> {{ posting_summary.provider2_jobs }}</p>
   </section>
   <section class="card">
     <h2>Share Stats</h2>
@@ -128,6 +126,7 @@ function startDashboardStream(){
       </article>
     `).join('');
   };
+  if (window.prepacEventStreamAuthErrorHandler) dashboardStream.onerror = window.prepacEventStreamAuthErrorHandler(dashboardStream);
 }
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){

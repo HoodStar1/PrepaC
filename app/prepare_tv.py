@@ -1,6 +1,6 @@
 from pathlib import Path
 from app.helpers import sanitize_show_name, detect_bracket_info_from_filenames, season_key, scan_videos_nonrecursive, scan_videos_recursive, enforce_name_length
-from app.media_probe import detect_tags, build_bracket_from_detected
+from app.media_probe import detect_tags, merge_bracket_with_detected_hdr
 
 def search_shows(tv_root, query):
     root = Path(tv_root); q = query.strip().lower()
@@ -33,9 +33,11 @@ def preview_tv(settings, show_name, season_name, bracket_override=""):
     if not files: raise ValueError("No video files found.")
     season_num = "00" if lk == "specials" else season_name.split()[-1]
     season_tag = f"S{season_num}"
-    bracket = bracket_override.strip() or detect_bracket_info_from_filenames([p.name for p in files])
     tags = detect_tags(str(files[0]))
-    if not bracket: bracket = build_bracket_from_detected(tags, "tv")
+    bracket = bracket_override.strip()
+    if not bracket:
+        bracket = detect_bracket_info_from_filenames([p.name for p in files])
+        bracket = merge_bracket_with_detected_hdr(bracket, tags, "tv")
     dest_show = sanitize_show_name(show_name)
     folder, _, chosen_bracket = enforce_name_length(dest_show, bracket, settings["end_tag"], int(settings["max_name_len"]), season_tag)
     dest_path = str(Path(settings["dest_root"]) / folder)

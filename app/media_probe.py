@@ -1,4 +1,4 @@
-import json, subprocess
+import json, re, subprocess
 from pathlib import Path
 
 def _run(cmd):
@@ -45,6 +45,59 @@ def _audio_base(acodec, mi_lower):
         return "DTS"
     return (acodec or "").upper() if acodec else None
 
+def _norm_probe_text(value):
+    return " ".join(re.sub(r"[\s_\-]+", " ", str(value or "").lower()).split())
+
+def _mediainfo_sections(text):
+    top_level = {"general", "video", "audio", "text", "menu", "chapters", "image", "other"}
+    sections = []
+    current_name = ""
+    current_lines = []
+
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        header = line.split("#", 1)[0].strip().lower()
+        if ":" not in line and header in top_level:
+            if current_name:
+                sections.append((current_name, current_lines))
+            current_name = header
+            current_lines = []
+            continue
+        if current_name:
+            current_lines.append(line)
+
+    if current_name:
+        sections.append((current_name, current_lines))
+    return sections
+
+def _mediainfo_video_fields(text):
+    fields = []
+    for name, lines in _mediainfo_sections(text):
+        if name != "video":
+            continue
+        for line in lines:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields.append((_norm_probe_text(key), _norm_probe_text(value)))
+    return fields
+
+def _mi_field_contains(fields, key_prefixes, needles):
+    prefixes = tuple(_norm_probe_text(p) for p in key_prefixes)
+    normalized_needles = tuple(_norm_probe_text(n) for n in needles)
+    for key, value in fields:
+        if not any(key.startswith(prefix) for prefix in prefixes):
+            continue
+        if any(needle and needle in value for needle in normalized_needles):
+            return True
+    return False
+
+def _mi_has_field(fields, key_prefixes):
+    prefixes = tuple(_norm_probe_text(p) for p in key_prefixes)
+    return any(any(key.startswith(prefix) for prefix in prefixes) for key, _value in fields)
+
 def detect_tags(path):
     path = str(Path(path))
     ff = ffprobe_json(path)
@@ -79,49 +132,80 @@ def detect_tags(path):
 
     resolution = _resolution_from_dimensions(width, height)
 
-    # HDR grouping — use ffprobe structured data as the authoritative source.
-    # Avoid mediainfo text substring matching for HDR flags: mediainfo output
-    # includes the filename, so a file named "Movie.HDR10.mkv" would falsely
-    # match "hdr10" even if the video stream has no HDR metadata at all.
+    # HDR grouping uses ffprobe structured data plus MediaInfo's Video section.
+    # MediaInfo is never matched from the full output because General/filename
+    # output includes General/filename fields that can falsely tag SDR files.
     _vstreams = [s for s in ff.get("streams", []) if s.get("codec_type") == "video"]
 
-    def _side_data_types():
-        types = set()
+    def _side_data_texts():
+        texts = []
         for s in _vstreams:
             for sd in s.get("side_data_list", []):
-                t = (sd.get("side_data_type") or "").lower()
-                if t:
-                    types.add(t)
-        return types
+                try:
+                    text = json.dumps(sd, sort_keys=True)
+                except Exception:
+                    text = str(sd)
+                if text:
+                    texts.append(_norm_probe_text(text))
+        return texts
 
-    _sd_types = _side_data_types()
-    _transfer = next(
-        ((s.get("color_transfer") or "").lower() for s in _vstreams if s.get("color_transfer")),
-        ""
-    )
+    _sd_texts = _side_data_texts()
+    _transfers = {
+        _norm_probe_text(s.get("color_transfer"))
+        for s in _vstreams
+        if s.get("color_transfer")
+    }
+    _mi_video_fields = _mediainfo_video_fields(mi)
 
-    # Dolby Vision: DOVI config in side_data, or mediainfo "dolby vision" text.
-    # mediainfo "dolby vision" is specific enough and doesn't appear in filenames.
+    # Dolby Vision: DOVI config in side_data, or MediaInfo's Video HDR format.
     has_dv = (
-        any("dovi" in t or "dolby vision" in t for t in _sd_types)
-        or "dolby vision" in mil
+        any("dovi" in t or "dolby vision" in t for t in _sd_texts)
+        or _mi_field_contains(_mi_video_fields, ("hdr format",), ("dolby vision",))
     )
 
     # HLG: arib-std-b67 is the unambiguous ffprobe value for HLG transfer.
-    has_hlg = _transfer == "arib-std-b67"
-
-    # HDR10+: side_data SMPTE 2094-40 entry, or mediainfo "hdr10+" text.
-    # "hdr10+" is specific enough to not appear accidentally in filenames.
-    has_hdr10plus = (
-        any("smpte2094" in t or "hdr10+" in t for t in _sd_types)
-        or "hdr10+" in mil
+    has_hlg = (
+        "arib std b67" in _transfers
+        or _mi_field_contains(_mi_video_fields, ("hdr format", "transfer characteristics"), ("hlg", "arib std b67"))
     )
 
-    # HDR10: PQ transfer curve AND mastering display static metadata present.
-    # Both conditions required — PQ alone is shared with DV-only and HDR10Plus.
-    _has_pq = _transfer == "smpte2084"
-    _has_mastering = any("mastering" in t or "content light" in t for t in _sd_types)
-    has_hdr10 = _has_pq and _has_mastering
+    # HDR10+: side_data SMPTE 2094-40 entry, or MediaInfo's Video HDR format.
+    has_hdr10plus = (
+        any("smpte2094" in t or "smpte 2094" in t or "hdr10+" in t or "hdr10 plus" in t for t in _sd_texts)
+        or _mi_field_contains(
+            _mi_video_fields,
+            ("hdr format", "hdr format string"),
+            ("hdr10+", "hdr10 plus", "smpte st 2094", "smpte 2094", "2094 40", "dynamic metadata"),
+        )
+    )
+
+    # HDR10: PQ plus static metadata from ffprobe, or static HDR fields from
+    # MediaInfo's Video section. PQ alone is shared with DV-only and HDR10Plus.
+    _has_pq = (
+        "smpte2084" in _transfers
+        or "smpte 2084" in _transfers
+        or _mi_field_contains(_mi_video_fields, ("transfer characteristics",), ("pq", "smpte st 2084", "smpte 2084"))
+    )
+    _has_mastering = any("mastering" in t or "content light" in t for t in _sd_texts)
+    _mi_has_static_hdr = (
+        _mi_field_contains(
+            _mi_video_fields,
+            ("hdr format", "hdr format string"),
+            ("hdr10", "smpte st 2086", "smpte 2086", "st 2086"),
+        )
+        or _mi_has_field(
+            _mi_video_fields,
+            (
+                "mastering display",
+                "maximum content light",
+                "maximum frame average light",
+                "maximum frame-average light",
+                "maxcll",
+                "maxfall",
+            ),
+        )
+    )
+    has_hdr10 = (_has_pq and _has_mastering) or _mi_has_static_hdr
     if has_hlg:
         hdr_group = "HLG"
     elif has_dv and has_hdr10plus:
@@ -185,6 +269,27 @@ def detect_tags(path):
         "raw_mediainfo": mi,
         "atmos": has_atmos,
     }
+
+_HDR_BRACKET_PATTERN = re.compile(
+    r"\[[^\]]*(?:dolby\s*vision|\bdovi\b|\bdv\b|hdr10\+|hdr10plus|\bhdr10\b|\bhdr\b|\bhlg\b)[^\]]*\]",
+    re.IGNORECASE,
+)
+
+def merge_bracket_with_detected_hdr(bracket, info, source_type="movie"):
+    bracket = str(bracket or "").strip()
+    if not bracket:
+        return build_bracket_from_detected(info, source_type)
+
+    hdr_group = str((info or {}).get("hdr_group") or "").strip()
+    if not hdr_group or _HDR_BRACKET_PATTERN.search(bracket):
+        return bracket
+
+    hdr_segment = f"[{hdr_group}]"
+    first_part = re.search(r"\[[^\]]+\]", bracket)
+    if not first_part:
+        return f"{bracket}{hdr_segment}"
+    insert_at = first_part.end()
+    return f"{bracket[:insert_at]}{hdr_segment}{bracket[insert_at:]}"
 
 def build_bracket_from_detected(info, source_type="movie"):
     tags = [t for t in info.get("detected_tags", []) if t]
