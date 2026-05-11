@@ -44,6 +44,85 @@ def _int_setting(settings, key, env_key, default_value, min_value):
     return max(int(min_value), value)
 
 
+def _bytes_setting_from_mb(settings, key, env_key, default_mb=0):
+    raw = settings.get(key) if isinstance(settings, dict) else None
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get(env_key, default_mb)
+    try:
+        mb = int(str(raw).strip())
+    except Exception:
+        mb = int(default_mb)
+    return max(0, mb) * 1024 * 1024
+
+
+def _existing_parent(path: Path) -> Path:
+    current = Path(path)
+    if current.exists():
+        return current
+    for parent in current.parents:
+        if parent.exists():
+            return parent
+    return current
+
+
+def _destination_free_bytes(dest_path: Path):
+    probe = _existing_parent(dest_path)
+    usage = shutil.disk_usage(str(probe))
+    return int(usage.free), probe
+
+
+def _dest_video_bytes(dest_path: Path):
+    if not dest_path.exists():
+        return 0
+    total = 0
+    for p in dest_path.rglob("*"):
+        try:
+            if p.is_file() and p.suffix.lower().lstrip(".") in VIDEO_EXTS:
+                total += p.stat().st_size
+        except Exception:
+            pass
+    return total
+
+
+def _wait_for_destination_space(job_id, settings, dest_path: Path, required_bytes: int, percent: int):
+    required_bytes = max(0, int(required_bytes or 0))
+    if required_bytes <= 0:
+        return True
+    poll_seconds = _int_setting(settings, "prepare_free_space_poll_seconds", "PREPAC_PREPARE_FREE_SPACE_POLL_SECONDS", 5, 1)
+    poll_seconds = min(poll_seconds, 300)
+    last_emit_ts = 0.0
+    waiting = False
+    while True:
+        if get_prepare_job_status(job_id).lower() == "cancelled":
+            add_job_event(job_id, "cancelled", "Prepare job stopped while waiting for free space", None)
+            return False
+        try:
+            free_bytes, probe = _destination_free_bytes(dest_path)
+        except Exception as exc:
+            add_job_event(job_id, "space check", f"Could not check free space for {dest_path}: {exc}. Continuing.", percent)
+            return True
+        if free_bytes >= required_bytes:
+            if waiting:
+                add_job_event(
+                    job_id,
+                    "space available",
+                    f"Enough free space is now available at {probe}: {human_bytes(free_bytes)} free, {human_bytes(required_bytes)} required. Resuming prepare.",
+                    percent,
+                )
+            return True
+        waiting = True
+        now_ts = time.monotonic()
+        if last_emit_ts <= 0.0 or (now_ts - last_emit_ts) >= 30.0:
+            add_job_event(
+                job_id,
+                "waiting for space",
+                f"Paused: not enough free space at {probe}. Required {human_bytes(required_bytes)}, available {human_bytes(free_bytes)}. The job will continue automatically when space is available.",
+                percent,
+            )
+            last_emit_ts = now_ts
+        time.sleep(poll_seconds)
+
+
 def _run_rsync(cmd, job_id, settings=None):
     attempts = 2
     for attempt in range(1, attempts + 1):
@@ -143,12 +222,17 @@ def run_tv_prepare(job_id, settings, payload):
     try:
         # status may already be atomically claimed as running
         set_job_status(job_id, "running", str(dest_path))
-        add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
-        dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
-        add_job_event(job_id, "copying", "Starting rsync copy for TV season video files...", 15)
         if not source_path.exists():
             add_job_event(job_id, "copying", f"Source path does not exist: {source_path}", 100)
             finish_job(job_id, False); return
+        src_count, src_bytes = video_stats(files)
+        reserve_bytes = _bytes_setting_from_mb(settings, "prepare_free_space_reserve_mb", "PREPAC_PREPARE_FREE_SPACE_RESERVE_MB", 0)
+        required_bytes = max(0, src_bytes - _dest_video_bytes(dest_path)) + reserve_bytes
+        if not _wait_for_destination_space(job_id, settings, dest_path, required_bytes, 5):
+            return
+        add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
+        dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
+        add_job_event(job_id, "copying", "Starting rsync copy for TV season video files...", 15)
         include_args = ["--include=*/"]
         for ext in VIDEO_EXTS: include_args.extend([f"--include=*.{ext}", f"--include=*.{ext.upper()}"])
         include_args.append("--exclude=*")
@@ -168,7 +252,6 @@ def run_tv_prepare(job_id, settings, payload):
             finish_job(job_id, False)
             return
         add_job_event(job_id, "verifying", "Verifying copied video files...", 85)
-        src_count, src_bytes = video_stats(files)
         dest_files = [p for p in dest_path.rglob("*") if p.is_file() and p.suffix.lower().lstrip(".") in VIDEO_EXTS]
         dest_count, dest_bytes = video_stats(dest_files)
         if dest_count < src_count or dest_bytes < src_bytes:
@@ -185,12 +268,19 @@ def run_movie_prepare(job_id, settings, payload):
     try:
         # status may already be atomically claimed as running
         set_job_status(job_id, "running", str(dest_path))
-        add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
-        dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
-        add_job_event(job_id, "copying", f"Copying largest non-trailer file: {source_file.name}", 20)
         if not source_file.exists():
             add_job_event(job_id, "copying", f"Source file does not exist: {source_file}", 100)
             finish_job(job_id, False); return
+        src_bytes = source_file.stat().st_size
+        copied = dest_path / source_file.name
+        existing_bytes = copied.stat().st_size if copied.exists() else 0
+        reserve_bytes = _bytes_setting_from_mb(settings, "prepare_free_space_reserve_mb", "PREPAC_PREPARE_FREE_SPACE_RESERVE_MB", 0)
+        required_bytes = max(0, src_bytes - existing_bytes) + reserve_bytes
+        if not _wait_for_destination_space(job_id, settings, dest_path, required_bytes, 5):
+            return
+        add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
+        dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
+        add_job_event(job_id, "copying", f"Copying largest non-trailer file: {source_file.name}", 20)
         io_timeout = _int_setting(settings, "prepare_rsync_io_timeout_seconds", "PREPAC_PREPARE_RSYNC_IO_TIMEOUT_SECONDS", 600, 60)
         cmd = [
             "rsync", "-ah", "--no-perms", "--no-owner", "--no-group",
@@ -208,7 +298,7 @@ def run_movie_prepare(job_id, settings, payload):
             finish_job(job_id, False)
             return
         add_job_event(job_id, "verifying", "Verifying copied file...", 85)
-        src_bytes = source_file.stat().st_size; copied = dest_path / source_file.name; dest_bytes = copied.stat().st_size if copied.exists() else 0
+        dest_bytes = copied.stat().st_size if copied.exists() else 0
         if dest_bytes < src_bytes:
             add_job_event(job_id, "verifying", f"Verification failed: source {human_bytes(src_bytes)}, dest {human_bytes(dest_bytes)}", 100)
             finish_job(job_id, False); return

@@ -112,6 +112,31 @@ window.PREPAC_CSRF_TOKEN = {{ csrf_token|tojson }};
     };
   };
 
+  if (window.EventSource && !window.__prepacEventSourceWrapped) {
+    const NativeEventSource = window.EventSource;
+    const activeStreams = new Set();
+    window.__prepacEventSourceWrapped = true;
+    window.prepacCloseEventStreams = function() {
+      activeStreams.forEach((stream) => {
+        try { stream.close(); } catch (_error) {}
+      });
+      activeStreams.clear();
+    };
+    window.EventSource = function(...args) {
+      const stream = new NativeEventSource(...args);
+      activeStreams.add(stream);
+      const nativeClose = stream.close.bind(stream);
+      stream.close = function() {
+        activeStreams.delete(stream);
+        return nativeClose();
+      };
+      return stream;
+    };
+    window.EventSource.prototype = NativeEventSource.prototype;
+    window.addEventListener('pagehide', window.prepacCloseEventStreams);
+    window.addEventListener('beforeunload', window.prepacCloseEventStreams);
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('form').forEach((form) => {
       const method = String(form.getAttribute('method') || 'GET').toUpperCase();

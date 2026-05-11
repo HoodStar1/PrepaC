@@ -1,5 +1,6 @@
 from pathlib import Path
 import time
+from app.workflow_paths import all_workflow_roots
 
 # Cache for resolved roots (TTL: 5 minutes)
 _ROOT_CACHE = {"data": {}, "ttl": 300, "last_clean": time.time()}
@@ -25,6 +26,9 @@ ALLOWED_ROOT_SETTING_KEYS = [
     "packing_output_root",
     "posting_posted_root",
     "posting_nzb_root",
+    "posting_watch_root",
+    "share_watch_root",
+    "share_import_root",
     "recycle_bin_root",
 ]
 
@@ -76,6 +80,16 @@ def build_allowed_roots(settings):
     roots = []
     for key in ALLOWED_ROOT_SETTING_KEYS:
         raw = str(settings.get(key, "") or "").strip()
+        if not raw:
+            continue
+        resolved = _safe_resolve(raw)
+        roots.append(resolved)
+        for alias in ALIAS_ROOTS.get(str(raw), []):
+            roots.append(_safe_resolve(alias))
+        for alias in ALIAS_ROOTS.get(str(resolved), []):
+            roots.append(_safe_resolve(alias))
+    for workflow_root in all_workflow_roots(settings):
+        raw = str(workflow_root)
         if not raw:
             continue
         resolved = _safe_resolve(raw)

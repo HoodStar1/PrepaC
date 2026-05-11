@@ -1,6 +1,7 @@
 from pathlib import Path
 from app.helpers import sanitize_show_name, detect_bracket_info_from_filenames, scan_videos_nonrecursive, largest_video_file, is_trailer_file, enforce_name_length
 from app.media_probe import detect_tags, merge_bracket_with_detected_hdr
+from app.workflow_paths import prepare_root
 
 def search_movies(movie_root, query):
     root = Path(movie_root); q = query.strip().lower()
@@ -21,7 +22,7 @@ def preview_movie(settings, movie_name, bracket_override=""):
         bracket = merge_bracket_with_detected_hdr(bracket, tags, "movie")
     dest_show = sanitize_show_name(movie_name)
     folder, _, chosen_bracket = enforce_name_length(dest_show, bracket, settings["end_tag"], int(settings["max_name_len"]), "")
-    dest_path = str(Path(settings["dest_root"]) / folder)
+    dest_path = str(prepare_root(settings) / folder)
     return {"media_type":"movie","movie_name":movie_name,"source_path":str(movie_path),"source_rel":movie_name,"source_file":str(biggest),
             "all_non_trailer_files":[str(p) for p in files],"detected_tags":tags,"chosen_bracket":chosen_bracket,"dest_folder":folder,
             "dest_path":dest_path,"path_warn":len(dest_path) > int(settings["win_path_warn"])}

@@ -7,7 +7,7 @@
   <div class="row">
     <button type="button" onclick="scanPacking()">Scan watched folder</button>
   </div>
-  <p class="muted">Watch folder: <code>{{ settings['packing_watch_root'] }}</code></p>
+  <p class="muted">Watch folder: <code>{{ settings['packing_watch_root_effective'] }}</code></p>
   <div id="packingCandidates"><p class="muted">No scan run yet.</p></div>
   <div class="row action-toolbar action-toolbar-bottom">
     <button type="button" id="startPackingBtn" onclick="startSelectedPacking()" disabled>Start selected packing jobs</button>

@@ -20,8 +20,9 @@
       <input type="text" name="youtube_root" value="{{ settings['youtube_root'] }}">
     </label>
     <label>
-      <span>Destination Root <small class="muted">Real path: /mnt/user/TBP/Jobs</small></span>
+      <span>Prepare Destination Folder <small class="muted">Packing follows this when its watch folder is blank or still using the legacy default</small></span>
       <input type="text" name="dest_root" value="{{ settings['dest_root'] }}">
+      <small class="muted">Effective prepare folder: <code>{{ settings['dest_root_effective'] }}</code></small>
     </label>
     <label>
       <span>End Tag</span>
@@ -150,8 +151,8 @@
   <h3>Packing Settings</h3>
   <div class="form-grid">
     <label><span>Packing Max Concurrent Jobs</span><input type="number" name="packing_max_concurrent_jobs" value="{{ settings['packing_max_concurrent_jobs'] }}"></label>
-    <label><span>Packing Watch Folder</span><input type="text" name="packing_watch_root" value="{{ settings['packing_watch_root'] }}"></label>
-    <label><span>Packing Output Folder</span><input type="text" name="packing_output_root" value="{{ settings['packing_output_root'] }}"></label>
+    <label><span>Packing Watch Folder</span><input type="text" name="packing_watch_root" value="{{ settings['packing_watch_root'] }}"><small class="muted">Effective: <code>{{ settings['packing_watch_root_effective'] }}</code></small></label>
+    <label><span>Packing Output Folder</span><input type="text" name="packing_output_root" value="{{ settings['packing_output_root'] }}"><small class="muted">Effective: <code>{{ settings['packing_output_root_effective'] }}</code></small></label>
     <label><span>Stability Delay (seconds)</span><input type="number" name="packing_stability_delay" value="{{ settings['packing_stability_delay'] }}"></label>
     <label class="checkbox"><input type="checkbox" name="packing_delete_source_after_success" {% if settings.packing_delete_source_after_success == 'true' %}checked{% endif %}><span>Delete source after successful packing (default ON)</span></label>
     <label><span>Password Prefix</span><input type="text" name="packing_password_prefix" value="{{ settings['packing_password_prefix'] }}"></label>
@@ -168,18 +169,22 @@
     <label><span>Thumbnail Host</span><input type="text" name="packing_thumbnail_host" value="freeimage" readonly></label>
     <label><span>Freeimage.host API Key</span><input type="text" name="packing_freeimage_api_key" value="{{ settings['packing_freeimage_api_key'] }}"><small class="muted">Source: {{ settings['packing_freeimage_api_key_source'] }}</small></label>
   </div>
-  <p class="muted">Packed archives go to: <code>{{ settings['packing_output_root'] }}/&lt;jobname&gt;</code><br>Output files go to: <code>{{ settings['packing_output_root'] }}/output files/&lt;jobname&gt;</code></p>
+  <p class="muted">Packed archives go to: <code>{{ settings['packing_output_root_effective'] }}/&lt;jobname&gt;</code><br>Output files go to: <code>{{ settings['packing_output_root_effective'] }}/output files/&lt;jobname&gt;</code></p>
 </section>
 
 <section class="card inset-card" style="grid-column: 1 / -1;">
   <h3>Posting Settings</h3>
   <div class="form-grid">
-    <label><span>Posted Output Root</span><input type="text" name="posting_posted_root" value="{{ settings['posting_posted_root'] }}"></label>
-    <label><span>NZB RAR Root</span><input type="text" name="posting_nzb_root" value="{{ settings['posting_nzb_root'] }}"></label>
+    <label><span>Posting Scan Folder</span><input type="text" name="posting_watch_root" value="{{ settings['posting_watch_root'] }}"><small class="muted">Blank follows the packing output folder. Effective: <code>{{ settings['posting_watch_root_effective'] }}</code></small></label>
+    <label><span>Posted Output Root</span><input type="text" name="posting_posted_root" value="{{ settings['posting_posted_root'] }}"><small class="muted">Effective: <code>{{ settings['posting_posted_root_effective'] }}</code></small></label>
+    <label><span>NZB RAR Root</span><input type="text" name="posting_nzb_root" value="{{ settings['posting_nzb_root'] }}"><small class="muted">Effective: <code>{{ settings['posting_nzb_root_effective'] }}</code></small></label>
     <label><span>Article Size</span><input type="number" name="posting_article_size" value="{{ settings['posting_article_size'] }}"></label>
     <label><span>yEnc Line Size</span><input type="number" name="posting_yenc_line_size" value="{{ settings['posting_yenc_line_size'] }}"></label>
     <label><span>Retries</span><input type="number" name="posting_retries" value="{{ settings['posting_retries'] }}"></label>
     <label><span>Retry Delay</span><input type="text" name="posting_retry_delay" value="{{ settings['posting_retry_delay'] }}"></label>
+    <label><span>Connection Headroom</span><input type="number" name="posting_connection_headroom" value="{{ settings['posting_connection_headroom'] }}"><small class="muted">Reserved from each provider max.</small></label>
+    <label><span>Failure Cooldown (seconds)</span><input type="number" name="posting_provider_failure_cooldown_seconds" value="{{ settings['posting_provider_failure_cooldown_seconds'] }}"></label>
+    <label><span>Disconnect Drain (seconds)</span><input type="number" name="posting_provider_disconnect_drain_seconds" value="{{ settings['posting_provider_disconnect_drain_seconds'] }}"></label>
     <label><span>Comment</span><input type="text" name="posting_comment" value="{{ settings['posting_comment'] }}"></label>
     <label><span>Providers Source</span><input type="text" value="{{ settings['posting_providers_source'] }}" readonly></label>
     <label class="checkbox"><input type="checkbox" name="posting_embed_password_in_nzb" {% if settings.posting_embed_password_in_nzb == 'true' %}checked{% endif %}><span>Embed password in NZB</span></label>
@@ -195,13 +200,14 @@
     <summary>Advanced: current generated JSON</summary>
     <pre id="postingProvidersPreview">[]</pre>
   </details>
-  <p class="muted">Posting reads <code>template.txt</code> from <code>{{ settings['packing_output_root'] }}/output files/&lt;jobname&gt;</code>, updates the actual posted groups, moves output files to <code>{{ settings['posting_posted_root'] }}/&lt;jobname&gt;</code>, deletes <code>{{ settings['packing_output_root'] }}/&lt;jobname&gt;</code> after success, and stores the NZB as a RAR in <code>{{ settings['posting_nzb_root'] }}/&lt;jobname&gt;.rar</code>.</p>
+  <p class="muted">Posting reads <code>template.txt</code> from <code>{{ settings['posting_watch_root_effective'] }}/output files/&lt;jobname&gt;</code>, updates the actual posted groups, moves output files to <code>{{ settings['posting_posted_root_effective'] }}/&lt;jobname&gt;</code>, deletes <code>{{ settings['posting_watch_root_effective'] }}/&lt;jobname&gt;</code> after success, and stores the NZB as a RAR in <code>{{ settings['posting_nzb_root_effective'] }}/&lt;jobname&gt;.rar</code>.</p>
 </section>
 
 <section class="card inset-card" style="grid-column: 1 / -1;">
   <h3>Share Settings</h3>
   <div class="form-grid">
-    <label><span>Share Import Root</span><input type="text" name="share_import_root" value="{{ settings['share_import_root'] }}"></label>
+    <label><span>Share Scan Folder</span><input type="text" name="share_watch_root" value="{{ settings['share_watch_root'] }}"><small class="muted">Blank follows the posted output root. Effective: <code>{{ settings['share_watch_root_effective'] }}</code></small></label>
+    <label><span>Share Import Root</span><input type="text" name="share_import_root" value="{{ settings['share_import_root'] }}"><small class="muted">Effective: <code>{{ settings['share_import_root_effective'] }}</code></small></label>
     <label><span>Share Request Timeout (seconds)</span><input type="number" name="share_request_timeout" value="{{ settings['share_request_timeout'] }}"></label>
     <label class="checkbox"><input type="checkbox" name="share_auto_after_posting" {% if settings.share_auto_after_posting == 'true' %}checked{% endif %}><span>Auto-share after successful posting</span></label>
     <label><span>Destination Source</span><input type="text" value="{{ settings['share_destinations_source'] }}" readonly></label>
@@ -226,7 +232,7 @@
       <button type="submit">Save Settings</button>
     </div>
   </form>
-<p class="muted">When post-check is enabled, PrepaC reserves 1 connection for checking and automatically clamps posting connections so the total does not exceed the provider max.</p>
+<p class="muted">PrepaC runs one Posting job per provider at a time. Connection headroom is reserved from each provider max, and post-check reserves one additional connection when enabled.</p>
 </section>
 
 <script>
@@ -245,7 +251,8 @@ function slugifyPostingProviderId(value, fallbackIndex){
 }
 
 function normalizedPostingProvider(provider, idx){
-  const result = Object.assign({
+  const raw = Object.assign({}, provider || {});
+  const result = {
     id: 'provider' + (idx + 1),
     name: 'Provider ' + (idx + 1),
     enabled: false,
@@ -257,7 +264,10 @@ function normalizedPostingProvider(provider, idx){
     connections: '25',
     max_connections: '25',
     priority_up_to_gb: '0'
-  }, provider || {});
+  };
+  Object.keys(result).forEach(key => {
+    if(Object.prototype.hasOwnProperty.call(raw, key)) result[key] = raw[key];
+  });
   result.id = slugifyPostingProviderId(result.id || result.name, idx + 1);
   result.name = String(result.name || ('Provider ' + (idx + 1))).trim() || ('Provider ' + (idx + 1));
   result.port = String(result.port || '563');
@@ -311,8 +321,8 @@ function postingProviderCard(provider, idx){
         <label><span>Port</span><input type="text" value="${escHtml(provider.port)}" oninput="updatePostingProvider(${idx}, 'port', this.value)"></label>
         <label><span>Username</span><input type="text" value="${escHtml(provider.username)}" oninput="updatePostingProvider(${idx}, 'username', this.value)"></label>
         <label><span>Password</span><input type="password" value="${escHtml(provider.password || '')}" oninput="updatePostingProvider(${idx}, 'password', this.value)"></label>
-        <label><span>Connections</span><input type="number" value="${escHtml(provider.connections)}" oninput="updatePostingProvider(${idx}, 'connections', this.value)"></label>
-        <label><span>Max Connections</span><input type="number" value="${escHtml(provider.max_connections)}" oninput="updatePostingProvider(${idx}, 'max_connections', this.value)"></label>
+        <label><span>Upload Connections</span><input type="number" value="${escHtml(provider.connections)}" oninput="updatePostingProvider(${idx}, 'connections', this.value)"><small class="muted">Requested Nyuu upload connections.</small></label>
+        <label><span>Account Max Connections</span><input type="number" value="${escHtml(provider.max_connections)}" oninput="updatePostingProvider(${idx}, 'max_connections', this.value)"><small class="muted">Provider account/server ceiling before headroom is reserved.</small></label>
         ${idx === 0 ? '<label><span>Prioritize jobs up to (GB)</span><input type="number" step="0.1" value="0" disabled><small class="muted">Provider 1 stays in the default availability pool.</small></label>' : `<label><span>Prioritize jobs up to (GB)</span><input type="number" step="0.1" min="0" value="${escHtml(provider.priority_up_to_gb || '0')}" oninput="updatePostingProvider(${idx}, 'priority_up_to_gb', this.value)"><small class="muted">Set 0 to give this provider the same routing priority as Provider 1.</small></label>`}
       </div>
     </article>

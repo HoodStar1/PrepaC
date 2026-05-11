@@ -7,7 +7,7 @@
   <div class="row">
     <button type="button" onclick="scanPosting()">Scan packed jobs</button>
   </div>
-  <p class="muted">Packed archives root: <code>{{ settings['packing_output_root'] }}</code></p>
+  <p class="muted">Posting scan folder: <code>{{ settings['posting_watch_root_effective'] }}</code></p>
   <div id="postingCandidates"><p class="muted">No scan run yet.</p></div>
   <div class="row action-toolbar action-toolbar-bottom">
     <button type="button" id="startPostingBtn" onclick="startSelectedPosting()" disabled>Start selected posting jobs</button>

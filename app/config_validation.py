@@ -12,6 +12,9 @@ INTEGER_LIMITS = {
     "posting_article_size": (1024, 50 * 1024 * 1024),
     "posting_yenc_line_size": (64, 32768),
     "posting_retries": (0, 10),
+    "posting_connection_headroom": (0, 128),
+    "posting_provider_failure_cooldown_seconds": (0, 86400),
+    "posting_provider_disconnect_drain_seconds": (0, 3600),
     "posting_provider1_port": (1, 65535),
     "posting_provider2_port": (1, 65535),
     "posting_provider1_connections": (1, 128),
@@ -29,7 +32,8 @@ BOOLEAN_KEYS = {
 }
 PATH_KEYS = {
     "config_root", "tv_root", "movie_root", "youtube_root", "dest_root", "recycle_bin_root", "packing_watch_root",
-    "packing_output_root", "posting_posted_root", "posting_nzb_root"
+    "packing_output_root", "posting_watch_root", "posting_posted_root", "posting_nzb_root", "share_watch_root",
+    "share_import_root"
 }
 
 PREPARE_PERMISSION_MODES = {"legacy_open", "shared_safe", "owner_strict"}

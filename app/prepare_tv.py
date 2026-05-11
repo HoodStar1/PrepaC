@@ -1,6 +1,7 @@
 from pathlib import Path
 from app.helpers import sanitize_show_name, detect_bracket_info_from_filenames, season_key, scan_videos_nonrecursive, scan_videos_recursive, enforce_name_length
 from app.media_probe import detect_tags, merge_bracket_with_detected_hdr
+from app.workflow_paths import prepare_root
 
 def search_shows(tv_root, query):
     root = Path(tv_root); q = query.strip().lower()
@@ -40,7 +41,7 @@ def preview_tv(settings, show_name, season_name, bracket_override=""):
         bracket = merge_bracket_with_detected_hdr(bracket, tags, "tv")
     dest_show = sanitize_show_name(show_name)
     folder, _, chosen_bracket = enforce_name_length(dest_show, bracket, settings["end_tag"], int(settings["max_name_len"]), season_tag)
-    dest_path = str(Path(settings["dest_root"]) / folder)
+    dest_path = str(prepare_root(settings) / folder)
     return {"media_type":"tv","show_name":show_name,"season_name":season_name,"source_path":str(season_path),"source_rel":f"{show_name}/{season_name}",
             "season_tag":season_tag,"video_files":[str(p) for p in files],"detected_tags":tags,"chosen_bracket":chosen_bracket,
             "dest_folder":folder,"dest_path":dest_path,"path_warn":len(dest_path) > int(settings["win_path_warn"])}

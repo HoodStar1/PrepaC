@@ -20,6 +20,7 @@ from app.media_probe import detect_tags, build_bracket_from_detected
 from app.db import load_settings
 from app.jobs import list_jobs
 from app.secret_utils import resolve_secret
+from app.workflow_paths import packing_output_root, packing_watch_root
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.cache_store import SCAN_CACHE
 from app.metrics import inc, observe
@@ -97,7 +98,7 @@ def largest_video(path: Path):
 
 def scan_watch_folder(settings):
     reconcile_orphaned_packing_jobs_in_process()
-    watch = Path(settings.get("packing_watch_root") or settings.get("dest_root") or "/media/dest")
+    watch = packing_watch_root(settings)
     cache_key = f"scan:packing:{watch}"
     cached = SCAN_CACHE.get(cache_key)
     if cached is not None:
@@ -814,7 +815,7 @@ def run_packing_job(job_id, source_path, settings):
     assert_path_within_roots(source_path, allowed_roots, "packing source")
     source = Path(source_path)
     job_name = source.name
-    packed_root = Path(settings.get("packing_output_root") or str(Path(settings.get("dest_root","/media/dest")) / "_packed"))
+    packed_root = packing_output_root(settings)
     pack_job_root = packed_root / job_name
     output_files_root = packed_root / "output files" / job_name
     _prepare_clean_packing_roots(pack_job_root, output_files_root)
@@ -1079,7 +1080,7 @@ def run_packing_job(job_id, source_path, settings):
         add_packing_event(job_id, "failed", str(e), None)
 def start_packing_job_async(source_path, settings):
     source = Path(source_path)
-    packed_root = Path(settings.get("packing_output_root") or str(Path(settings.get("dest_root","/media/dest")) / "_packed"))
+    packed_root = packing_output_root(settings)
     pack_job_root = packed_root / source.name
     output_files_root = packed_root / "output files" / source.name
     reconcile_orphaned_packing_jobs_in_process()
@@ -1111,10 +1112,11 @@ def start_packing_job_async(source_path, settings):
         try:
             wait_cfg = load_settings().get("packing_slot_wait_timeout_seconds", "")
             if str(wait_cfg or "").strip() == "":
-                wait_cfg = os.environ.get("PREPAC_PACKING_SLOT_WAIT_TIMEOUT_SECONDS", "7200")
-            max_wait_seconds = max(300, int(str(wait_cfg or "7200").strip()))
+                wait_cfg = os.environ.get("PREPAC_PACKING_SLOT_WAIT_TIMEOUT_SECONDS", "0")
+            configured_wait = int(str(wait_cfg or "0").strip())
+            max_wait_seconds = 0 if configured_wait <= 0 else max(300, configured_wait)
         except Exception:
-            max_wait_seconds = 7200
+            max_wait_seconds = 0
         while True:
             current_settings = load_settings()
             try:
@@ -1125,7 +1127,7 @@ def start_packing_job_async(source_path, settings):
             if status == "cancelled":
                 return
             waited = int(time.monotonic() - wait_started_ts)
-            if waited >= max_wait_seconds:
+            if max_wait_seconds and waited >= max_wait_seconds:
                 add_packing_event(job_id, "failed", f"Timed out waiting for packing slot after {waited} seconds.", None)
                 finish_packing(job_id, False, f"Timed out waiting for packing slot after {waited} seconds.")
                 return

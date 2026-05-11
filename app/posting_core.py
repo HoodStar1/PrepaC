@@ -18,6 +18,7 @@ from app.secret_utils import resolve_secret
 from app.cache_store import SCAN_CACHE
 from app.metrics import inc, observe
 from app.subprocess_utils import run_command_with_output, terminate_process
+from app.workflow_paths import posting_nzb_root, posting_posted_root, posting_watch_root
 from app.packing_jobs import list_packing_history, has_large_running_packing_job
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from app.posting_jobs import (
@@ -41,6 +42,23 @@ from app.posting_jobs import (
 
 GB = 1024 ** 3
 POSTING_ACTIVE_JOB_IDS = set()
+POSTING_PROVIDER_COOLDOWNS = {}
+NNTP_CONNECTION_FAILURE_MARKERS = (
+    "nntperror",
+    "nntp connection failed",
+    "unexpected response to auth pass",
+    "too many connections",
+    "code: 482",
+    "connect timed out",
+    "connection timed out",
+    "disconnect timed out",
+    "etimedout",
+    "econnrefused",
+    "econnreset",
+    "socket hang up",
+    "network is unreachable",
+    "no route to host",
+)
 
 
 def _packed_root_size_bytes(packed_root: Path):
@@ -246,7 +264,7 @@ def update_template_groups(template_text: str, groups_csv: str):
 
 def scan_posting_candidates(settings):
     reconcile_orphaned_posting_jobs_in_process()
-    packed_root = Path(settings.get("packing_output_root") or "/media/dest/_packed")
+    packed_root = posting_watch_root(settings)
     cache_key = f"scan:posting:{packed_root}"
     cached = SCAN_CACHE.get(cache_key)
     if cached is not None:
@@ -419,6 +437,87 @@ def validate_posting_inputs(settings, provider, packed_root: Path, output_files_
 def post_check_enabled(settings):
     return str(settings.get("posting_post_check", "false")).lower() == "true"
 
+
+def _posting_provider_cooldown_seconds(settings):
+    try:
+        raw = settings.get("posting_provider_failure_cooldown_seconds", "")
+        if str(raw or "").strip() == "":
+            raw = os.environ.get("PREPAC_POSTING_PROVIDER_FAILURE_COOLDOWN_SECONDS", "300")
+        return max(0, int(str(raw or "300").strip()))
+    except Exception:
+        return 300
+
+
+def _posting_provider_disconnect_drain_seconds(settings):
+    try:
+        raw = settings.get("posting_provider_disconnect_drain_seconds", "")
+        if str(raw or "").strip() == "":
+            raw = os.environ.get("PREPAC_POSTING_PROVIDER_DISCONNECT_DRAIN_SECONDS", "60")
+        return max(0, int(str(raw or "60").strip()))
+    except Exception:
+        return 60
+
+
+def _posting_connection_headroom(settings):
+    try:
+        raw = settings.get("posting_connection_headroom", "")
+        if str(raw or "").strip() == "":
+            raw = os.environ.get("PREPAC_POSTING_CONNECTION_HEADROOM", "2")
+        return max(0, int(str(raw or "2").strip()))
+    except Exception:
+        return 2
+
+
+def _provider_cooldown_remaining(provider_name):
+    key = str(provider_name or "").strip()
+    if not key:
+        return 0
+    entry = POSTING_PROVIDER_COOLDOWNS.get(key)
+    if not entry:
+        return 0
+    until_ts = float(entry.get("until", 0.0) or 0.0)
+    remaining = int(round(until_ts - time.time()))
+    if remaining <= 0:
+        POSTING_PROVIDER_COOLDOWNS.pop(key, None)
+        return 0
+    return remaining
+
+
+def _cooldown_posting_provider(provider_name, settings, reason, seconds=None):
+    if seconds is None:
+        seconds = _posting_provider_cooldown_seconds(settings)
+    key = str(provider_name or "").strip()
+    if not key or seconds <= 0:
+        return 0
+    POSTING_PROVIDER_COOLDOWNS[key] = {
+        "until": time.time() + seconds,
+        "reason": str(reason or "")[:500],
+    }
+    return seconds
+
+
+def _is_provider_connection_failure(message):
+    text = str(message or "").lower()
+    return any(marker in text for marker in NNTP_CONNECTION_FAILURE_MARKERS)
+
+
+def _nyuu_failure_summary(posting_log: Path, fallback):
+    try:
+        lines = read_log_tail(posting_log, max_lines=120).splitlines()
+    except Exception:
+        lines = []
+    cleaned = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in lines]
+    for line in reversed(cleaned):
+        low = line.lower()
+        if any(marker in low for marker in NNTP_CONNECTION_FAILURE_MARKERS):
+            return line[:500]
+    for line in reversed(cleaned):
+        low = line.lower()
+        if "[err" in low or "error" in low or "failed" in low:
+            return line[:500]
+    return fallback
+
+
 def _provider_priority_threshold(provider: dict, default: float = 0.0) -> float:
     try:
         return max(0.0, float(str((provider or {}).get("priority_up_to_gb", "0") or "0").strip()))
@@ -451,7 +550,10 @@ def effective_connections(settings, provider: dict):
     requested = max(1, int(str(provider.get("connections", "1") or "1")))
     configured_max = max(1, int(str(provider.get("max_connections", provider.get("connections", "1")) or "1")))
     clamped_total = min(requested, configured_max)
-    reserve = 1 if post_check_enabled(settings) else 0
+    reserve = _posting_connection_headroom(settings)
+    if post_check_enabled(settings):
+        reserve += 1
+    reserve = min(reserve, max(0, clamped_total - 1))
     effective = max(1, clamped_total - reserve)
     return effective, clamped_total, reserve
 def wait_for_provider(settings, size_bytes, job_id):
@@ -459,10 +561,11 @@ def wait_for_provider(settings, size_bytes, job_id):
     try:
         wait_cfg = settings.get("posting_provider_wait_timeout_seconds", "")
         if str(wait_cfg or "").strip() == "":
-            wait_cfg = os.environ.get("PREPAC_POSTING_PROVIDER_WAIT_TIMEOUT_SECONDS", "3600")
-        max_wait_seconds = max(120, int(str(wait_cfg or "3600").strip()))
+            wait_cfg = os.environ.get("PREPAC_POSTING_PROVIDER_WAIT_TIMEOUT_SECONDS", "0")
+        configured_wait = int(str(wait_cfg or "0").strip())
+        max_wait_seconds = 0 if configured_wait <= 0 else max(120, configured_wait)
     except Exception:
-        max_wait_seconds = 3600
+        max_wait_seconds = 0
     try:
         no_candidate_cfg = settings.get("posting_provider_no_candidate_timeout_seconds", "")
         if str(no_candidate_cfg or "").strip() == "":
@@ -478,11 +581,20 @@ def wait_for_provider(settings, size_bytes, job_id):
     
     while True:
         elapsed = int(time.time() - start_time)
-        if elapsed > max_wait_seconds:
-            raise RuntimeError(f"Timeout waiting for posting provider after {max_wait_seconds} seconds - no providers available")
+        if max_wait_seconds and elapsed > max_wait_seconds:
+            raise RuntimeError(f"Timeout waiting for posting provider after {elapsed} seconds - no providers available")
         
-        candidates = _provider_priority_candidates(settings, size_bytes)
-        if not candidates:
+        configured_candidates = _provider_priority_candidates(settings, size_bytes)
+        candidates = []
+        cooldown_notes = []
+        for provider in configured_candidates:
+            remaining = _provider_cooldown_remaining(provider.get("name") or provider.get("id"))
+            if remaining > 0:
+                cooldown_notes.append(f"{provider.get('name') or provider.get('id')} cooling down for {remaining}s")
+                continue
+            candidates.append(provider)
+
+        if not configured_candidates:
             if no_candidate_started is None:
                 no_candidate_started = time.time()
             elif (time.time() - no_candidate_started) >= no_candidate_timeout_seconds:
@@ -502,6 +614,8 @@ def wait_for_provider(settings, size_bytes, job_id):
         if candidates:
             priority_names = ", ".join(str(provider.get("name") or provider.get("id") or "provider") for provider in candidates[:4])
             msg = f"Waiting for an available posting provider (priority order: {priority_names})"
+        elif cooldown_notes:
+            msg = "Waiting for posting provider cooldown: " + "; ".join(cooldown_notes[:4])
         else:
             msg = "Waiting for an available posting provider (no enabled providers configured)"
         now_ts = time.monotonic()
@@ -637,6 +751,7 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
         "last_article_progress_monotonic": time.monotonic(),
         "last_posted_articles": 0,
         "watchdog_error": "",
+        "connection_warning": "",
     }
 
     silence_timeout = int(silence_timeout_seconds or POSTING_SILENCE_TIMEOUT_SECONDS)
@@ -701,6 +816,8 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
                         if m:
                             warn_msg = m.group("msg").strip()
                             state["last_warn"] = warn_msg
+                            if _is_provider_connection_failure(warn_msg):
+                                state["connection_warning"] = warn_msg
                             if "retry post request" in warn_msg.lower():
                                 add_posting_event(job_id, "finalizing", "Retrying final article after timeout", 96)
                             elif "disconnect timed out" in warn_msg.lower():
@@ -838,16 +955,23 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
     output_files_root = Path(output_files_root_str)
     template_path = Path(template_path_str)
     job_name = packed_root.name
-    posted_root = Path(settings.get("posting_posted_root") or "/media/dest/_posted") / job_name
+    posted_root = posting_posted_root(settings) / job_name
     nzb_tmp_root = posted_root
-    nzb_rar_root = Path(settings.get("posting_nzb_root") or "/media/dest/_nzb")
+    nzb_rar_root = posting_nzb_root(settings)
     size_bytes = _resolved_posting_size_bytes(packed_root, size_bytes=size_bytes)
     posting_log = posted_root / "posting.log"
 
     try:
         provider = wait_for_provider(settings, size_bytes, job_id)
+        eff_connections, max_allowed, reserve = effective_connections(settings, provider)
         update_posting_job(job_id, provider_used=provider["name"])
-        add_posting_event(job_id, "prepare", f"Using {provider['name']} for posting", 5)
+        reserve_note = f", {reserve} reserved" if reserve else ""
+        add_posting_event(
+            job_id,
+            "prepare",
+            f"Using {provider['name']} for posting ({eff_connections}/{max_allowed} connections{reserve_note})",
+            5,
+        )
 
         info = parse_template_info(template_path)
         header = info.get("header") or job_name
@@ -868,7 +992,6 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         assert_path_within_roots(nzb_rar_root, allowed_roots, "nzb rar root")
         posted_root.mkdir(parents=True, exist_ok=True)
         nzb_path = nzb_tmp_root / f"{job_name}.nzb"
-        eff_connections, max_allowed, reserve = effective_connections(settings, provider)
         cmd = build_nyuu_command(job_name, packed_root, nzb_path, header, password, groups_csv, from_header, provider, settings)
 
         errors = validate_posting_inputs(
@@ -888,6 +1011,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             logf.write(f"Header: {header}\n")
             logf.write(f"From: {from_header}\n")
             logf.write(f"Groups: {groups_csv}\n")
+            logf.write(f"Connections: using {eff_connections} of {max_allowed} configured max; reserved {reserve}\n")
             logf.write(f"Command: {shell_join(redact_cli_command(cmd))}\n\n")
             if errors:
                 logf.write("Validation errors:\n")
@@ -937,7 +1061,34 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             raise RuntimeError(str(_state.get("watchdog_error")))
 
         if rc != 0:
-            raise RuntimeError(f"Nyuu exited with code {rc}")
+            failure_message = _nyuu_failure_summary(posting_log, f"Nyuu exited with code {rc}")
+            if _is_provider_connection_failure(failure_message):
+                cooldown_seconds = _cooldown_posting_provider(provider.get("name"), settings, failure_message)
+                if cooldown_seconds:
+                    add_posting_event(
+                        job_id,
+                        "provider",
+                        f"{provider.get('name')} connection failed; cooling provider for {cooldown_seconds}s",
+                        None,
+                    )
+            raise RuntimeError(failure_message)
+
+        connection_warning = str(_state.get("connection_warning") or "").strip()
+        if connection_warning:
+            drain_seconds = _posting_provider_disconnect_drain_seconds(settings)
+            cooldown_seconds = _cooldown_posting_provider(
+                provider.get("name"),
+                settings,
+                connection_warning,
+                seconds=drain_seconds,
+            )
+            if cooldown_seconds:
+                add_posting_event(
+                    job_id,
+                    "provider",
+                    f"{provider.get('name')} reported a connection disconnect; waiting {cooldown_seconds}s before reusing it",
+                    None,
+                )
 
         add_posting_event(job_id, "postcheck", "Upload finished, waiting for Nyuu post-check and finalization", 96)
 
@@ -1020,7 +1171,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         logging.getLogger(__name__).error(f"Posting job {job_id} failed with error: {e}", exc_info=True)
 def start_posting_job_async(packed_root, settings):
     packed_root = Path(packed_root)
-    output_files_root = Path(settings.get("packing_output_root") or "/media/dest/_packed") / "output files" / packed_root.name
+    output_files_root = posting_watch_root(settings) / "output files" / packed_root.name
     template_path = output_files_root / "template.txt"
     size_bytes = _resolved_posting_size_bytes(packed_root)
     reconcile_orphaned_posting_jobs_in_process()

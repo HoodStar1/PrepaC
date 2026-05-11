@@ -10,7 +10,7 @@ RUN npm install -g "node-gyp@${NODE_GYP_VERSION}"     && npm install -g "nyuu@${
 
 FROM debian:bookworm-slim AS par2-builder
 
-ARG PAR2_TAG=v1.2.0
+ARG PAR2_TAG=v1.4.0
 
 RUN apt-get update     && apt-get install -y --no-install-recommends         ca-certificates         git         make         g++         autoconf         automake         libtool         pkg-config     && rm -rf /var/lib/apt/lists/*
 
@@ -47,8 +47,8 @@ ENV PREPAC_LOG_JSON=false
 
 WORKDIR /app
 
-ARG RAR_URL=https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz
-ARG RAR_SHA256=d3e7fba3272385b1d0255ee332a1e8c1a6779bb5a5ff9d4d8ac2be846e49ca46
+ARG RAR_URL=https://www.rarlab.com/rar/rarlinux-x64-722.tar.gz
+ARG RAR_SHA256=34455a6fca2b3aa2bf7fdb78998a11fedf4377ebac8581c5e9357e197263b071
 
 RUN apt-get update     && apt-get install -y --no-install-recommends         ffmpeg         mediainfo         rsync         curl         ca-certificates         libstdc++6         libjpeg62-turbo         libpng16-16         libwebp7         libtiff6         libfreetype6         liblcms2-2         libopenjp2-7         libharfbuzz0b         libfribidi0         libxcb1         tcl8.6         tk8.6         tini     && rm -rf /var/lib/apt/lists/*
 

@@ -1,0 +1,23 @@
+services:
+  prepac:
+    build: .
+    container_name: prepac
+    ports:
+      - "1234:1234"
+    environment:
+      PREPAC_LOG_LEVEL: INFO
+      PREPAC_LOG_JSON: "false"
+    volumes:
+      - ./config:/config
+      - ./data/tv:/media/tv
+      - ./data/movies:/media/movies
+      - ./data/youtube:/media/youtube
+      - ./data/destination:/media/dest
+      # Optional separate workflow mounts. Configure the matching folders in
+      # Settings if you want Prepare, Packing, Posting, and Share separated.
+      # - ./data/prepare:/media/prepare
+      # - ./data/packing:/media/packing
+      # - ./data/posting:/media/posting
+      # - ./data/share:/media/share
+    restart: unless-stopped
+    stop_grace_period: 45s

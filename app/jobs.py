@@ -104,6 +104,12 @@ def try_claim_prepare_slot(job_id, max_jobs):
             conn.rollback()
             conn.close()
             return False
+        cur.execute("SELECT id FROM prepare_jobs WHERE status='queued' ORDER BY id ASC LIMIT 1")
+        next_row = cur.fetchone()
+        if not next_row or int(next_row[0]) != int(job_id):
+            conn.rollback()
+            conn.close()
+            return False
         cur.execute("UPDATE prepare_jobs SET status='running', started_at=? WHERE id=? AND status='queued'", (now(), job_id))
         claimed = cur.rowcount == 1
         conn.commit()

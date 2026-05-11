@@ -32,6 +32,7 @@ from app.posters import show_poster, movie_poster
 from app.packing_core import scan_watch_folder, start_packing_job_async
 from app.packing_jobs import list_packing_jobs, list_packing_jobs_by_status, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
 from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats, get_posting_providers
+from app.posting_provider_config import sanitize_posting_provider_items
 from app.data_sanitizer import redact_sensitive_data, redact_cli_command, sanitize_provider_param
 from app.posting_jobs import list_posting_jobs, list_posting_jobs_by_status, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
@@ -55,6 +56,7 @@ from app.web_security import (
     share_import_limit_bytes,
     share_import_limit_mebibytes,
 )
+from app.workflow_paths import posting_posted_root, settings_with_effective_workflow_paths
 
 
 
@@ -733,10 +735,11 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
     try:
         wait_cfg = load_settings().get("prepare_slot_wait_timeout_seconds", "")
         if str(wait_cfg or "").strip() == "":
-            wait_cfg = os.environ.get("PREPAC_PREPARE_SLOT_WAIT_TIMEOUT_SECONDS", "7200")
-        max_wait_seconds = max(300, int(str(wait_cfg or "7200").strip()))
+            wait_cfg = os.environ.get("PREPAC_PREPARE_SLOT_WAIT_TIMEOUT_SECONDS", "0")
+        configured_wait = int(str(wait_cfg or "0").strip())
+        max_wait_seconds = 0 if configured_wait <= 0 else max(300, configured_wait)
     except Exception:
-        max_wait_seconds = 7200
+        max_wait_seconds = 0
     try:
         while True:
             current = load_settings()
@@ -748,7 +751,7 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
             if get_prepare_job_status(job_id).lower() == "cancelled":
                 return
             waited = int(time.monotonic() - wait_started_ts)
-            if waited >= max_wait_seconds:
+            if max_wait_seconds and waited >= max_wait_seconds:
                 add_job_event(job_id, "failed", f"Timed out waiting for prepare slot after {waited} seconds.", None)
                 finish_job(job_id, False)
                 return
@@ -1084,7 +1087,18 @@ def _event_stream(generator_fn):
     @stream_with_context
     def generate():
         last = None
-        while True:
+        try:
+            max_stream_seconds = max(10, int(str(os.environ.get("PREPAC_SSE_MAX_SECONDS", "55") or "55")))
+        except Exception:
+            max_stream_seconds = 55
+        try:
+            heartbeat_seconds = max(5, int(str(os.environ.get("PREPAC_SSE_HEARTBEAT_SECONDS", "15") or "15")))
+        except Exception:
+            heartbeat_seconds = 15
+        started = time.monotonic()
+        last_emit = 0.0
+        yield "retry: 5000\n\n"
+        while (time.monotonic() - started) < max_stream_seconds:
             try:
                 payload = generator_fn()
             except Exception as e:
@@ -1093,6 +1107,10 @@ def _event_stream(generator_fn):
             if data != last:
                 yield data
                 last = data
+                last_emit = time.monotonic()
+            elif (time.monotonic() - last_emit) >= heartbeat_seconds:
+                yield ": keepalive\n\n"
+                last_emit = time.monotonic()
             time.sleep(1)
     return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -1123,8 +1141,9 @@ def _prepare_active_jobs_payload():
             item["recent_terminal"] = True
             item["seconds_since_terminal"] = age_seconds
             recent_terminal_jobs.append(item)
+        active_jobs.sort(key=lambda j: int(j.get("id") or 0))
+        recent_terminal_jobs.sort(key=lambda j: int(j.get("id") or 0), reverse=True)
         jobs = active_jobs + recent_terminal_jobs
-        jobs.sort(key=lambda j: int(j.get("id") or 0), reverse=True)
     except Exception as e:
         return {"jobs": [], "ok": False, "error": f"prepare job listing failed: {e}"}
     return {
@@ -1147,6 +1166,7 @@ def _packing_jobs_payload():
             j["message"] = latest.get("message", j.get("message",""))
             j["phase"] = latest.get("phase", j.get("phase",""))
             j["percent"] = latest.get("percent", j.get("percent"))
+    jobs.sort(key=lambda j: (0 if str(j.get("status", "")).lower() in {"queued", "running"} else 1, int(j.get("id") or 0) if str(j.get("status", "")).lower() in {"queued", "running"} else -int(j.get("id") or 0)))
     return {"ok": True, "jobs": jobs}
 
 def _packing_completed_payload():
@@ -1156,12 +1176,13 @@ def _packing_completed_payload():
 
 def _posting_jobs_payload():
     jobs = list_posting_jobs(200)
+    settings = load_settings()
     for j in jobs:
         live = get_posting_live_stats(int(j.get("id", 0)))
         if any(live.values()):
             j["runtime_stats"] = live
         else:
-            posted_root = j.get("posted_root") or f"/media/dest/_posted/{j.get('job_name', '')}"
+            posted_root = j.get("posted_root") or str(posting_posted_root(settings) / str(j.get("job_name", "")))
             log_path = pathlib.Path(posted_root) / "posting.log"
             j["runtime_stats"] = parse_posting_log_stats(str(log_path))
         if j.get("events"):
@@ -1169,6 +1190,7 @@ def _posting_jobs_payload():
             j["message"] = latest.get("message", j.get("message",""))
             j["phase"] = latest.get("phase", j.get("phase",""))
             j["percent"] = latest.get("percent", j.get("percent"))
+    jobs.sort(key=lambda j: (0 if str(j.get("status", "")).lower() in {"queued", "running"} else 1, int(j.get("id") or 0) if str(j.get("status", "")).lower() in {"queued", "running"} else -int(j.get("id") or 0)))
     return {"ok": True, "jobs": jobs}
 
 
@@ -1708,7 +1730,7 @@ def help_page():
 @app.route("/settings")
 def settings_page():
     settings = load_settings()
-    display_settings = dict(settings)
+    display_settings = settings_with_effective_workflow_paths(settings)
     for key in SECRET_SPECS.keys():
         display_settings[key] = masked_secret_value(key, settings)
         display_settings[key + "_source"] = secret_source(key, settings)
@@ -1736,7 +1758,7 @@ def clean_logs_page():
 def api_settings_save():
     current = load_settings()
     data = dict(current)
-    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","prepare_permissions_mode","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","posting_providers_json","auth_username","github_repo_owner","github_repo_name","share_import_root","share_request_timeout","share_destinations_json"]:
+    for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","prepare_permissions_mode","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","posting_watch_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_connection_headroom","posting_provider_failure_cooldown_seconds","posting_provider_disconnect_drain_seconds","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","posting_providers_json","auth_username","github_repo_owner","github_repo_name","share_watch_root","share_import_root","share_request_timeout","share_destinations_json"]:
         if k in request.form:
             incoming = request.form.get(k, current.get(k, "")).strip()
             if k in SECRET_SPECS and incoming.startswith("********"):
@@ -1760,6 +1782,7 @@ def api_settings_save():
         provider_items = json.loads(raw_providers or "[]") if provider_source != "secret_file" and provider_source != "env_var" else get_posting_providers(current)
         if not isinstance(provider_items, list):
             raise ValueError("posting_providers_json must be a list")
+        provider_items = sanitize_posting_provider_items(provider_items)
         # Validate against schema
         _validate_posting_providers(provider_items)
     except JsonSchemaValidationError as e:
@@ -2033,7 +2056,7 @@ def jobs_page():
 
 @app.route("/packing")
 def packing_page():
-    return render_template("packing.html", settings=load_settings())
+    return render_template("packing.html", settings=settings_with_effective_workflow_paths(load_settings()))
 
 @app.route("/api/packing/scan", methods=["POST"])
 def api_packing_scan():
@@ -2075,7 +2098,7 @@ def api_packing_completed_stream():
 
 @app.route("/posting")
 def posting_page():
-    return render_template("posting.html", settings=load_settings())
+    return render_template("posting.html", settings=settings_with_effective_workflow_paths(load_settings()))
 
 @app.route("/api/posting/scan", methods=["POST"])
 def api_posting_scan():
@@ -2116,7 +2139,7 @@ def api_posting_output(job_id):
     job = next((j for j in jobs if int(j.get("id", 0)) == int(job_id)), None)
     if not job:
         return jsonify({"ok": False, "error": "Job not found"}), 404
-    posted_root = job.get("posted_root") or f"/media/dest/_posted/{job.get('job_name', '')}"
+    posted_root = job.get("posted_root") or str(posting_posted_root(load_settings()) / str(job.get("job_name", "")))
     log_path = pathlib.Path(posted_root) / "posting.log"
     return jsonify({"ok": True, "raw_output": _tail_text_file(str(log_path), 200), "stats": parse_posting_log_stats(str(log_path)), "source": "log"})
 
@@ -2128,7 +2151,7 @@ def clean_result_page():
 @app.route("/share")
 def share_page():
     settings = load_settings()
-    return render_template("share.html", settings=settings, category_options=CATEGORY_KEY_OPTIONS)
+    return render_template("share.html", settings=settings_with_effective_workflow_paths(settings), category_options=CATEGORY_KEY_OPTIONS)
 
 @app.route("/api/share/candidates")
 def api_share_candidates():

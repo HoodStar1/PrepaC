@@ -17,6 +17,7 @@ from app.db import load_settings
 from app.posting_jobs import list_posting_history
 from app.secret_utils import resolve_secret
 from app.web_security import normalize_service_base_url
+from app.workflow_paths import posting_nzb_root, share_import_root, share_watch_root
 from app.share_jobs import (
     add_share_event,
     create_imported_share_bundle,
@@ -565,6 +566,109 @@ def refresh_share_caps(settings=None):
     return results
 
 
+def _artifact_pair_key(nzb_rar_path, template_path):
+    return (str(nzb_rar_path or "").strip(), str(template_path or "").strip())
+
+
+def _first_existing_rar(job_dir: Path, nzb_root: Path):
+    candidates = []
+    try:
+        candidates.extend(sorted(job_dir.glob("*.rar")))
+    except Exception:
+        pass
+    candidates.append(nzb_root / f"{job_dir.name}.rar")
+    candidates.append(nzb_root / job_dir.name / f"{job_dir.name}.rar")
+    try:
+        candidates.extend(sorted((nzb_root / job_dir.name).glob("*.rar")))
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _share_candidate_from_artifacts(candidate_id, source_ref_id, source_type, job_name, nzb_rar_path, template_path, shared_by_source, extra=None):
+    info = parse_template_info(Path(template_path))
+    effective_size = max(
+        int(Path(nzb_rar_path).stat().st_size) if Path(nzb_rar_path).exists() else 0,
+        int(info.get("declared_size_bytes") or 0),
+    )
+    meta = infer_release_metadata(job_name, effective_size, info.get("groups", ""))
+    item = {
+        "candidate_id": candidate_id,
+        "source_type": source_type,
+        "source_ref_id": source_ref_id,
+        "job_name": job_name,
+        "release_name": job_name,
+        "nzb_rar_path": str(nzb_rar_path),
+        "template_path": str(template_path),
+        "size_bytes": effective_size,
+        "groups_csv": info.get("groups", ""),
+        "template_first_title": info.get("first_title", ""),
+        "episode_count": int(info.get("episode_count") or 0),
+        "template_declared_size": info.get("declared_size", ""),
+        "audio_summary": info.get("audio_summary", ""),
+        "video_summary": info.get("video_summary", ""),
+        "audio_codec": info.get("audio_codec", ""),
+        "video_codec": info.get("video_codec", ""),
+        "hdr_flags": info.get("hdr_flags", []),
+        "episode_range": info.get("episode_range", ""),
+        "shared_destinations": shared_by_source.get(source_ref_id, []),
+        **meta,
+    }
+    if extra:
+        item.update(extra)
+    return item
+
+
+def _scan_share_watch_candidates(settings, hidden_ids, shared_by_source, seen_artifact_pairs):
+    root = share_watch_root(settings)
+    nzb_root = posting_nzb_root(settings)
+    if not root.exists() or not root.is_dir():
+        return []
+
+    results = []
+    for job_dir in sorted(root.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        template = job_dir / "template.txt"
+        if not template.exists():
+            continue
+        rar_path = _first_existing_rar(job_dir, nzb_root)
+        if not rar_path:
+            continue
+        pair = _artifact_pair_key(rar_path, template)
+        if pair in seen_artifact_pairs:
+            continue
+        digest = hashlib.sha1("|".join(pair).encode("utf-8", errors="replace")).hexdigest()[:16]
+        candidate_id = f"folder:{digest}"
+        if candidate_id in hidden_ids:
+            continue
+        try:
+            item = _share_candidate_from_artifacts(
+                candidate_id,
+                candidate_id,
+                "folder",
+                job_dir.name,
+                rar_path,
+                template,
+                shared_by_source,
+                {"matched_by": "share_watch_root", "match_score": 100},
+            )
+        except Exception:
+            continue
+        seen_artifact_pairs.add(pair)
+        results.append(item)
+    return results
+
+
 def build_share_candidates(settings=None):
     settings = settings or _now_settings()
     hidden_ids = get_hidden_share_candidate_ids(settings)
@@ -581,6 +685,7 @@ def build_share_candidates(settings=None):
             "destination_name": str(job.get("destination_name") or job.get("destination_id") or ""),
         })
     results = []
+    seen_artifact_pairs = set()
     for row in list_posting_history(5000):
         if str(row.get("status", "")).lower() != "done":
             continue
@@ -588,6 +693,7 @@ def build_share_candidates(settings=None):
         template_path = str(row.get("template_path") or "")
         if not nzb_rar_path or not template_path:
             continue
+        seen_artifact_pairs.add(_artifact_pair_key(nzb_rar_path, template_path))
         info = parse_template_info(Path(template_path))
         effective_size = max(int(row.get("size_bytes") or 0), int(info.get("declared_size_bytes") or 0))
         meta = infer_release_metadata(row.get("job_name", ""), effective_size, info.get("groups", ""))
@@ -620,7 +726,11 @@ def build_share_candidates(settings=None):
             **meta,
         })
     for row in list_imported_share_bundles(5000):
-        info = parse_template_info(Path(row.get("template_path") or ""))
+        nzb_rar_path = str(row.get("nzb_rar_path") or "")
+        template_path = str(row.get("template_path") or "")
+        if nzb_rar_path and template_path:
+            seen_artifact_pairs.add(_artifact_pair_key(nzb_rar_path, template_path))
+        info = parse_template_info(Path(template_path))
         effective_size = max(int(row.get("size_bytes") or 0), int(info.get("declared_size_bytes") or 0))
         meta = infer_release_metadata(row.get("release_name", ""), effective_size, info.get("groups", ""))
         candidate_id = f"import:{row['id']}"
@@ -633,8 +743,8 @@ def build_share_candidates(settings=None):
             "import_bundle_id": row["id"],
             "job_name": row.get("release_name", ""),
             "release_name": row.get("release_name", ""),
-            "nzb_rar_path": row.get("nzb_rar_path", ""),
-            "template_path": row.get("template_path", ""),
+            "nzb_rar_path": nzb_rar_path,
+            "template_path": template_path,
             "mediainfo_override_path": row.get("mediainfo_override_path", ""),
             "size_bytes": effective_size,
             "groups_csv": info.get("groups", ""),
@@ -652,12 +762,13 @@ def build_share_candidates(settings=None):
             "shared_destinations": shared_by_source.get(f"import:{row['id']}", []),
             **meta,
         })
+    results.extend(_scan_share_watch_candidates(settings, hidden_ids, shared_by_source, seen_artifact_pairs))
     return results
 
 
 def import_share_bundle(nzb_rar_file, template_file, mediainfo_file=None, release_name="", matched_by="", match_score=0):
     settings = _now_settings()
-    base = Path(settings.get("share_import_root") or "/media/dest/_share/imports")
+    base = share_import_root(settings)
     base.mkdir(parents=True, exist_ok=True)
     token = hashlib.sha1(os.urandom(24)).hexdigest()[:12]
     target = base / token
