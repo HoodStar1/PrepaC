@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}{{ error_label|default("Application error", true) }} &middot; PrepaC{% endblock %}
+{% block page_label %}{{ error_label|default("Application error", true) }}{% endblock %}
+{% block content %}
+<section class="error-page card" aria-labelledby="error-title">
+  <span class="error-code" aria-hidden="true">{{ error_status|default(500, true) }}</span>
+  <div>
+    <span class="eyebrow">{{ error_eyebrow|default("Unexpected error", true) }}</span>
+    <h1 id="error-title">{{ error_title|default("PrepaC could not complete that request", true) }}</h1>
+    <p>{{ error_message|default("Try the action again. If the issue continues, review the application logs before restarting active work.", true) }}</p>
+    <div class="actions">
+      <a class="button" href="{{ url_for('dashboard') }}">Return to dashboard</a>
+      <a class="button secondary" href="{{ url_for('help_page') }}">Open help</a>
+    </div>
+  </div>
+</section>
+{% endblock %}

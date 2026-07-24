@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% block title %}Posting history · PrepaC{% endblock %}
+{% block page_label %}Posting history{% endblock %}
 {% block content %}
+<section class="page-header"><div><span class="eyebrow">Stage 03 history</span><h1>Posting history</h1><p>Provider uploads, release metadata, and resulting NZB artifacts.</p></div><a class="button secondary" href="{{ url_for('api_posting_history_export') }}">Download CSV</a></section>
 <section class="card">
-  <h2>Posting History</h2>
-  <p><a href="{{ url_for('api_posting_history_export') }}">Download CSV</a></p>
+  <div class="section-heading"><div><h2>Posted jobs</h2><p>Expand a row to inspect metadata and events.</p></div></div>
   {% if jobs %}
   <table>
     <tr><th>Date</th><th>Job</th><th>Status</th><th>Provider</th><th>Size</th><th>NZB</th><th>Message</th></tr>
@@ -32,7 +34,7 @@
     {% endfor %}
   </table>
   {% else %}
-  <p>No posting history yet.</p>
+  <div class="empty-state"><strong>No posting history</strong></div>
   {% endif %}
 </section>
 {% endblock %}

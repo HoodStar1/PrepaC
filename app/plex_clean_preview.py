@@ -1,12 +1,22 @@
 import re
 import time
+import hashlib
+import json
 from app.posters import target_poster
 from pathlib import Path
-import requests
+from app.plex_http import plex_section_path, request_plex_json
 from app.secret_utils import resolve_secret
 
 PLEX_GET_CACHE = {}
 PLEX_GET_CACHE_TTL_SECONDS = 30
+# Large Plex installations remain supported while an untrusted or malfunctioning
+# server can no longer make a preview retain an unlimited number of pages/items.
+PLEX_LIBRARY_PAGE_SIZE = 200
+PLEX_MAX_LIBRARY_PAGES = 250
+PLEX_MAX_LIBRARY_ITEMS = PLEX_LIBRARY_PAGE_SIZE * PLEX_MAX_LIBRARY_PAGES
+
+CLEAN_FILTER_REASONS = frozenset({"both", "played", "prepared"})
+CLEAN_FILTER_TYPES = frozenset({"all", "tv", "movie", "youtube"})
 
 EXCLUDED_TOPS = {"user", "user0", "remotes", "disks"}
 
@@ -21,16 +31,28 @@ MEDIA_MAP = {
     "/media/TBP/Jobs": "TBP/Jobs",
 }
 
+
+def normalize_clean_filter_scope(filter_reason="both", filter_type="all"):
+    reason = str(filter_reason or "").strip().lower()
+    media_type = str(filter_type or "").strip().lower()
+    if reason not in CLEAN_FILTER_REASONS or media_type not in CLEAN_FILTER_TYPES:
+        raise ValueError("Invalid clean filter")
+    return reason, media_type
+
+
 def plex_get(url, token, path, params=None):
-    headers = {"X-Plex-Token": token, "Accept": "application/json"}
-    cache_key = (url.rstrip("/"), path, tuple(sorted((params or {}).items())))
+    token_fingerprint = hashlib.sha256(str(token).encode("utf-8")).digest()
+    cache_key = (
+        url.rstrip("/"),
+        path,
+        tuple(sorted((params or {}).items())),
+        token_fingerprint,
+    )
     now = time.time()
     cached = PLEX_GET_CACHE.get(cache_key)
     if cached and (now - cached["ts"] <= PLEX_GET_CACHE_TTL_SECONDS):
         return cached["data"]
-    r = requests.get(url.rstrip("/") + path, headers=headers, params=params or {}, timeout=5)
-    r.raise_for_status()
-    data = r.json()
+    data = request_plex_json(url, token, path, params=params or {})
     PLEX_GET_CACHE[cache_key] = {"ts": now, "data": data}
     if len(PLEX_GET_CACHE) > 128:
         oldest_key = min(PLEX_GET_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
@@ -47,35 +69,96 @@ def get_library_key(url, token, title):
             return str(lib.get("key"))
     return None
 
-def fetch_library_items(url, token, key):
+
+def _pagination_value_digest(value):
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _plex_item_identity(item):
+    if isinstance(item, dict):
+        for field in ("ratingKey", "key", "guid"):
+            value = item.get(field)
+            if value is not None and str(value):
+                return f"{field}:{value}"
+    return f"content:{_pagination_value_digest(item)}"
+
+
+def _fetch_paginated_items(url, token, key, endpoint):
     start = 0
-    size = 200
     items = []
+    pages = 0
+    page_fingerprints = set()
+    seen_item_identities = set()
+
     while True:
-        data = plex_get(url, token, f"/library/sections/{key}/all", {"X-Plex-Container-Start": start, "X-Plex-Container-Size": size})
+        if pages >= PLEX_MAX_LIBRARY_PAGES:
+            raise RuntimeError(
+                f"Plex library pagination exceeded the {PLEX_MAX_LIBRARY_PAGES}-page safety limit"
+            )
+        data = plex_get(
+            url,
+            token,
+            plex_section_path(key, endpoint),
+            {
+                "X-Plex-Container-Start": start,
+                "X-Plex-Container-Size": PLEX_LIBRARY_PAGE_SIZE,
+            },
+        )
         mc = data.get("MediaContainer", {})
+        if not isinstance(mc, dict):
+            raise RuntimeError("Plex returned an invalid paginated library response")
         batch = mc.get("Metadata", []) or []
-        items.extend(batch)
-        total = int(mc.get("totalSize", len(items)))
-        if len(items) >= total or not batch:
+        if not isinstance(batch, list):
+            raise RuntimeError("Plex returned an invalid paginated library response")
+        pages += 1
+        if not batch:
             break
-        start += size
+        if len(items) + len(batch) > PLEX_MAX_LIBRARY_ITEMS:
+            raise RuntimeError(
+                f"Plex library pagination exceeded the {PLEX_MAX_LIBRARY_ITEMS}-item safety limit"
+            )
+
+        page_fingerprint = _pagination_value_digest(batch)
+        if page_fingerprint in page_fingerprints:
+            raise RuntimeError("Plex library pagination repeated a page without progress")
+        page_fingerprints.add(page_fingerprint)
+
+        page_item_identities = {_plex_item_identity(item) for item in batch}
+        if seen_item_identities and not (page_item_identities - seen_item_identities):
+            raise RuntimeError("Plex library pagination repeated items without progress")
+        seen_item_identities.update(page_item_identities)
+
+        items.extend(batch)
+
+        raw_total = mc.get("totalSize", len(items))
+        try:
+            total = int(raw_total)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Plex returned an invalid library totalSize") from exc
+        if total < 0:
+            raise RuntimeError("Plex returned an invalid library totalSize")
+        if len(items) >= total:
+            break
+        if len(items) >= PLEX_MAX_LIBRARY_ITEMS:
+            raise RuntimeError(
+                f"Plex library pagination exceeded the {PLEX_MAX_LIBRARY_ITEMS}-item safety limit"
+            )
+        start += PLEX_LIBRARY_PAGE_SIZE
     return items
 
+
+def fetch_library_items(url, token, key):
+    return _fetch_paginated_items(url, token, key, "all")
+
+
 def fetch_tv_episodes(url, token, key):
-    start = 0
-    size = 200
-    items = []
-    while True:
-        data = plex_get(url, token, f"/library/sections/{key}/allLeaves", {"X-Plex-Container-Start": start, "X-Plex-Container-Size": size})
-        mc = data.get("MediaContainer", {})
-        batch = mc.get("Metadata", []) or []
-        items.extend(batch)
-        total = int(mc.get("totalSize", len(items)))
-        if len(items) >= total or not batch:
-            break
-        start += size
-    return items
+    return _fetch_paginated_items(url, token, key, "allLeaves")
 
 def item_is_played(item):
     return bool(item.get("viewCount"))
@@ -306,7 +389,55 @@ def _season_context_details(target_path: str):
         "will_also_remove_show_folder": len(other_season_dirs) == 0,
     }
 
+
+def clean_candidate_id(candidate):
+    """Stable opaque identifier independent of sorting and filter state."""
+    identity = "\x1f".join(
+        (
+            canonical_target_key(candidate.get("target_path", "")),
+            str(candidate.get("media_type", "") or "").strip().lower(),
+            str(candidate.get("target_kind", "") or "").strip().lower(),
+        )
+    )
+    return "clean:" + hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
+
+
+def add_clean_candidate_ids(candidates):
+    for candidate in candidates:
+        candidate["candidate_id"] = clean_candidate_id(candidate)
+    return candidates
+
+
+def resolve_clean_candidate_ids(
+    candidate_ids,
+    settings,
+    history_items,
+    filter_reason="both",
+    filter_type="all",
+):
+    """Rebuild candidates in their preview scope and resolve current identifiers."""
+    requested = [str(value or "").strip() for value in (candidate_ids or [])]
+    if not requested or any(not value.startswith("clean:") for value in requested):
+        raise ValueError("One or more Clean candidate IDs are invalid.")
+    if len(requested) != len(set(requested)):
+        raise ValueError("Duplicate Clean candidate IDs are not allowed.")
+    filter_reason, filter_type = normalize_clean_filter_scope(filter_reason, filter_type)
+    current = preview_clean(
+        settings,
+        history_items,
+        filter_reason,
+        filter_type,
+    )
+    if current.get("error"):
+        raise RuntimeError(str(current["error"]))
+    by_id = {item["candidate_id"]: item for item in current.get("results", [])}
+    missing = [value for value in requested if value not in by_id]
+    if missing:
+        raise ValueError("One or more Clean candidates are no longer available. Refresh the preview.")
+    return [by_id[value] for value in requested]
+
 def preview_clean(settings, history_items, filter_reason="both", filter_type="all"):
+    filter_reason, filter_type = normalize_clean_filter_scope(filter_reason, filter_type)
     url = settings.get("plex_url","").strip()
     token = resolve_secret("plex_token", settings)
     if not url or not token:
@@ -367,7 +498,7 @@ def preview_clean(settings, history_items, filter_reason="both", filter_type="al
                         "size_bytes": sb["total_bytes"],
                         "breakdown": sb["locations"],
                         "details": {"plex_files": parts, "reason_flags": ["fully_played"]},
-                        "poster_url": target_poster(target, "youtube", "nearest_parent") or plex_image_url(url, token, best_thumb(item.get("thumb"), item.get("art"), item.get("parentThumb"), item.get("grandparentThumb"))),
+                        "poster_url": target_poster(movie_path, "movie", "movie_folder") or plex_image_url(url, token, best_thumb(item.get("thumb"), item.get("art"), item.get("parentThumb"), item.get("grandparentThumb"))),
                     })
 
         yt_lib = settings.get("plex_youtube_library","").strip()
@@ -527,6 +658,6 @@ def preview_clean(settings, history_items, filter_reason="both", filter_type="al
             if not existing.get("poster_url") and r.get("poster_url"):
                 existing["poster_url"] = r["poster_url"]
 
-    out = list(merged.values())
+    out = add_clean_candidate_ids(list(merged.values()))
     out.sort(key=lambda x: (x["media_type"], x["title"].lower()))
     return {"error": None, "results": out}

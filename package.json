@@ -1,0 +1,12 @@
+{
+  "name": "prepac-runtime-tools",
+  "version": "1.5.0",
+  "private": true,
+  "description": "Pinned Node.js runtime tools bundled in the PrepaC Docker image",
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
+  "dependencies": {
+    "nyuu": "0.4.2"
+  }
+}

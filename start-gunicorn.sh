@@ -1,52 +1,5 @@
 #!/bin/sh
 set -eu
 
-CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)"
-
-if [ "${GUNICORN_WORKERS:-}" = "" ]; then
-  # Background jobs are process-local threads with process-local active-job
-  # tracking. Keep the default to one worker unless the operator explicitly
-  # opts into multi-process behavior.
-  WORKERS=1
-else
-  WORKERS="${GUNICORN_WORKERS}"
-fi
-
-if [ "${GUNICORN_THREADS:-}" = "" ]; then
-  if [ "$CPU_COUNT" -ge 16 ]; then
-    THREADS=8
-  elif [ "$CPU_COUNT" -ge 8 ]; then
-    THREADS=6
-  elif [ "$CPU_COUNT" -ge 4 ]; then
-    THREADS=4
-  else
-    THREADS=2
-  fi
-else
-  THREADS="${GUNICORN_THREADS}"
-fi
-
-TIMEOUT="${GUNICORN_TIMEOUT:-120}"
-GRACEFUL_TIMEOUT="${GUNICORN_GRACEFUL_TIMEOUT:-30}"
-KEEPALIVE="${GUNICORN_KEEPALIVE:-5}"
-MAX_REQUESTS="${GUNICORN_MAX_REQUESTS:-0}"
-MAX_REQUESTS_JITTER="${GUNICORN_MAX_REQUESTS_JITTER:-100}"
-BIND="${GUNICORN_BIND:-0.0.0.0:1234}"
-LOG_LEVEL="${GUNICORN_LOG_LEVEL:-info}"
-WORKER_TMP_DIR="${GUNICORN_WORKER_TMP_DIR:-/dev/shm}"
-
-exec gunicorn \
-  --worker-class gthread \
-  --workers "$WORKERS" \
-  --threads "$THREADS" \
-  --bind "$BIND" \
-  --timeout "$TIMEOUT" \
-  --graceful-timeout "$GRACEFUL_TIMEOUT" \
-  --keep-alive "$KEEPALIVE" \
-  --max-requests "$MAX_REQUESTS" \
-  --max-requests-jitter "$MAX_REQUESTS_JITTER" \
-  --worker-tmp-dir "$WORKER_TMP_DIR" \
-  --access-logfile - \
-  --error-logfile - \
-  --log-level "$LOG_LEVEL" \
-  app.app:app
+export PREPAC_CONFIG_DIR="${PREPAC_CONFIG_DIR:-/config}"
+exec python -m prepac --server gunicorn

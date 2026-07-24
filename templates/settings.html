@@ -1,724 +1,112 @@
 {% extends "base.html" %}
+{% block title %}Settings · PrepaC{% endblock %}
+{% block page_label %}Application configuration{% endblock %}
 {% block content %}
-<section class="hero-panel"><div><h2>Settings</h2><p>Application configuration.</p></div></section>
-<section class="card">
-  <h2>Settings</h2>
-  <p>Manage application settings.</p>
+{% set posting_editable = settings.get('posting_providers_source') in ['saved_setting', 'unset'] %}
+{% set share_editable = settings.get('share_destinations_source') in ['saved_setting', 'unset'] %}
+{% set plex_token_editable = settings.get('plex_token_source') in ['saved_setting', 'unset'] %}
+{% set freeimage_key_editable = settings.get('packing_freeimage_api_key_source') in ['saved_setting', 'unset'] %}
+<section class="page-header"><div><span class="eyebrow">Configuration</span><h1>Settings</h1><p>Paths, workflow behavior, providers, destinations, and account security.</p></div><label for="settingsSearch"><span>Find a setting</span><input id="settingsSearch" type="search" placeholder="Search sections" autocomplete="off"></label></section>
 
-  <form method="post" action="{{ url_for('api_settings_save') }}" class="form-grid">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>
-      <span>TV Root <small class="muted">Real path: /mnt/user/TV Shows</small></span>
-      <input type="text" name="tv_root" value="{{ settings['tv_root'] }}">
-    </label>
-    <label>
-      <span>Movie Root <small class="muted">Real path: /mnt/user/Movies</small></span>
-      <input type="text" name="movie_root" value="{{ settings['movie_root'] }}">
-    </label>
-    <label>
-      <span>YouTube Root <small class="muted">Real path: /mnt/user/Youtube Downloads</small></span>
-      <input type="text" name="youtube_root" value="{{ settings['youtube_root'] }}">
-    </label>
-    <label>
-      <span>Prepare Destination Folder <small class="muted">Packing follows this when its watch folder is blank or still using the legacy default</small></span>
-      <input type="text" name="dest_root" value="{{ settings['dest_root'] }}">
-      <small class="muted">Effective prepare folder: <code>{{ settings['dest_root_effective'] }}</code></small>
-    </label>
-    <label>
-      <span>End Tag</span>
-      <input type="text" name="end_tag" value="{{ settings['end_tag'] }}">
-    </label>
-    <label>
-      <span>Recycle Bin Root <small class="muted">Usually maps under /mnt/user/TBP/Jobs/.prepac_recycle</small></span>
-      <input type="text" name="recycle_bin_root" value="{{ settings['recycle_bin_root'] }}">
-    </label>
+<form id="settingsForm" method="post" action="{{ url_for('api_settings_save') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="settings-layout">
+    <nav class="card settings-nav" aria-label="Settings sections">
+      <a href="#paths-settings">Paths</a><a href="#application-settings">Application</a><a href="#account-settings">Account</a><a href="#plex-settings">Plex</a><a href="#prepare-settings">Prepare</a><a href="#packing-settings">Packing</a><a href="#posting-settings">Posting</a><a href="#share-settings">Share</a>
+    </nav>
+    <div class="settings-content">
+      <section class="card settings-section" id="paths-settings">
+        <div class="section-heading"><div><h2>Paths and cleanup defaults</h2><p>Container-visible paths used across the workflow.</p></div></div>
+        <div class="form-grid">
+          <label><span>TV root <small class="muted">Host example: /mnt/user/TV Shows</small></span><input type="text" name="tv_root" value="{{ settings.get('tv_root', '') }}"></label>
+          <label><span>Movie root <small class="muted">Host example: /mnt/user/Movies</small></span><input type="text" name="movie_root" value="{{ settings.get('movie_root', '') }}"></label>
+          <label><span>YouTube root</span><input type="text" name="youtube_root" value="{{ settings.get('youtube_root', '') }}"></label>
+          <label><span>Prepare destination</span><input type="text" name="dest_root" value="{{ settings.get('dest_root', '') }}"><small class="muted">Effective: <code>{{ settings.get('dest_root_effective', '') }}</code></small></label>
+          <label><span>Recycle bin root</span><input type="text" name="recycle_bin_root" value="{{ settings.get('recycle_bin_root', '') }}"></label>
+          <label><span>End tag</span><input type="text" name="end_tag" value="{{ settings.get('end_tag', '') }}"></label>
+          <label class="checkbox"><input type="checkbox" name="clean_dry_run" {% if settings.get('clean_dry_run') == 'true' %}checked{% endif %}><span>Use dry run by default</span></label>
+          <label class="checkbox"><input type="checkbox" name="clean_use_recycle_bin" {% if settings.get('clean_use_recycle_bin') == 'true' %}checked{% endif %}><span>Use recycle bin for real clean actions</span></label>
+        </div>
+      </section>
 
-    <label class="checkbox">
-      <input type="checkbox" name="clean_dry_run" {% if settings.clean_dry_run == 'true' %}checked{% endif %}>
-      <span>Clean Dry Run</span>
-    </label>
-    <label class="checkbox">
-      <input type="checkbox" name="clean_use_recycle_bin" {% if settings.clean_use_recycle_bin == 'true' %}checked{% endif %}>
-      <span>Use Recycle Bin for real clean actions</span>
-    </label>
+      <section class="card settings-section" id="application-settings">
+        <div class="section-heading"><div><h2>Application</h2><p>Version information and manual update checks.</p></div></div>
+        <div class="form-grid">
+          <label><span>Version</span><input type="text" value="{{ app_version }}" readonly></label><label><span>Build</span><input type="text" value="{{ build_display }}" readonly></label><label><span>Full version</span><input type="text" value="{{ full_version }}" readonly></label>
+          <label><span>GitHub repository owner</span><input type="text" name="github_repo_owner" value="{{ settings.get('github_repo_owner', '') }}"></label><label><span>GitHub repository name</span><input type="text" name="github_repo_name" value="{{ settings.get('github_repo_name', '') }}"></label>
+          <label class="checkbox"><input type="checkbox" name="update_check_enabled" {% if settings.get('update_check_enabled') == 'true' %}checked{% endif %}><span>Enable update checks when requested</span></label>
+        </div>
+        <div class="actions"><button type="button" id="checkUpdatesBtn" class="secondary">Check now</button></div>
+        <pre id="updateCheckResult" role="status" aria-live="polite">No update check performed.</pre>
+      </section>
 
+      <section class="card settings-section" id="account-settings">
+        <div class="section-heading"><div><h2>Account security</h2><p>Credentials are never displayed in generated settings summaries.</p></div></div>
+        <div class="form-grid"><label><span>Username</span><input type="text" name="auth_username" value="{{ settings.get('auth_username', '') }}" autocomplete="username"></label><label><span>Password</span><input type="text" value="Configured" readonly></label><label><span>Recovery secret</span><input type="text" value="Manage on the recovery settings page" readonly></label></div>
+        <div class="actions"><a class="button secondary" href="/change-password">Change password</a><a class="button secondary" href="{{ url_for('change_recovery_secret_page') }}">Manage recovery secret</a></div>
+      </section>
 
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Application Version</h3>
-  <div class="form-grid">
-    <label><span>Version</span><input type="text" value="{{ app_version }}" readonly></label>
-    <label><span>Build</span><input type="text" value="{{ build_display }}" readonly></label>
-    <label style="grid-column: 1 / -1;"><span>Full Version</span><input type="text" value="{{ full_version }}" readonly></label>
-  </div>
-</section>
+      <section class="card settings-section" id="plex-settings">
+        <div class="section-heading"><div><h2>Plex</h2><p>Connect a server and map library names used by Prepare and Clean.</p></div>{% if plex_token_editable %}<a class="button" href="{{ url_for('plex_signin') }}">Sign in with Plex</a>{% else %}<span class="status-chip">Token managed externally</span>{% endif %}</div>
+        <div class="actions"><button type="button" id="loadPlexServersBtn" class="secondary">Load servers from configured token</button></div>
+        <div id="serversBox"><div class="empty-state"><strong>No server list loaded</strong></div></div>
+        <div class="form-grid">
+          <label><span>Plex URL</span><input type="text" name="plex_url" value="{{ settings.get('plex_url', '') }}" placeholder="http://server:32400"></label>
+          <div class="field"><span class="field-label">Plex token</span><span class="secret-field"><input type="password" name="plex_token" value="" aria-label="Plex token" placeholder="{{ 'Configured — leave blank to keep' if settings.get('plex_token_source') != 'unset' else 'Not configured' }}" autocomplete="new-password" {% if not plex_token_editable %}disabled{% endif %}><button type="button" class="secondary small" data-secret-toggle aria-pressed="false" {% if not plex_token_editable %}disabled{% endif %}>Show</button></span><small>Source: {{ settings.get('plex_token_source', 'unset') }}{% if not plex_token_editable %}; managed externally{% endif %}</small></div>
+          <label><span>TV library</span><input type="text" name="plex_tv_library" value="{{ settings.get('plex_tv_library', '') }}"></label><label><span>Movie library</span><input type="text" name="plex_movie_library" value="{{ settings.get('plex_movie_library', '') }}"></label><label><span>YouTube library</span><input type="text" name="plex_youtube_library" value="{{ settings.get('plex_youtube_library', '') }}"></label>
+        </div>
+      </section>
 
+      <section class="card settings-section" id="prepare-settings">
+        <div class="section-heading"><div><h2>Prepare and workflow automation</h2><p>Concurrency, permissions, and optional automatic handoff.</p></div></div>
+        <div class="form-grid">
+          <label><span>Maximum concurrent Prepare jobs</span><input type="number" min="1" name="prepare_max_concurrent_jobs" value="{{ settings.get('prepare_max_concurrent_jobs', '') }}"></label>
+          <label><span>Prepare permissions mode</span><select name="prepare_permissions_mode"><option value="legacy_open" {% if settings.get('prepare_permissions_mode') == 'legacy_open' %}selected{% endif %}>Legacy open — directories 777, files 666</option><option value="shared_safe" {% if settings.get('prepare_permissions_mode') == 'shared_safe' %}selected{% endif %}>Shared safe — directories 775, files 664</option><option value="owner_strict" {% if settings.get('prepare_permissions_mode') == 'owner_strict' %}selected{% endif %}>Owner strict — directories 750, files 640</option></select></label>
+          <label class="checkbox"><input type="checkbox" name="workflow_auto_chain_enabled" {% if settings.get('workflow_auto_chain_enabled') == 'true' %}checked{% endif %}><span>Automatically continue Prepare → Packing → Posting</span></label>
+        </div>
+      </section>
 
+      <section class="card settings-section" id="packing-settings">
+        <div class="section-heading"><div><h2>Packing</h2><p>Archive output, PAR2, passwords, and thumbnail settings.</p></div></div>
+        <div class="form-grid">
+          <label><span>Maximum concurrent jobs</span><input type="number" min="1" name="packing_max_concurrent_jobs" value="{{ settings.get('packing_max_concurrent_jobs', '') }}"></label><label><span>Watch folder</span><input type="text" name="packing_watch_root" value="{{ settings.get('packing_watch_root', '') }}"><small>Effective: <code>{{ settings.get('packing_watch_root_effective', '') }}</code></small></label><label><span>Output folder</span><input type="text" name="packing_output_root" value="{{ settings.get('packing_output_root', '') }}"><small>Effective: <code>{{ settings.get('packing_output_root_effective', '') }}</code></small></label>
+          <label><span>Stability delay (seconds)</span><input type="number" min="0" name="packing_stability_delay" value="{{ settings.get('packing_stability_delay', '') }}"></label><label class="checkbox"><input type="checkbox" name="packing_delete_source_after_success" {% if settings.get('packing_delete_source_after_success') == 'true' %}checked{% endif %}><span>Delete source after successful packing</span></label><label><span>Password prefix</span><input type="text" name="packing_password_prefix" value="{{ settings.get('packing_password_prefix', '') }}"></label><label><span>Password length</span><input type="number" min="8" name="packing_password_length" value="{{ settings.get('packing_password_length', '') }}"></label>
+          <label class="checkbox"><input type="checkbox" name="packing_header_encrypt" {% if settings.get('packing_header_encrypt') == 'true' %}checked{% endif %}><span>RAR header encryption</span></label><label class="checkbox"><input type="checkbox" name="packing_auto_volume" {% if settings.get('packing_auto_volume') == 'true' %}checked{% endif %}><span>Automatic RAR volume sizing</span></label><label class="checkbox"><input type="checkbox" name="packing_auto_par2" {% if settings.get('packing_auto_par2') == 'true' %}checked{% endif %}><span>Automatic PAR2 percentage</span></label>
+          <label><span>PAR2 threads</span><input type="number" min="1" name="packing_par2_threads" value="{{ settings.get('packing_par2_threads', '') }}"></label><label><span>PAR2 memory (MB)</span><input type="number" min="1" name="packing_par2_memory_mb" value="{{ settings.get('packing_par2_memory_mb', '') }}"></label><label><span>PAR2 block size</span><input type="number" min="1" name="packing_par2_block_size" value="{{ settings.get('packing_par2_block_size', '') }}"></label>
+          <label><span>Archive name length</span><input type="number" min="1" name="packing_name_length" value="{{ settings.get('packing_name_length', '') }}"></label><label><span>Fixed tag</span><input type="text" name="packing_name_fixed_tag" value="{{ settings.get('packing_name_fixed_tag', '') }}"></label><label><span>Fixed tag position</span><input type="number" min="0" name="packing_name_fixed_pos" value="{{ settings.get('packing_name_fixed_pos', '') }}"></label>
+          <label><span>Thumbnail host</span><input type="text" name="packing_thumbnail_host" value="freeimage" readonly></label><div class="field"><span class="field-label">Freeimage API key</span><span class="secret-field"><input type="password" name="packing_freeimage_api_key" value="" aria-label="Freeimage API key" placeholder="{{ 'Configured — leave blank to keep' if settings.get('packing_freeimage_api_key_source') != 'unset' else 'Not configured' }}" autocomplete="new-password" {% if not freeimage_key_editable %}disabled{% endif %}><button type="button" class="secondary small" data-secret-toggle aria-pressed="false" {% if not freeimage_key_editable %}disabled{% endif %}>Show</button></span><small>Source: {{ settings.get('packing_freeimage_api_key_source', 'unset') }}{% if not freeimage_key_editable %}; managed externally{% endif %}</small></div>
+        </div>
+      </section>
 
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Update Settings</h3>
-  <div class="form-grid">
-    <label><span>GitHub Repo Owner</span><input type="text" name="github_repo_owner" value="{{ settings['github_repo_owner'] }}"></label>
-    <label><span>GitHub Repo Name</span><input type="text" name="github_repo_name" value="{{ settings['github_repo_name'] }}"></label>
-    <label class="checkbox"><input type="checkbox" name="update_check_enabled" {% if settings.update_check_enabled == 'true' %}checked{% endif %}><span>Enable update checks</span></label>
-  </div>
-  <div class="row" style="margin-top: 1rem;">
-    <button type="button" onclick="checkForUpdatesNow()">Check for updates</button>
-  </div>
-  <pre id="updateCheckResult">No update check performed yet.</pre>
-  <p class="muted">When an update is available, a badge appears in the header. The manual check button lets you refresh the result immediately.</p>
-</section>
+      <section class="card settings-section" id="posting-settings">
+        <div class="section-heading"><div><h2>Posting</h2><p>Transfer behavior and provider accounts.</p></div></div>
+        <div class="form-grid">
+          <label><span>Scan folder</span><input type="text" name="posting_watch_root" value="{{ settings.get('posting_watch_root', '') }}"><small>Effective: <code>{{ settings.get('posting_watch_root_effective', '') }}</code></small></label><label><span>Posted output root</span><input type="text" name="posting_posted_root" value="{{ settings.get('posting_posted_root', '') }}"><small>Effective: <code>{{ settings.get('posting_posted_root_effective', '') }}</code></small></label><label><span>NZB RAR root</span><input type="text" name="posting_nzb_root" value="{{ settings.get('posting_nzb_root', '') }}"><small>Effective: <code>{{ settings.get('posting_nzb_root_effective', '') }}</code></small></label>
+          <label><span>Article size</span><input type="number" min="1" name="posting_article_size" value="{{ settings.get('posting_article_size', '') }}"></label><label><span>yEnc line size</span><input type="number" min="1" name="posting_yenc_line_size" value="{{ settings.get('posting_yenc_line_size', '') }}"></label><label><span>Retries</span><input type="number" min="0" name="posting_retries" value="{{ settings.get('posting_retries', '') }}"></label><label><span>Retry delay</span><input type="text" name="posting_retry_delay" value="{{ settings.get('posting_retry_delay', '') }}"></label>
+          <label><span>Connection headroom</span><input type="number" min="0" name="posting_connection_headroom" value="{{ settings.get('posting_connection_headroom', '') }}"></label><label><span>Failure cooldown (seconds)</span><input type="number" min="0" name="posting_provider_failure_cooldown_seconds" value="{{ settings.get('posting_provider_failure_cooldown_seconds', '') }}"></label><label><span>Disconnect drain (seconds)</span><input type="number" min="0" name="posting_provider_disconnect_drain_seconds" value="{{ settings.get('posting_provider_disconnect_drain_seconds', '') }}"></label><label><span>Comment</span><input type="text" name="posting_comment" value="{{ settings.get('posting_comment', '') }}"></label>
+          <label class="checkbox"><input type="checkbox" name="posting_embed_password_in_nzb" {% if settings.get('posting_embed_password_in_nzb') == 'true' %}checked{% endif %}><span>Embed archive password in NZB</span></label><label class="checkbox"><input type="checkbox" name="posting_post_check" {% if settings.get('posting_post_check') == 'true' %}checked{% endif %}><span>Enable post-check verification</span></label><label><span>Provider source</span><input type="text" value="{{ settings.get('posting_providers_source', '') }}" readonly></label>
+        </div>
+        {% if not posting_editable %}<div class="flash info" role="status">Providers are managed by {{ settings.get('posting_providers_source')|replace('_', ' ') }} and are read-only here.</div>{% endif %}
+        <textarea id="postingProvidersJson" name="posting_providers_json" hidden {% if not posting_editable %}disabled{% endif %}></textarea>
+        <div class="actions"><button type="button" id="addPostingProviderBtn" {% if not posting_editable %}disabled{% endif %}>Add provider</button></div>
+        <div id="postingProvidersBuilder" data-editable="{{ 'true' if posting_editable else 'false' }}"></div>
+      </section>
 
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Authentication</h3>
-  <div class="form-grid">
-    <label><span>Username</span><input type="text" name="auth_username" value="{{ settings['auth_username'] }}"></label>
-    <label><span>Password Status</span><input type="text" value="{{ 'Configured' if settings['auth_password_hash'] else 'Not configured' }}" readonly></label>
-    <label><span>Recovery Secret Status</span><input type="text" value="{{ 'Configured' if settings['auth_recovery_hash'] else 'Not configured' }}" readonly></label>
-  </div>
-  <div class="row" style="margin-top: 1rem;">
-    <a class="buttonlike" href="{{ url_for('change_recovery_secret_page') }}">{{ "Change Recovery Secret" if settings['auth_recovery_hash'] else "Set Recovery Secret" }}</a>
-  </div>
-  <p class="muted">Authentication is mandatory. Use the button above to set or change the recovery secret for password recovery.</p>
-</section>
-
-    <section class="card inset-card" style="grid-column: 1 / -1;">
-      <h3>Plex Settings</h3>
-      <p>Connect PrepaC to Plex and review the detected server.</p>
-
-      <div class="row">
-        <a class="buttonlike" href="{{ url_for('plex_signin') }}">Sign in with Plex</a>
-        <button type="button" onclick="loadServers()">Refresh Servers From Saved Token</button>
-      </div>
-      <p class="muted">The callback URL is generated automatically from the current browser address, so this flow works on different systems without hardcoding a specific IP.</p>
-      <pre id="pinStatus">Use “Sign in with Plex” to complete authentication in one flow.</pre>
-
-      <div class="row">
-        <button type="button" onclick="loadServers()">Load Servers From Saved Token</button>
-      </div>
-      <div id="serversBox"><p class="muted">No server list loaded yet.</p></div>
-
-      <div class="form-grid">
-        <label>
-          <span>Plex URL</span>
-          <input type="text" name="plex_url" value="{{ settings['plex_url'] }}" placeholder="http://IP:32400">
-        </label>
-        <label>
-          <span>Plex Token</span>
-          <input type="text" name="plex_token" value="{{ settings['plex_token'] }}" placeholder="token">
-        </label>
-        <label>
-          <span>TV Library Name</span>
-          <input type="text" name="plex_tv_library" value="{{ settings['plex_tv_library'] }}">
-        </label>
-        <label>
-          <span>Movie Library Name</span>
-          <input type="text" name="plex_movie_library" value="{{ settings['plex_movie_library'] }}">
-        </label>
-        <label>
-          <span>YouTube Library Name</span>
-          <input type="text" name="plex_youtube_library" value="{{ settings['plex_youtube_library'] }}">
-        </label>
-      </div>
-    </section>
-
-
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Prepare Settings</h3>
-  <div class="form-grid">
-    <label><span>Prepare Max Concurrent Jobs</span><input type="number" name="prepare_max_concurrent_jobs" value="{{ settings['prepare_max_concurrent_jobs'] }}"></label>
-    <label>
-      <span>Prepare Permissions Mode</span>
-      <select name="prepare_permissions_mode">
-        <option value="legacy_open" {% if settings.prepare_permissions_mode == 'legacy_open' %}selected{% endif %}>legacy_open (dirs 777, files 666)</option>
-        <option value="shared_safe" {% if settings.prepare_permissions_mode == 'shared_safe' %}selected{% endif %}>shared_safe (dirs 775, files 664)</option>
-        <option value="owner_strict" {% if settings.prepare_permissions_mode == 'owner_strict' %}selected{% endif %}>owner_strict (dirs 750, files 640)</option>
-      </select>
-      <small class="muted">Default keeps current behavior for compatibility. Switch to safer modes only after verifying downstream tooling permissions.</small>
-    </label>
-  </div>
-</section>
-
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Workflow Automation</h3>
-  <label class="checkbox">
-    <input type="checkbox" name="workflow_auto_chain_enabled" {% if settings.workflow_auto_chain_enabled == 'true' %}checked{% endif %}>
-    <span>Enable automated workflow chaining (Prepare → Packing → Posting)</span>
-  </label>
-  <p class="muted">Prepare still starts manually. When enabled, each completed Prepare job automatically queues Packing, and each completed Packing job automatically queues Posting for that same job. Clean remains fully manual.</p>
-</section>
-
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Packing Settings</h3>
-  <div class="form-grid">
-    <label><span>Packing Max Concurrent Jobs</span><input type="number" name="packing_max_concurrent_jobs" value="{{ settings['packing_max_concurrent_jobs'] }}"></label>
-    <label><span>Packing Watch Folder</span><input type="text" name="packing_watch_root" value="{{ settings['packing_watch_root'] }}"><small class="muted">Effective: <code>{{ settings['packing_watch_root_effective'] }}</code></small></label>
-    <label><span>Packing Output Folder</span><input type="text" name="packing_output_root" value="{{ settings['packing_output_root'] }}"><small class="muted">Effective: <code>{{ settings['packing_output_root_effective'] }}</code></small></label>
-    <label><span>Stability Delay (seconds)</span><input type="number" name="packing_stability_delay" value="{{ settings['packing_stability_delay'] }}"></label>
-    <label class="checkbox"><input type="checkbox" name="packing_delete_source_after_success" {% if settings.packing_delete_source_after_success == 'true' %}checked{% endif %}><span>Delete source after successful packing (default ON)</span></label>
-    <label><span>Password Prefix</span><input type="text" name="packing_password_prefix" value="{{ settings['packing_password_prefix'] }}"></label>
-    <label><span>Password Length</span><input type="number" name="packing_password_length" value="{{ settings['packing_password_length'] }}"></label>
-    <label class="checkbox"><input type="checkbox" name="packing_header_encrypt" {% if settings.packing_header_encrypt == 'true' %}checked{% endif %}><span>RAR header encryption</span></label>
-    <label class="checkbox"><input type="checkbox" name="packing_auto_volume" {% if settings.packing_auto_volume == 'true' %}checked{% endif %}><span>Auto RAR volume sizing</span></label>
-    <label class="checkbox"><input type="checkbox" name="packing_auto_par2" {% if settings.packing_auto_par2 == 'true' %}checked{% endif %}><span>Auto PAR2 percentage</span></label>
-    <label><span>PAR2 Threads</span><input type="number" name="packing_par2_threads" value="{{ settings['packing_par2_threads'] }}"></label>
-    <label><span>PAR2 Memory (MB)</span><input type="number" name="packing_par2_memory_mb" value="{{ settings['packing_par2_memory_mb'] }}"></label>
-    <label><span>PAR2 Block Size</span><input type="number" name="packing_par2_block_size" value="{{ settings['packing_par2_block_size'] }}"></label>
-    <label><span>Archive Name Length</span><input type="number" name="packing_name_length" value="{{ settings['packing_name_length'] }}"></label>
-    <label><span>Fixed Tag</span><input type="text" name="packing_name_fixed_tag" value="{{ settings['packing_name_fixed_tag'] }}"></label>
-    <label><span>Fixed Tag Position</span><input type="number" name="packing_name_fixed_pos" value="{{ settings['packing_name_fixed_pos'] }}"></label>
-    <label><span>Thumbnail Host</span><input type="text" name="packing_thumbnail_host" value="freeimage" readonly></label>
-    <label><span>Freeimage.host API Key</span><input type="text" name="packing_freeimage_api_key" value="{{ settings['packing_freeimage_api_key'] }}"><small class="muted">Source: {{ settings['packing_freeimage_api_key_source'] }}</small></label>
-  </div>
-  <p class="muted">Packed archives go to: <code>{{ settings['packing_output_root_effective'] }}/&lt;jobname&gt;</code><br>Output files go to: <code>{{ settings['packing_output_root_effective'] }}/output files/&lt;jobname&gt;</code></p>
-</section>
-
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Posting Settings</h3>
-  <div class="form-grid">
-    <label><span>Posting Scan Folder</span><input type="text" name="posting_watch_root" value="{{ settings['posting_watch_root'] }}"><small class="muted">Blank follows the packing output folder. Effective: <code>{{ settings['posting_watch_root_effective'] }}</code></small></label>
-    <label><span>Posted Output Root</span><input type="text" name="posting_posted_root" value="{{ settings['posting_posted_root'] }}"><small class="muted">Effective: <code>{{ settings['posting_posted_root_effective'] }}</code></small></label>
-    <label><span>NZB RAR Root</span><input type="text" name="posting_nzb_root" value="{{ settings['posting_nzb_root'] }}"><small class="muted">Effective: <code>{{ settings['posting_nzb_root_effective'] }}</code></small></label>
-    <label><span>Article Size</span><input type="number" name="posting_article_size" value="{{ settings['posting_article_size'] }}"></label>
-    <label><span>yEnc Line Size</span><input type="number" name="posting_yenc_line_size" value="{{ settings['posting_yenc_line_size'] }}"></label>
-    <label><span>Retries</span><input type="number" name="posting_retries" value="{{ settings['posting_retries'] }}"></label>
-    <label><span>Retry Delay</span><input type="text" name="posting_retry_delay" value="{{ settings['posting_retry_delay'] }}"></label>
-    <label><span>Connection Headroom</span><input type="number" name="posting_connection_headroom" value="{{ settings['posting_connection_headroom'] }}"><small class="muted">Reserved from each provider max.</small></label>
-    <label><span>Failure Cooldown (seconds)</span><input type="number" name="posting_provider_failure_cooldown_seconds" value="{{ settings['posting_provider_failure_cooldown_seconds'] }}"></label>
-    <label><span>Disconnect Drain (seconds)</span><input type="number" name="posting_provider_disconnect_drain_seconds" value="{{ settings['posting_provider_disconnect_drain_seconds'] }}"></label>
-    <label><span>Comment</span><input type="text" name="posting_comment" value="{{ settings['posting_comment'] }}"></label>
-    <label><span>Providers Source</span><input type="text" value="{{ settings['posting_providers_source'] }}" readonly></label>
-    <label class="checkbox"><input type="checkbox" name="posting_embed_password_in_nzb" {% if settings.posting_embed_password_in_nzb == 'true' %}checked{% endif %}><span>Embed password in NZB</span></label>
-    <label class="checkbox"><input type="checkbox" name="posting_post_check" {% if settings.posting_post_check == 'true' %}checked{% endif %}><span>Enable post-check verification</span></label>
-  </div>
-  <p class="muted">Configure one or more posting providers here. Existing Provider 1 and Provider 2 settings are carried forward automatically, so current users do not need to re-enter credentials. For every provider after Provider 1, use <strong>Prioritize jobs up to (GB)</strong> to reserve that provider for smaller jobs first. Set it to <strong>0</strong> to give that provider the same routing priority as Provider 1.</p>
-  <textarea id="postingProvidersJson" name="posting_providers_json" style="display:none;">{{ settings['posting_providers_editor'] }}</textarea>
-  <div class="row" style="margin: 1rem 0;">
-    <button type="button" onclick="addPostingProvider()">Add provider</button>
-  </div>
-  <div id="postingProvidersBuilder"></div>
-  <details style="margin-top: 1rem;">
-    <summary>Advanced: current generated JSON</summary>
-    <pre id="postingProvidersPreview">[]</pre>
-  </details>
-  <p class="muted">Posting reads <code>template.txt</code> from <code>{{ settings['posting_watch_root_effective'] }}/output files/&lt;jobname&gt;</code>, updates the actual posted groups, moves output files to <code>{{ settings['posting_posted_root_effective'] }}/&lt;jobname&gt;</code>, deletes <code>{{ settings['posting_watch_root_effective'] }}/&lt;jobname&gt;</code> after success, and stores the NZB as a RAR in <code>{{ settings['posting_nzb_root_effective'] }}/&lt;jobname&gt;.rar</code>.</p>
-</section>
-
-<section class="card inset-card" style="grid-column: 1 / -1;">
-  <h3>Share Settings</h3>
-  <div class="form-grid">
-    <label><span>Share Scan Folder</span><input type="text" name="share_watch_root" value="{{ settings['share_watch_root'] }}"><small class="muted">Blank follows the posted output root. Effective: <code>{{ settings['share_watch_root_effective'] }}</code></small></label>
-    <label><span>Share Import Root</span><input type="text" name="share_import_root" value="{{ settings['share_import_root'] }}"><small class="muted">Effective: <code>{{ settings['share_import_root_effective'] }}</code></small></label>
-    <label><span>Share Request Timeout (seconds)</span><input type="number" name="share_request_timeout" value="{{ settings['share_request_timeout'] }}"></label>
-    <label class="checkbox"><input type="checkbox" name="share_auto_after_posting" {% if settings.share_auto_after_posting == 'true' %}checked{% endif %}><span>Auto-share after successful posting</span></label>
-    <label><span>Destination Source</span><input type="text" value="{{ settings['share_destinations_source'] }}" readonly></label>
-  </div>
-  <p class="muted">Configure one or more Newznab-compatible share destinations here. The hidden JSON is generated automatically from the form below when you save.</p>
-  <textarea id="shareDestinationsJson" name="share_destinations_json" style="display:none;">{{ settings['share_destinations_editor'] }}</textarea>
-
-  <div class="row" style="margin: 1rem 0;">
-    <button type="button" onclick="addShareDestination()">Add destination</button>
-    <button type="button" onclick="refreshShareCaps()">Refresh all saved destination categories</button>
-  </div>
-  <div id="shareDestinationsBuilder"></div>
-  <pre id="shareCapsResult">No share destination test or category refresh performed yet.</pre>
-  <details style="margin-top: 1rem;">
-    <summary>Advanced: current generated JSON</summary>
-    <pre id="shareDestinationsPreview">[]</pre>
-  </details>
-</section>
-
-
-    <div style="grid-column: 1 / -1;">
-      <button type="submit">Save Settings</button>
+      <section class="card settings-section" id="share-settings">
+        <div class="section-heading"><div><h2>Share</h2><p>Import storage, request timing, and destinations that implement the Newznab-style <code>nzbadd</code> upload extension.</p></div></div>
+        <div class="form-grid"><label><span>Scan folder</span><input type="text" name="share_watch_root" value="{{ settings.get('share_watch_root', '') }}"><small>Effective: <code>{{ settings.get('share_watch_root_effective', '') }}</code></small></label><label><span>Import root</span><input type="text" name="share_import_root" value="{{ settings.get('share_import_root', '') }}"><small>Effective: <code>{{ settings.get('share_import_root_effective', '') }}</code></small></label><label><span>Request timeout (seconds)</span><input type="number" min="1" name="share_request_timeout" value="{{ settings.get('share_request_timeout', '') }}"></label><label class="checkbox"><input type="checkbox" name="share_auto_after_posting" {% if settings.get('share_auto_after_posting') == 'true' %}checked{% endif %}><span>Automatically share after posting</span></label><label><span>Destination source</span><input type="text" value="{{ settings.get('share_destinations_source', '') }}" readonly></label></div>
+        {% if not share_editable %}<div class="flash info" role="status">Destinations are managed by {{ settings.get('share_destinations_source')|replace('_', ' ') }} and are read-only here.</div>{% endif %}
+        <textarea id="shareDestinationsJson" name="share_destinations_json" hidden {% if not share_editable %}disabled{% endif %}></textarea>
+        <div class="actions"><button type="button" id="addShareDestinationBtn" {% if not share_editable %}disabled{% endif %}>Add destination</button><button type="button" id="refreshShareCapsSettingsBtn" class="secondary">Refresh saved categories</button></div>
+        <div id="shareDestinationsBuilder" data-editable="{{ 'true' if share_editable else 'false' }}"></div>
+        <pre id="shareCapsResult" role="status" aria-live="polite">No destination test or category refresh performed.</pre>
+      </section>
     </div>
-  </form>
-<p class="muted">PrepaC runs one Posting job per provider at a time. Connection headroom is reserved from each provider max, and post-check reserves one additional connection when enabled.</p>
-</section>
-
-<script>
-
-
-const shareCategoryOptions = {{ share_category_options|tojson }};
-let postingProvidersState = {{ posting_providers|tojson }};
-let shareDestinationsState = {{ share_destinations|tojson }};
-let draggedShareDestinationIndex = null;
-
-function escHtml(v){ return String(v ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
-
-
-function slugifyPostingProviderId(value, fallbackIndex){
-  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('provider' + fallbackIndex);
-}
-
-function normalizedPostingProvider(provider, idx){
-  const raw = Object.assign({}, provider || {});
-  const result = {
-    id: 'provider' + (idx + 1),
-    name: 'Provider ' + (idx + 1),
-    enabled: false,
-    host: '',
-    port: '563',
-    ssl: true,
-    username: '',
-    password: '',
-    connections: '25',
-    max_connections: '25',
-    priority_up_to_gb: '0'
-  };
-  Object.keys(result).forEach(key => {
-    if(Object.prototype.hasOwnProperty.call(raw, key)) result[key] = raw[key];
-  });
-  result.id = slugifyPostingProviderId(result.id || result.name, idx + 1);
-  result.name = String(result.name || ('Provider ' + (idx + 1))).trim() || ('Provider ' + (idx + 1));
-  result.port = String(result.port || '563');
-  result.connections = String(result.connections || '25');
-  result.max_connections = String(result.max_connections || result.connections || '25');
-  return result;
-}
-
-postingProvidersState = (Array.isArray(postingProvidersState) ? postingProvidersState : []).map((provider, idx) => normalizedPostingProvider(provider, idx));
-
-function defaultPostingProvider(){
-  return normalizedPostingProvider({}, postingProvidersState.length);
-}
-
-function syncPostingProvidersJson(){
-  postingProvidersState = postingProvidersState.map((provider, idx) => normalizedPostingProvider(provider, idx));
-  const hidden = document.getElementById('postingProvidersJson');
-  const preview = document.getElementById('postingProvidersPreview');
-  const serialized = JSON.stringify(postingProvidersState, null, 2);
-  if(hidden) hidden.value = serialized;
-  if(preview) preview.textContent = serialized;
-}
-
-function postingProviderCard(provider, idx){
-  return `
-    <article class="job share-destination-card" style="margin-bottom:1rem;" draggable="true"
-      data-posting-provider-index="${idx}"
-      ondragstart="startPostingProviderDrag(event, ${idx})"
-      ondragover="allowPostingProviderDrop(event, ${idx})"
-      ondrop="dropPostingProvider(event, ${idx})"
-      ondragend="endPostingProviderDrag()">
-      <div class="row" style="justify-content:space-between; align-items:center; gap:.75rem; flex-wrap:wrap;">
-        <div class="row" style="gap:.75rem; align-items:center; flex-wrap:wrap;">
-          <span title="Drag to reorder" style="cursor:grab; font-size:1.25rem; user-select:none;">☰</span>
-          <h4 style="margin:0;">Provider ${idx + 1}</h4>
-          <code>${escHtml(provider.id)}</code>
-        </div>
-        <div class="row" style="gap:.5rem; flex-wrap:wrap;">
-          <button type="button" onclick="movePostingProvider(${idx}, -1)" ${idx === 0 ? 'disabled' : ''}>Move up</button>
-          <button type="button" onclick="movePostingProvider(${idx}, 1)" ${idx === postingProvidersState.length - 1 ? 'disabled' : ''}>Move down</button>
-          <button type="button" onclick="clonePostingProvider(${idx})">Clone</button>
-          <button type="button" onclick="removePostingProvider(${idx})">Remove</button>
-        </div>
-      </div>
-      <div class="form-grid" style="margin-top:1rem;">
-        <label class="checkbox"><input type="checkbox" ${provider.enabled ? 'checked' : ''} onchange="updatePostingProvider(${idx}, 'enabled', this.checked)"><span>Enabled</span></label>
-        <label><span>Display Name</span><input type="text" value="${escHtml(provider.name)}" oninput="updatePostingProvider(${idx}, 'name', this.value)"></label>
-        <label><span>ID</span><input type="text" value="${escHtml(provider.id)}" oninput="updatePostingProvider(${idx}, 'id', this.value)"></label>
-        <label class="checkbox"><input type="checkbox" ${provider.ssl ? 'checked' : ''} onchange="updatePostingProvider(${idx}, 'ssl', this.checked)"><span>Use SSL</span></label>
-        <label><span>Host</span><input type="text" value="${escHtml(provider.host)}" oninput="updatePostingProvider(${idx}, 'host', this.value)"></label>
-        <label><span>Port</span><input type="text" value="${escHtml(provider.port)}" oninput="updatePostingProvider(${idx}, 'port', this.value)"></label>
-        <label><span>Username</span><input type="text" value="${escHtml(provider.username)}" oninput="updatePostingProvider(${idx}, 'username', this.value)"></label>
-        <label><span>Password</span><input type="password" value="${escHtml(provider.password || '')}" oninput="updatePostingProvider(${idx}, 'password', this.value)"></label>
-        <label><span>Upload Connections</span><input type="number" value="${escHtml(provider.connections)}" oninput="updatePostingProvider(${idx}, 'connections', this.value)"><small class="muted">Requested Nyuu upload connections.</small></label>
-        <label><span>Account Max Connections</span><input type="number" value="${escHtml(provider.max_connections)}" oninput="updatePostingProvider(${idx}, 'max_connections', this.value)"><small class="muted">Provider account/server ceiling before headroom is reserved.</small></label>
-        ${idx === 0 ? '<label><span>Prioritize jobs up to (GB)</span><input type="number" step="0.1" value="0" disabled><small class="muted">Provider 1 stays in the default availability pool.</small></label>' : `<label><span>Prioritize jobs up to (GB)</span><input type="number" step="0.1" min="0" value="${escHtml(provider.priority_up_to_gb || '0')}" oninput="updatePostingProvider(${idx}, 'priority_up_to_gb', this.value)"><small class="muted">Set 0 to give this provider the same routing priority as Provider 1.</small></label>`}
-      </div>
-    </article>
-  `;
-}
-
-function renderPostingProvidersBuilder(){
-  const box = document.getElementById('postingProvidersBuilder');
-  if(!box) return;
-  if(!postingProvidersState.length){
-    box.innerHTML = '<p class="muted">No posting providers configured yet.</p>';
-  } else {
-    box.innerHTML = postingProvidersState.map((provider, idx) => postingProviderCard(provider, idx)).join('');
-  }
-  syncPostingProvidersJson();
-}
-
-function addPostingProvider(){
-  postingProvidersState.push(defaultPostingProvider());
-  renderPostingProvidersBuilder();
-}
-
-function clonePostingProvider(idx){
-  const source = normalizedPostingProvider(postingProvidersState[idx], idx);
-  const copy = JSON.parse(JSON.stringify(source));
-  copy.name = `${source.name || 'Provider'} Copy`;
-  copy.id = slugifyPostingProviderId(copy.name, postingProvidersState.length + 1);
-  postingProvidersState.splice(idx + 1, 0, copy);
-  renderPostingProvidersBuilder();
-}
-
-function removePostingProvider(idx){
-  postingProvidersState.splice(idx, 1);
-  renderPostingProvidersBuilder();
-}
-
-function movePostingProvider(idx, delta){
-  const target = idx + delta;
-  if(target < 0 || target >= postingProvidersState.length) return;
-  const [item] = postingProvidersState.splice(idx, 1);
-  postingProvidersState.splice(target, 0, item);
-  renderPostingProvidersBuilder();
-}
-
-let draggedPostingProviderIndex = null;
-
-function startPostingProviderDrag(event, idx){
-  draggedPostingProviderIndex = idx;
-  if(event.dataTransfer){
-    event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData('text/plain', String(idx));
-  }
-}
-
-function allowPostingProviderDrop(event){
-  event.preventDefault();
-  if(event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-}
-
-function dropPostingProvider(event, idx){
-  event.preventDefault();
-  const sourceIdx = draggedPostingProviderIndex;
-  if(sourceIdx === null || sourceIdx === idx) return;
-  const [item] = postingProvidersState.splice(sourceIdx, 1);
-  postingProvidersState.splice(idx, 0, item);
-  draggedPostingProviderIndex = null;
-  renderPostingProvidersBuilder();
-}
-
-function endPostingProviderDrag(){
-  draggedPostingProviderIndex = null;
-}
-
-function updatePostingProvider(idx, key, value){
-  postingProvidersState[idx][key] = value;
-  if(key === 'name' && (!postingProvidersState[idx].id || String(postingProvidersState[idx].id).startsWith('provider') || String(postingProvidersState[idx].id) === slugifyPostingProviderId(postingProvidersState[idx].name, idx + 1))){
-    postingProvidersState[idx].id = slugifyPostingProviderId(value, idx + 1);
-  }
-  if(key === 'id'){
-    postingProvidersState[idx].id = slugifyPostingProviderId(value, idx + 1);
-  }
-  syncPostingProvidersJson();
-}
-
-function slugifyDestinationId(value, fallbackIndex){
-  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('destination' + fallbackIndex);
-}
-
-function normalizedDestination(dest, idx){
-  const result = Object.assign({
-    id: 'destination' + (idx + 1),
-    name: 'New Destination',
-    enabled: true,
-    mode: 'both',
-    base_url: '',
-    api_key: '',
-    include_nfo: true,
-    include_mediainfo: true,
-    includemeta: true,
-    basic_auth: false,
-    username: '',
-    password: '',
-    categories_cache: [],
-    category_overrides: {}
-  }, dest || {});
-  if (!result.id) result.id = slugifyDestinationId(result.name, idx + 1);
-  result.categories_cache = Array.isArray(result.categories_cache) ? result.categories_cache : [];
-  result.category_overrides = (result.category_overrides && typeof result.category_overrides === 'object') ? result.category_overrides : {};
-  return result;
-}
-
-shareDestinationsState = (Array.isArray(shareDestinationsState) ? shareDestinationsState : []).map((dest, idx) => normalizedDestination(dest, idx));
-
-function defaultShareDestination(){
-  return normalizedDestination({}, shareDestinationsState.length);
-}
-
-function syncShareDestinationsJson(){
-  shareDestinationsState = shareDestinationsState.map((dest, idx) => normalizedDestination(dest, idx));
-  const hidden = document.getElementById('shareDestinationsJson');
-  const preview = document.getElementById('shareDestinationsPreview');
-  const serialized = JSON.stringify(shareDestinationsState, null, 2);
-  if(hidden) hidden.value = serialized;
-  if(preview) preview.textContent = serialized;
-}
-
-function categoryOverrideLabel(categoryKey){
-  const found = shareCategoryOptions.find(opt => opt.value === categoryKey);
-  return found ? found.label : categoryKey;
-}
-
-function categoryCacheOptions(cache, selectedValue){
-  const options = ['<option value="">Auto-match from cached categories</option>'];
-  for(const item of cache){
-    const selected = String(item.id) === String(selectedValue || '') ? 'selected' : '';
-    options.push(`<option value="${escHtml(item.id)}" ${selected}>${escHtml(item.id)} - ${escHtml(item.label)}</option>`);
-  }
-  return options.join('');
-}
-
-function shareCategoryOverrideRows(dest, idx){
-  const cache = Array.isArray(dest.categories_cache) ? dest.categories_cache : [];
-  return shareCategoryOptions.map(opt => `
-    <label>
-      <span>${escHtml(opt.label)}</span>
-      <select onchange="updateShareDestinationOverride(${idx}, '${opt.value}', this.value)">
-        ${categoryCacheOptions(cache, (dest.category_overrides || {})[opt.value])}
-      </select>
-    </label>
-  `).join('');
-}
-
-function shareDestinationCard(dest, idx){
-  const cache = Array.isArray(dest.categories_cache) ? dest.categories_cache : [];
-  const overrideCount = Object.values(dest.category_overrides || {}).filter(Boolean).length;
-  return `
-    <article class="job share-destination-card" style="margin-bottom:1rem;" draggable="true"
-      data-share-destination-index="${idx}"
-      ondragstart="startShareDestinationDrag(event, ${idx})"
-      ondragover="allowShareDestinationDrop(event, ${idx})"
-      ondrop="dropShareDestination(event, ${idx})"
-      ondragend="endShareDestinationDrag()">
-      <div class="row" style="justify-content:space-between; align-items:center; gap:.75rem; flex-wrap:wrap;">
-        <div class="row" style="gap:.75rem; align-items:center; flex-wrap:wrap;">
-          <span title="Drag to reorder" style="cursor:grab; font-size:1.25rem; user-select:none;">☰</span>
-          <h4 style="margin:0;">Destination ${idx + 1}</h4>
-          <code>${escHtml(dest.id)}</code>
-        </div>
-        <div class="row" style="gap:.5rem; flex-wrap:wrap;">
-          <button type="button" onclick="moveShareDestination(${idx}, -1)" ${idx === 0 ? 'disabled' : ''}>Move up</button>
-          <button type="button" onclick="moveShareDestination(${idx}, 1)" ${idx === shareDestinationsState.length - 1 ? 'disabled' : ''}>Move down</button>
-          <button type="button" onclick="cloneShareDestination(${idx})">Clone</button>
-          <button type="button" onclick="testShareDestination(${idx})">Test connection</button>
-          <button type="button" onclick="removeShareDestination(${idx})">Remove</button>
-        </div>
-      </div>
-      <div class="form-grid" style="margin-top:1rem;">
-        <label class="checkbox"><input type="checkbox" ${dest.enabled ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'enabled', this.checked)"><span>Enabled</span></label>
-        <label><span>Display Name</span><input type="text" value="${escHtml(dest.name)}" oninput="updateShareDestination(${idx}, 'name', this.value)"></label>
-        <label><span>ID</span><input type="text" value="${escHtml(dest.id)}" oninput="updateShareDestination(${idx}, 'id', this.value)"></label>
-        <label><span>Base URL</span><input type="text" placeholder="https://auto.example.com" value="${escHtml(dest.base_url)}" oninput="updateShareDestination(${idx}, 'base_url', this.value)"></label>
-        <label><span>API Key</span><input type="password" value="${escHtml(dest.api_key)}" oninput="updateShareDestination(${idx}, 'api_key', this.value)"></label>
-        <label><span>Mode</span>
-          <select onchange="updateShareDestination(${idx}, 'mode', this.value)">
-            <option value="manual" ${dest.mode === 'manual' ? 'selected' : ''}>Manual</option>
-            <option value="auto" ${dest.mode === 'auto' ? 'selected' : ''}>Automatic</option>
-            <option value="both" ${dest.mode === 'both' ? 'selected' : ''}>Both</option>
-          </select>
-        </label>
-        <label class="checkbox"><input type="checkbox" ${dest.include_nfo ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'include_nfo', this.checked)"><span>Attach generated NFO</span></label>
-        <label class="checkbox"><input type="checkbox" ${dest.include_mediainfo ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'include_mediainfo', this.checked)"><span>Attach MediaInfo XML</span></label>
-        <label class="checkbox"><input type="checkbox" ${dest.includemeta ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'includemeta', this.checked)"><span>Send includemeta=true</span></label>
-        <label class="checkbox"><input type="checkbox" ${dest.basic_auth ? 'checked' : ''} onchange="updateShareDestination(${idx}, 'basic_auth', this.checked)"><span>Use basic auth</span></label>
-        <label><span>Username</span><input type="text" value="${escHtml(dest.username || '')}" oninput="updateShareDestination(${idx}, 'username', this.value)"></label>
-        <label><span>Password</span><input type="password" value="${escHtml(dest.password || '')}" oninput="updateShareDestination(${idx}, 'password', this.value)"></label>
-      </div>
-      <details style="margin-top:1rem;" ${overrideCount ? 'open' : ''}>
-        <summary>Category mapping overrides (${overrideCount})</summary>
-        <p class="muted">Leave each mapping on auto to use PrepaC's default category matching. Set an override when a destination uses a different category ID than the standard Newznab category.</p>
-        <div class="form-grid" style="margin-top:.75rem;">
-          ${shareCategoryOverrideRows(dest, idx)}
-        </div>
-      </details>
-      <details style="margin-top:1rem;">
-        <summary>Cached categories (${cache.length})</summary>
-        ${cache.length ? `<div class="row" style="flex-wrap:wrap; margin-top:.75rem;">${cache.map(cat => `<code>${escHtml(cat.id)} - ${escHtml(cat.label)}</code>`).join('')}</div>` : '<p class="muted">No cached categories yet. Use test connection or refresh all saved destination categories.</p>'}
-      </details>
-    </article>
-  `;
-}
-
-function renderShareDestinationsBuilder(){
-  const box = document.getElementById('shareDestinationsBuilder');
-  if(!box) return;
-  if(!shareDestinationsState.length){
-    box.innerHTML = '<p class="muted">No share destinations configured yet.</p>';
-  } else {
-    box.innerHTML = shareDestinationsState.map((dest, idx) => shareDestinationCard(dest, idx)).join('');
-  }
-  syncShareDestinationsJson();
-}
-
-function addShareDestination(){
-  shareDestinationsState.push(defaultShareDestination());
-  renderShareDestinationsBuilder();
-}
-
-function cloneShareDestination(idx){
-  const source = normalizedDestination(shareDestinationsState[idx], idx);
-  const copy = JSON.parse(JSON.stringify(source));
-  copy.name = `${source.name || 'New Destination'} Copy`;
-  copy.id = slugifyDestinationId(copy.name, shareDestinationsState.length + 1);
-  shareDestinationsState.splice(idx + 1, 0, copy);
-  renderShareDestinationsBuilder();
-}
-
-function removeShareDestination(idx){
-  shareDestinationsState.splice(idx, 1);
-  renderShareDestinationsBuilder();
-}
-
-function moveShareDestination(idx, delta){
-  const target = idx + delta;
-  if(target < 0 || target >= shareDestinationsState.length) return;
-  const [item] = shareDestinationsState.splice(idx, 1);
-  shareDestinationsState.splice(target, 0, item);
-  renderShareDestinationsBuilder();
-}
-
-function startShareDestinationDrag(event, idx){
-  draggedShareDestinationIndex = idx;
-  if(event.dataTransfer){
-    event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData('text/plain', String(idx));
-  }
-}
-
-function allowShareDestinationDrop(event, idx){
-  event.preventDefault();
-  if(event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-}
-
-function dropShareDestination(event, idx){
-  event.preventDefault();
-  const sourceIdx = draggedShareDestinationIndex;
-  if(sourceIdx === null || sourceIdx === idx) return;
-  const [item] = shareDestinationsState.splice(sourceIdx, 1);
-  const insertAt = idx;
-  shareDestinationsState.splice(insertAt, 0, item);
-  draggedShareDestinationIndex = null;
-  renderShareDestinationsBuilder();
-}
-
-function endShareDestinationDrag(){
-  draggedShareDestinationIndex = null;
-}
-
-function updateShareDestination(idx, key, value){
-  shareDestinationsState[idx][key] = value;
-  if(key === 'name' && (!shareDestinationsState[idx].id || String(shareDestinationsState[idx].id).startsWith('destination') || String(shareDestinationsState[idx].id) === slugifyDestinationId(shareDestinationsState[idx].name, idx + 1))){
-    shareDestinationsState[idx].id = slugifyDestinationId(value, idx + 1);
-  }
-  if(key === 'id'){
-    shareDestinationsState[idx].id = slugifyDestinationId(value, idx + 1);
-  }
-  syncShareDestinationsJson();
-}
-
-function updateShareDestinationOverride(idx, categoryKey, categoryId){
-  const dest = shareDestinationsState[idx];
-  dest.category_overrides = (dest.category_overrides && typeof dest.category_overrides === 'object') ? dest.category_overrides : {};
-  if(categoryId){
-    dest.category_overrides[categoryKey] = categoryId;
-  } else {
-    delete dest.category_overrides[categoryKey];
-  }
-  syncShareDestinationsJson();
-}
-
-async function testShareDestination(idx){
-  const box = document.getElementById('shareCapsResult');
-  const destination = shareDestinationsState[idx];
-  box.textContent = `Testing ${destination.name || destination.id}...`;
-  const r = await fetch('/api/share/destination/test', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({destination})
-  });
-  const d = await r.json();
-  if(d.ok){
-    shareDestinationsState[idx].categories_cache = d.categories || [];
-    renderShareDestinationsBuilder();
-  }
-  box.textContent = JSON.stringify(d, null, 2);
-}
-
-async function refreshShareCaps(){
-  const box = document.getElementById('shareCapsResult');
-  if(box) box.textContent = 'Refreshing...';
-  const r = await fetch('/api/share/caps/refresh', {method:'POST'});
-  const d = await r.json();
-  if(box) box.textContent = JSON.stringify(d, null, 2);
-  if(d.ok){
-    try {
-      const refresh = await fetch('/api/share/candidates');
-      const data = await refresh.json();
-      shareDestinationsState = (data.destinations || shareDestinationsState).map((dest, idx) => normalizedDestination(dest, idx));
-      renderShareDestinationsBuilder();
-    } catch (e) {}
-  }
-}
-renderPostingProvidersBuilder();
-renderShareDestinationsBuilder();
-
-async function loadServers(){
-  const box = document.getElementById('serversBox');
-  box.innerHTML = '<p>Loading servers...</p>';
-  const r = await fetch('/api/plex/servers');
-  const d = await r.json();
-  if(!d.ok){
-    box.innerHTML = `<p><strong>Error:</strong> ${d.error}</p>`;
-    return;
-  }
-  if(!d.servers.length){
-    box.innerHTML = '<p>No servers found.</p>';
-    return;
-  }
-  box.innerHTML = d.servers.map(server => `
-    <article class="job">
-      <h4>${server.name}</h4>
-      <details open>
-        <summary>Connections</summary>
-        ${(server.connections || []).map(conn => `
-          <div class="row">
-            <code>${conn.uri}</code>
-            <button type="button" onclick="selectServer('${conn.uri.replace(/'/g, "\'")}')">Use this URL</button>
-          </div>
-        `).join('')}
-      </details>
-    </article>
-  `).join('');
-}
-async function selectServer(uri){
-  const r = await fetch('/api/plex/server/select', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({server_url: uri})
-  });
-  const d = await r.json();
-  if(!d.ok){
-    alert(d.error || 'Failed to save server');
-    return;
-  }
-  const plexUrlInput = document.querySelector('input[name="plex_url"]');
-  if (plexUrlInput) plexUrlInput.value = d.plex_url || uri;
-  alert('Plex server URL saved into settings. Click Save Settings to persist any other changes.');
-}
-  renderShareDestinationsBuilder();
-</script>
-
-
-<script>
-async function checkForUpdatesNow() {
-  const box = document.getElementById('updateCheckResult');
-  box.textContent = 'Checking for updates...';
-  const data = await prepacCheckForUpdates(true);
-  if (!data) {
-    box.textContent = 'Update check failed.';
-    return;
-  }
-  if (data.update_available) {
-    box.textContent = `Current: ${data.current_version}\nLatest: ${data.latest_version}\nRelease: ${data.release_url || ''}\nAsset: ${data.asset_name || data.asset_url || ''}`;
-  } else {
-    box.textContent = `You are up to date. Current: ${data.current_version}`;
-  }
-}
-</script>
-
+  </div>
+  <div class="settings-savebar"><span id="settingsDirtyStatus" class="muted" role="status" aria-live="polite">No unsaved changes.</span><button type="submit">Save settings</button></div>
+</form>
+<div id="postingProvidersData" hidden>{{ posting_providers|tojson }}</div>
+<div id="shareDestinationsData" hidden>{{ share_destinations|tojson }}</div>
+<div id="settingsCategoryOptionsData" hidden>{{ share_category_options|tojson }}</div>
 {% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/settings.js') }}?v={{ build_number }}" defer></script>{% endblock %}

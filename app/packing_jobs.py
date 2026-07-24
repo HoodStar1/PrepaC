@@ -1,8 +1,14 @@
-from datetime import datetime
 import os
 import time
 from app.db import get_conn
 from app.subprocess_utils import terminate_process
+from app.timestamp_utils import (
+    latest_local_timestamp,
+    local_now,
+    local_now_iso,
+    parse_local_timestamp,
+    recent_event_timestamps,
+)
 
 ACTIVE_PACKING_PROCS = {}
 
@@ -38,26 +44,47 @@ class TTLDict:
 _PACKING_EVENT_THROTTLE_STATE = TTLDict(ttl_seconds=3600)
 
 def now():
-    return datetime.now().isoformat(timespec="seconds")
+    return local_now_iso()
 
-def create_packing_job(source_path, job_name, output_root, output_files_root):
-    existing_id = get_existing_active_packing_job_id(source_path)
-    if existing_id:
-        return existing_id
+def create_packing_job(source_path, job_name, output_root, output_files_root, idempotency_key=None, return_created=False):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO packing_jobs(source_path, job_name, output_root, output_files_root, status, created_at) VALUES (?, ?, ?, ?, 'queued', ?)",
-        (source_path, job_name, output_root, output_files_root, now())
-    )
-    job_id = cur.lastrowid
-    conn.commit(); conn.close()
-    return job_id
+    key = str(idempotency_key or "").strip() or None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if key:
+            row = cur.execute(
+                "SELECT id FROM packing_jobs "
+                "WHERE (idempotency_key=? OR source_path=?) "
+                "AND status IN ('queued','running','finalizing','outcome_unknown') "
+                "ORDER BY id DESC LIMIT 1",
+                (key, source_path),
+            ).fetchone()
+        else:
+            row = cur.execute(
+                "SELECT id FROM packing_jobs WHERE source_path=? "
+                "AND status IN ('queued','running','finalizing','outcome_unknown') "
+                "ORDER BY id DESC LIMIT 1",
+                (source_path,),
+            ).fetchone()
+        if row:
+            conn.commit()
+            result = int(row[0])
+            return (result, False) if return_created else result
+        cur.execute(
+            "INSERT INTO packing_jobs(source_path, job_name, output_root, output_files_root, status, created_at, idempotency_key) VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            (source_path, job_name, output_root, output_files_root, now(), key),
+        )
+        job_id = cur.lastrowid
+        conn.commit()
+        return (job_id, True) if return_created else job_id
+    finally:
+        conn.close()
 
 
 
 def get_existing_active_packing_job_id(source_path):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id FROM packing_jobs WHERE source_path=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1", (source_path,))
+    cur.execute("SELECT id FROM packing_jobs WHERE source_path=? AND status IN ('queued','running','finalizing','outcome_unknown') ORDER BY id DESC LIMIT 1", (source_path,))
     row = cur.fetchone()
     conn.close()
     return int(row[0]) if row else None
@@ -86,40 +113,47 @@ def reconcile_orphaned_running_packing_jobs(active_job_ids, reason="Recovered or
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
         """
-        SELECT j.id, j.percent, j.started_at, j.created_at, MAX(e.timestamp) AS last_event_at
-        FROM packing_jobs j
-        LEFT JOIN packing_job_events e ON e.packing_job_id=j.id
-        WHERE j.status='running'
-        GROUP BY j.id
+        SELECT id, status, percent, started_at, created_at
+        FROM packing_jobs
+        WHERE status IN ('running','finalizing')
         """
     )
     rows = [dict(r) for r in cur.fetchall()]
+    events_by_job = recent_event_timestamps(
+        cur,
+        "packing_job_events",
+        "packing_job_id",
+        (row["id"] for row in rows),
+    )
     changed = 0
-    now_dt = datetime.now()
+    now_dt = local_now()
     for row in rows:
         job_id = int(row.get("id") or 0)
         if job_id in active_ids:
             continue
-        activity_times = []
-        for field in ("last_event_at", "started_at", "created_at"):
-            try:
-                ts = row.get(field)
-                if ts:
-                    activity_times.append(datetime.fromisoformat(str(ts)))
-            except Exception:
-                pass
-        if activity_times:
-            age_seconds = int((now_dt - max(activity_times)).total_seconds())
+        last_activity = latest_local_timestamp(
+            [
+                row.get("started_at"),
+                row.get("created_at"),
+                *events_by_job.get(job_id, []),
+            ]
+        )
+        if last_activity:
+            age_seconds = int((now_dt - last_activity).total_seconds())
             if age_seconds < stale_min_age:
                 continue
+        prior_status = str(row.get("status") or "").lower()
+        target_status = "outcome_unknown" if prior_status == "finalizing" else "failed"
         recovered_reason = f"{reason}; no persisted activity for at least {stale_min_age}s"
+        if target_status == "outcome_unknown":
+            recovered_reason += "; finalization may have completed, so verify outputs before force retry"
         cur.execute(
-            "UPDATE packing_jobs SET status='failed', finished_at=?, message=? WHERE id=? AND status='running'",
-            (now(), recovered_reason, job_id),
+            "UPDATE packing_jobs SET status=?, finished_at=?, message=? WHERE id=? AND status=?",
+            (target_status, now(), recovered_reason, job_id, prior_status),
         )
         if cur.rowcount <= 0:
             continue
-        cur.execute("INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (job_id, now(), 'recovered', recovered_reason, row.get('percent')))
+        cur.execute("INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (job_id, now(), ('outcome_unknown' if target_status == 'outcome_unknown' else 'recovered'), recovered_reason, row.get('percent')))
         changed += 1
     conn.commit(); conn.close()
     return changed
@@ -137,14 +171,15 @@ def has_outdated_or_missing_successful_packing(source_path, prepared_finished_at
         return True
     if not prepared_finished_at:
         return False
-    try:
-        return prepared_finished_at > latest_pack
-    except Exception:
-        return prepared_finished_at != latest_pack
+    prepared_at = parse_local_timestamp(prepared_finished_at)
+    packed_at = parse_local_timestamp(latest_pack)
+    if prepared_at is None or packed_at is None:
+        return True
+    return prepared_at > packed_at
 
 def count_running_packing_jobs():
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status='running'")
+    cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status IN ('running','finalizing')")
     row = cur.fetchone()
     conn.close()
     return int(row[0] or 0)
@@ -157,7 +192,7 @@ def try_claim_packing_slot(job_id, max_jobs):
         # Set a timeout to prevent hanging on database locks
         conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
         cur.execute("BEGIN IMMEDIATE")
-        cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status='running'")
+        cur.execute("SELECT COUNT(*) FROM packing_jobs WHERE status IN ('running','finalizing')")
         running = int(cur.fetchone()[0] or 0)
         if running >= int(max_jobs):
             conn.rollback()
@@ -217,16 +252,83 @@ def add_packing_event(job_id, phase, message, percent=None):
     conn.commit(); conn.close()
 
 def start_packing(job_id):
-    update_packing_job(job_id, status="running", started_at=now())
+    """Claim a queued job without reviving a cancelled or terminal row."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE packing_jobs SET status='running', started_at=COALESCE(started_at, ?) "
+        "WHERE id=? AND status='queued' AND output_reset_claimed_at IS NULL",
+        (now(), int(job_id)),
+    )
+    changed = cur.rowcount == 1
+    conn.commit(); conn.close()
+    return changed
+
+
+def begin_packing_output_reset(job_id):
+    """Atomically claim ownership before any existing output is removed.
+
+    Cancellation uses the inverse compare-and-swap predicate. SQLite serializes
+    the two writes, so either cancellation wins and this returns false, or this
+    marker wins and cancellation remains unavailable for this packing attempt.
+    """
+    timestamp = now()
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE packing_jobs SET output_reset_claimed_at=?, status='running', "
+        "started_at=COALESCE(started_at, ?), phase='resetting', "
+        "message='Claimed packing output; preparing clean output directories' "
+        "WHERE id=? AND status IN ('queued','running') "
+        "AND output_reset_claimed_at IS NULL",
+        (timestamp, timestamp, int(job_id)),
+    )
+    changed = cur.rowcount == 1
+    conn.commit(); conn.close()
+    return changed
 
 def finish_packing(job_id, success=True, message=""):
     conn = get_conn(); cur = conn.cursor()
+    eligible_statuses = "('running','finalizing')" if success else "('queued','running')"
     cur.execute(
         "UPDATE packing_jobs SET status=?, finished_at=?, message=?, percent=? "
-        "WHERE id=? AND status NOT IN ('done','failed','cancelled')",
+        f"WHERE id=? AND status IN {eligible_statuses}",
         ("done" if success else "failed", now(), message, 100 if success else None, job_id),
     )
     conn.commit(); conn.close()
+
+
+def begin_packing_finalization(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE packing_jobs SET status='finalizing', phase='finalizing' "
+        "WHERE id=? AND status='running' AND output_reset_claimed_at IS NOT NULL",
+        (int(job_id),),
+    )
+    changed = cur.rowcount > 0
+    conn.commit(); conn.close()
+    return changed
+
+
+def mark_packing_outcome_unknown(job_id, message):
+    safe_message = str(message or "Packing finalization outcome is unknown")[:1000]
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        timestamp = now()
+        cur.execute(
+            "UPDATE packing_jobs SET status='outcome_unknown', phase='outcome_unknown', "
+            "finished_at=?, message=?, percent=NULL WHERE id=? AND status='finalizing'",
+            (timestamp, safe_message, int(job_id)),
+        )
+        changed = cur.rowcount == 1
+        if changed:
+            cur.execute(
+                "INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) "
+                "VALUES (?, ?, 'outcome_unknown', ?, NULL)",
+                (int(job_id), timestamp, safe_message),
+            )
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
 
 def list_packing_jobs(limit=200):
     """Fetch packing jobs with events - optimized to avoid N+1 queries."""
@@ -388,6 +490,11 @@ def interrupt_running_packing_jobs(reason="Interrupted by container shutdown", r
             terminate_process(proc)
         except Exception:
             pass
+    if not recovery:
+        # The worker thread may still complete after its child process exits.
+        # Leave persisted state untouched; stale reconciliation will decide the
+        # outcome after this process has actually gone away.
+        return len(ACTIVE_PACKING_PROCS)
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM packing_jobs WHERE status='running'")
     rows = [dict(r) for r in cur.fetchall()]
@@ -403,11 +510,34 @@ def interrupt_running_packing_jobs(reason="Interrupted by container shutdown", r
     return len(rows)
 
 
+def acknowledge_packing_outcome_unknown_for_resubmission(job_id):
+    """Unblock a fresh packing submission after output/source reconciliation."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE packing_jobs SET status='failed', phase='manual_reconcile', "
+            "message='Unknown outcome manually reconciled; fresh submission permitted' "
+            "WHERE id=? AND status='outcome_unknown'",
+            (int(job_id),),
+        )
+        changed = cur.rowcount == 1
+        if changed:
+            cur.execute(
+                "INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) "
+                "VALUES (?, ?, 'manual_reconcile', 'Unknown outcome manually reconciled; fresh submission permitted', NULL)",
+                (int(job_id), now()),
+            )
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
 def has_large_running_packing_job(min_size_bytes):
     min_size_bytes = int(min_size_bytes or 0)
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        "SELECT 1 FROM packing_jobs WHERE status='running' AND size_bytes >= ? LIMIT 1",
+        "SELECT 1 FROM packing_jobs WHERE status IN ('running','finalizing') AND size_bytes >= ? LIMIT 1",
         (min_size_bytes,),
     )
     row = cur.fetchone()
@@ -432,16 +562,21 @@ def unregister_packing_proc(job_id, proc=None):
 
 def cancel_packing_job(job_id, reason="Cancelled by user"):
     proc = ACTIVE_PACKING_PROCS.get(int(job_id))
-    if proc is not None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE packing_jobs SET status='cancelled', finished_at=?, message=? WHERE id=? AND status IN ('queued','running')", (now(), reason, job_id))
+    cur.execute(
+        "UPDATE packing_jobs SET status='cancelled', finished_at=?, message=? "
+        "WHERE id=? AND status IN ('queued','running') "
+        "AND output_reset_claimed_at IS NULL",
+        (now(), reason, int(job_id)),
+    )
     changed = cur.rowcount > 0
     if changed:
         cur.execute("INSERT INTO packing_job_events(packing_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)",
                     (job_id, now(), 'cancelled', reason, None))
     conn.commit(); conn.close()
+    if changed and proc is not None:
+        try:
+            terminate_process(proc)
+        except Exception:
+            pass
     return changed

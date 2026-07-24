@@ -2,71 +2,125 @@
 
 ## The app does not start
 
-Check your container logs and confirm your Docker configuration is valid.
+Run `prepac --check` for a direct install, or inspect `docker compose logs prepac` for Docker.
 
-- If startup now reports a schema migration or index creation failure, check the logged SQL statement and database error before restarting repeatedly.
-- Already-applied column additions are skipped automatically; other migration failures now stop startup so the database is not left silently inconsistent.
+- Confirm Python is 3.13 or 3.14.
+- Confirm `PREPAC_CONFIG_DIR` exists or can be created and is writable.
+- Confirm the installed runtime lock matches the platform.
+- Check the logged database migration or schema error before restarting repeatedly.
+- On Docker, confirm the host is AMD64 and the Compose service uses `platform: linux/amd64`.
 
-## Sign-in says too many attempts
+## A runtime tool is missing
 
-PrepaC temporarily locks sign-in and password reset after repeated failed attempts.
+Direct installs require `ffmpeg`, `ffprobe`, `mediainfo`, `rar`, `par2`, `node`, and `nyuu` on `PATH`. Close and reopen the terminal or restart the service after changing `PATH`.
 
-- Wait for the lockout window to expire, then try again.
-- If needed, adjust auth rate-limit environment variables for your deployment size.
+On Windows, install command-line versions and verify each command from the same account that runs PrepaC. rsync is not required.
+
+## Prepare copy fails
+
+Check source readability, destination write access, free space, and the Active Prepare Job events.
+
+On Linux, PrepaC can use rsync when it is available. If rsync is absent, it uses the built-in copy path. On Windows, the built-in copy path is expected. A failure is therefore not fixed by installing rsync unless the log specifically shows an rsync attempt.
+
+## Every page fails after a job starts
+
+If normal pages return an application error and `/health` returns `503`, inspect
+`docker compose logs --tail=200 prepac` for a SQLite error. Every authenticated
+page reads sign-in settings from the same config database, so a database
+storage failure affects the whole interface even when the job itself is not
+shown on that page.
+
+- Keep `PREPAC_SQLITE_JOURNAL_MODE=DELETE` for Docker bind mounts, Windows, and
+  Unraid `/mnt/user` paths. Rebuild and restart so the mode is selected during
+  locked startup; PrepaC creates and verifies a retained backup before changing
+  an existing database's mode.
+- Confirm `/config` is writable, has free space, and is not opened by a second
+  PrepaC container.
+- Treat `database is locked`, `disk I/O error`, `readonly database`, and missing
+  schema messages as storage or permission faults, then correct that condition
+  before retrying jobs.
+- If starting a queue waits for the configured busy timeout and then reports
+  `database is locked`, confirm the container is running a current build with
+  worker-local Gunicorn initialization and a single Gunicorn worker. Rebuild
+  the image after updating rather than restarting an older container.
+- On Unraid, move the complete stopped config directory to a direct cache/pool
+  path if errors continue. Follow
+  [SQLite storage compatibility](operations.md#sqlite-storage-compatibility);
+  never delete SQLite `-wal`/`-shm` files or copy only `prepac.db` while the
+  service is running.
+
+## Packing fails
+
+- Run `rar` and `par2` from the service account.
+- Confirm RAR licensing and executable access.
+- Check free space in both working and output folders.
+- Confirm FFmpeg, ffprobe, and MediaInfo can read the input file.
 
 ## Posting does not start
 
-Check provider settings, provider order, priority thresholds, and path configuration.
+Check provider settings, provider order, account groups, priority thresholds, connection ceilings, and path configuration. If every eligible provider is busy, the job remains queued.
 
-If all eligible providers are busy, the posting job remains queued until an eligible provider becomes available.
+For `502 max number of simultaneous IPs` or `482 too many connections`:
 
-## Prepare fails with rsync errors
+- Put provider entries sharing one upstream account in the same Account Group.
+- Reduce Upload Connections or increase Connection Headroom.
+- Confirm the provider allows the number of source IPs in use.
 
-Prepare now requires `rsync` to succeed and reports the direct rsync error in the job events.
-
-- Check the Active Prepare Job details for the exact rsync message and command.
-- Verify the container has `rsync` installed and available on `PATH`.
-- Verify the configured source and destination mounts exist inside the container and are writable where needed.
-- If the copy runs for a long time, ensure rsync can emit progress output and is not being blocked by mount or filesystem issues.
+Run `node --version` and `nyuu --help` from the service account when Nyuu cannot launch.
 
 ## Share does not submit
 
-Check destination settings, API access, and any rate limits on the target indexer.
+- Confirm the destination is a plain `http://` or `https://` base URL. Enter
+  the URL before `/api`; PrepaC 1.5.0 also normalizes one trailing `/api`
+  segment for compatibility.
+- Put credentials in their dedicated fields, not in the URL.
+- A successful Newznab capabilities check does not prove upload support. The
+  destination must also permit the nonstandard `nzbadd` API command used for
+  Share uploads.
+- Check destination and reverse-proxy logs for the corresponding request when
+  it returns HTTP 500. As a disposable diagnostic, retry a small test after
+  disabling optional NFO, MediaInfo, and metadata multipart fields; do not
+  force-retry a real job until you have confirmed the first request did not
+  arrive.
+- PrepaC never shows or stores the raw remote HTML error page. It records only
+  a bounded diagnostic containing safe response metadata and a body hash.
+- Redirects, timeouts, 5xx responses, and unverifiable 2xx responses become
+  `outcome_unknown` because the destination may have accepted the upload before
+  its response failed. Reconcile the destination before using **Force retry**.
+- An imported RAR must contain exactly one regular NZB no larger than 16 MiB.
+  PrepaC validates the archive and streams that entry without selecting or
+  extracting its stored path, so legacy absolute, traversal-like, bracketed,
+  wildcard, and leading-dash member names are safe.
+- The default imported bundle cap is 128 MiB; increase
+  `PREPAC_SHARE_IMPORT_MAX_MB` only when needed.
 
-- Destination URLs must now be plain `http://` or `https://` base URLs.
-- Remove embedded credentials, query strings, and fragments from the destination URL.
-- Keep credentials in the dedicated API key or basic-auth fields instead of the URL itself.
+## A job is finalizing, uploading, or outcome unknown
 
-## Share import says "Upload too large"
+`finalizing` and `uploading` mean an irreversible local or remote step may be in progress. Cancellation is intentionally unavailable in these states. Do not stop the service or submit the same work again merely because progress appears quiet; review the latest job event first.
 
-Share imports are now capped per request.
+Packing also locks cancellation while its status is still `running` once the
+job has claimed its output directories. At that point it may already have
+cleared prior output. This is deliberate: only a cancellation that commits
+before the output claim can guarantee that no destructive reset follows.
 
-- The default limit is `512` MiB.
-- Increase `PREPAC_SHARE_IMPORT_MAX_MB` only if your real import bundle size requires it.
-- Retry the upload after adjusting the limit and restarting the app.
+`outcome_unknown` means PrepaC could not safely determine whether that step completed. Inspect and reconcile the Prepare destination, Packing outputs, posting provider/NZB records, or Share destination as appropriate. Prepare, Packing, and Posting remain deduplication-blocked until an authenticated administrator uses **Acknowledge and allow resubmission** and types the verification phrase; acknowledgement does not retry the job. Share's confirmed **Force retry** can duplicate a submission that actually succeeded, so use it only after checking the remote destination. See [Job shutdown and recovery](operations.md#job-shutdown-and-recovery) for the full state and restart behavior.
 
-## Plex sign-in or callback uses the wrong external URL
+## Sign-in says too many attempts
 
-- If you are behind a reverse proxy, set `PREPAC_TRUST_PROXY_HEADERS=true`.
-- If you are not using a trusted reverse proxy, leave it disabled so external URLs use the direct request scheme and host.
+Wait for the lockout window, then retry. Adjust the auth rate window, attempt limit, or lockout duration only for a documented operational need.
 
-## A form save or API action says "Security check failed"
+## Plex callback uses the wrong URL
 
-PrepaC now requires a session-backed CSRF token for mutating requests.
+Set `PREPAC_TRUST_PROXY_HEADERS=true` only behind a trusted reverse proxy that sets the external scheme and host. Add the proxy's exact address or CIDR to `PREPAC_TRUSTED_PROXIES`; only loopback is trusted by default. Otherwise leave forwarded-header trust disabled.
 
-- Reload the page and retry the action.
-- If you use a reverse proxy, make sure it preserves cookies for the app origin.
-- If you call the API manually, send the `X-CSRF-Token` header from the active browser session.
+## A form says “Security check failed”
 
-## An active Share job needs to stop
-
-Use the cancel or remove action on the Active Share Jobs card. The job result is then available in Share History.
+Reload the page to obtain a new CSRF token. Confirm the reverse proxy preserves cookies and the app origin. Manual API clients must send the session's `X-CSRF-Token`.
 
 ## Clean does not remove files
 
-Check Dry Run, confirmation text `DELETE`, permissions, and recycle-bin configuration.
+Check Dry Run, the exact `DELETE` confirmation, filesystem permissions, allowed roots, and recycle-bin configuration.
 
-## Metrics scraping does not work
+## Metrics scraping fails
 
-- If `PREPAC_METRICS_TOKEN` is set, include it as `X-Prepac-Metrics-Token` (or `?token=`).
-- If no token is configured, metrics continue to use authenticated access.
+If `PREPAC_METRICS_TOKEN` is set, send it in the `X-Prepac-Metrics-Token` header. Without a token, metrics require the normal authenticated access.

@@ -1,31 +1,22 @@
 {% extends "base.html" %}
+{% block title %}Initial setup · PrepaC{% endblock %}
+{% block page_label %}Initial setup{% endblock %}
 {% block content %}
-<section class="card">
-  <h2>Initial Setup</h2>
-  <p>Create the local admin account used to sign in to PrepaC.</p>
-
-  <form method="post" class="stack" autocomplete="off">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="username">Username</label>
-    <input id="username" name="username" type="text" value="{{ request.form.get('username', '') }}" required autofocus>
-
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" required>
-
-    <label for="confirm_password">Confirm password</label>
-    <input id="confirm_password" name="confirm_password" type="password" required>
-
-    <label for="recovery_secret">Recovery secret</label>
-    <input id="recovery_secret" name="recovery_secret" type="password" required>
-
-    <label for="confirm_recovery_secret">Confirm recovery secret</label>
-    <input id="confirm_recovery_secret" name="confirm_recovery_secret" type="password" required>
-
-    <p class="muted">Use a recovery secret with at least 8 characters. It is required to reset the password later.</p>
-
-    <div class="actions">
-      <button type="submit">Finish setup</button>
-    </div>
-  </form>
-</section>
+<div class="auth-shell">
+  <section class="card auth-card" aria-labelledby="setup-title">
+    <span class="brand-mark" aria-hidden="true">P</span>
+    <h1 id="setup-title">Set up PrepaC</h1>
+    <p>Create the local administrator account used to protect this installation.</p>
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label for="username"><span>Username</span><input id="username" name="username" type="text" value="{{ request.form.get('username', '') }}" autocomplete="username" required autofocus></label>
+      <label for="password"><span>Password</span><input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required></label>
+      <label for="confirm_password"><span>Confirm password</span><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></label>
+      <label for="recovery_secret"><span>Recovery secret</span><input id="recovery_secret" name="recovery_secret" type="password" autocomplete="off" minlength="8" required></label>
+      <label for="confirm_recovery_secret"><span>Confirm recovery secret</span><input id="confirm_recovery_secret" name="confirm_recovery_secret" type="password" autocomplete="off" minlength="8" required></label>
+      <p class="muted">Use unique, memorable values with at least eight characters. Keep the recovery secret somewhere safe.</p>
+      <div class="actions"><button type="submit">Finish setup</button></div>
+    </form>
+  </section>
+</div>
 {% endblock %}

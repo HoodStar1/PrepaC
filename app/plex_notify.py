@@ -1,11 +1,18 @@
-import requests
 from app.secret_utils import resolve_secret
 from app.plex_clean_preview import get_library_key
+from app.plex_http import (
+    MAX_PLEX_REFRESH_RESPONSE_BYTES,
+    plex_section_path,
+    request_plex_bytes,
+)
 
 def refresh_library(url, token, section_key):
-    headers = {"X-Plex-Token": token, "Accept": "application/json"}
-    r = requests.get(f"{url.rstrip('/')}/library/sections/{section_key}/refresh", headers=headers, timeout=30)
-    r.raise_for_status()
+    request_plex_bytes(
+        url,
+        token,
+        plex_section_path(section_key, "refresh"),
+        max_bytes=MAX_PLEX_REFRESH_RESPONSE_BYTES,
+    )
     return True
 
 def notify_after_clean(settings, candidates):

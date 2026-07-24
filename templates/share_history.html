@@ -1,6 +1,9 @@
 {% extends "base.html" %}
+{% block title %}Share history · PrepaC{% endblock %}
+{% block page_label %}Share history{% endblock %}
 {% block content %}
 {% set completed = jobs|selectattr("status", "equalto", "done")|list %}
+<section class="page-header"><div><span class="eyebrow">Stage 04 history</span><h1>Share history</h1><p>Destination submissions, selected categories, and remote identifiers.</p></div><a class="button secondary" href="{{ url_for('api_share_history_export') }}">Download CSV</a></section>
 <section class="card">
   <h2>Share Summary</h2>
   {% if completed %}
@@ -18,13 +21,12 @@
     {% endfor %}
   </table>
   {% else %}
-  <p>No completed share summary yet.</p>
+  <div class="empty-state"><strong>No completed shares</strong></div>
   {% endif %}
 </section>
 
 <section class="card">
   <h2>Share History</h2>
-  <p><a href="{{ url_for('api_share_history_export') }}">Download CSV</a></p>
   {% if jobs %}
   <table>
     <tr><th>Date</th><th>Job</th><th>Destination</th><th>Status</th><th>Category</th><th>Remote</th><th>Message</th></tr>
@@ -53,7 +55,7 @@
     {% endfor %}
   </table>
   {% else %}
-  <p>No share history yet.</p>
+  <div class="empty-state"><strong>No share history</strong></div>
   {% endif %}
 </section>
 {% endblock %}

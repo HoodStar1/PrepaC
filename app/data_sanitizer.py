@@ -16,15 +16,17 @@ _SENSITIVE_PATTERNS = [
     (r'token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-\.]{8,})["\']?', 'token'),
     (r'auth[_-]?token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-\.]{8,})["\']?', 'token'),
     (r'bearer\s+([a-zA-Z0-9_\-\.]{8,})', 'bearer_token'),
+    (r'(?:x-plex-token|x-prepac-metrics-token|authorization|proxy-authorization)["\']?\s*[:=]\s*["\']?([^"\'\s,;]+)', 'authorization_header'),
+    (r'(?:apikey|api_key|access_token|authToken)=([^&\s]+)', 'query_secret'),
+    (r'(?:session|csrf_token|secret_key|recovery_secret)["\']?\s*[:=]\s*["\']?([^"\'\s,;]+)', 'session_secret'),
     
     # Connection strings and URLs with credentials
-    (r'(?:mysql|postgres|mongodb|redis)://[^/]*:([^@/]+)@', 'password_in_url'),
+    (r'[a-z][a-z0-9+.-]*://[^\s/:]+:([^\s/@]+)@', 'password_in_url'),
     
     # Email addresses (optional redaction)
     # (r'([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+)', 'email'),
     
-    # File paths that might contain usernames (optional)
-    # (r'/home/([a-zA-Z0-9_\-]+)/', 'username_in_path'),
+    (r'(?i)(?:[a-z]:\\Users\\|/home/|/Users/)[^/\\\s]+', 'user_home_path'),
 ]
 
 
@@ -72,18 +74,23 @@ def redact_cli_command(cmd_list: list, unsafe_args: set = None) -> str:
             skip_next = False
             continue
         
-        # Check for unsafe flag with = separator
+        arg = str(arg)
+        # Check for unsafe flag with = separator.
         if '=' in arg:
             flag, value = arg.split('=', 1)
-            if any(flag.startswith(u) for u in unsafe_args):
+            if flag in unsafe_args:
                 redacted.append(f"{flag}=***REDACTED***")
                 continue
-        
-        # Check for unsafe flag (next arg is value)
-        if any(arg.startswith(u) for u in unsafe_args):
-            if '=' not in arg:
-                skip_next = True
-            redacted.append(arg.split('=')[0] + "=***REDACTED***" if '=' in arg else arg)
+
+        # Exact flags consume the next argument.
+        if arg in unsafe_args:
+            skip_next = True
+            redacted.append(arg)
+            continue
+
+        # RAR-style inline password flag, e.g. -pSecret.
+        if arg.startswith('-p') and not arg.startswith('--') and len(arg) > 2:
+            redacted.append('-p***REDACTED***')
             continue
         
         redacted.append(arg)

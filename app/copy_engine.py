@@ -1,11 +1,28 @@
 import os, shutil
 import time
 import logging
+import uuid
 from pathlib import Path
 from app.helpers import human_bytes, video_stats
-from app.jobs import add_job_event, set_job_status, finish_job, register_prepare_proc, unregister_prepare_proc, get_prepare_job_status
+from app.jobs import (
+    add_job_event,
+    begin_prepare_finalization,
+    finish_job,
+    get_prepare_job_status,
+    mark_prepare_outcome_unknown,
+    prepare_should_stop,
+    prepare_shutdown_requested,
+    register_prepare_proc,
+    set_job_status,
+    unregister_prepare_proc,
+)
 from app.history_db import save_prepared_item
 from app.subprocess_utils import run_command_with_output
+from app.path_guardrails import (
+    assert_no_symlinks_in_path,
+    assert_operation_pair,
+    assert_path_within_roots,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -93,8 +110,7 @@ def _wait_for_destination_space(job_id, settings, dest_path: Path, required_byte
     last_emit_ts = 0.0
     waiting = False
     while True:
-        if get_prepare_job_status(job_id).lower() == "cancelled":
-            add_job_event(job_id, "cancelled", "Prepare job stopped while waiting for free space", None)
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped while waiting for free space"):
             return False
         try:
             free_bytes, probe = _destination_free_bytes(dest_path)
@@ -148,7 +164,7 @@ def _run_rsync(cmd, job_id, settings=None):
                 last_emitted_msg = msg
 
         def _should_stop(_proc):
-            return get_prepare_job_status(job_id).lower() == "cancelled"
+            return prepare_should_stop(job_id)
 
         def _on_proc_start(proc):
             proc_ref["proc"] = proc
@@ -176,10 +192,87 @@ def _run_rsync(cmd, job_id, settings=None):
         if rc != 0:
             cmd_str = " ".join(str(a) for a in cmd)
             add_job_event(job_id, "copying", f"rsync command: {cmd_str}"[:800], None)
-        if rc == 0 or get_prepare_job_status(job_id).lower() == 'cancelled' or attempt >= attempts:
+        if rc == 0 or prepare_should_stop(job_id) or attempt >= attempts:
             return rc
         add_job_event(job_id, "copying", f"rsync attempt {attempt} failed with exit code {rc}; retrying once", None)
     return rc
+
+
+def _stop_prepare_if_requested(job_id, message="Prepare job stopped"):
+    status = get_prepare_job_status(job_id).lower()
+    if status == "cancelled":
+        return True
+    if status not in {"running", "finalizing"}:
+        return True
+    if not prepare_shutdown_requested():
+        return False
+    if status == "running":
+        add_job_event(job_id, "shutdown", message, None)
+        finish_job(job_id, False)
+    return True
+
+
+def _copy_file_atomic(job_id, source: Path, destination: Path):
+    """Copy one file without exposing a partially-written final path."""
+    if _stop_prepare_if_requested(job_id, "Prepare job stopped before writing a destination file"):
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    assert_no_symlinks_in_path(source, "copy source")
+    assert_no_symlinks_in_path(destination, "copy destination")
+    temporary = destination.parent / f".{destination.name}.prepac-{uuid.uuid4().hex}.part"
+    try:
+        shutil.copy2(source, temporary)
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before committing a destination file"):
+            return False
+        os.replace(temporary, destination)
+        return True
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _copy_files_with_python(job_id, source_root: Path, dest_root: Path, files):
+    """Cross-platform rsync fallback used by direct Windows installs."""
+    files = [Path(item) for item in files]
+    total = len(files)
+    for index, source_file in enumerate(files, start=1):
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped during file copy"):
+            return False
+        source_file = assert_path_within_roots(
+            source_file, [source_root], "copy source file",
+            require_exists=True, require_directory=False,
+        )
+        relative = source_file.relative_to(source_root)
+        destination = dest_root / relative
+        assert_path_within_roots(destination, [dest_root], "copy destination file")
+        if not _copy_file_atomic(job_id, source_file, destination):
+            return False
+        percent = 20 + int((index / max(1, total)) * 60)
+        add_job_event(job_id, "copying", f"Copied {index} of {total} video files", percent)
+    return True
+
+
+def _validated_tv_payload(settings, payload):
+    from app.prepare_tv import preview_tv
+
+    return preview_tv(
+        settings,
+        payload.get("show_name", ""),
+        payload.get("season_name", ""),
+        payload.get("chosen_bracket", ""),
+    )
+
+
+def _validated_movie_payload(settings, payload):
+    from app.prepare_movie import preview_movie
+
+    return preview_movie(
+        settings,
+        payload.get("movie_name", ""),
+        payload.get("chosen_bracket", ""),
+    )
 
 def _chmod_chown(dest_path, settings):
     perm = _permission_pair(settings)
@@ -218,10 +311,25 @@ def _apply_open_permissions_recursive(root_path):
 
 
 def run_tv_prepare(job_id, settings, payload):
-    source_path = Path(payload["source_path"]); dest_path = Path(payload["dest_path"]); files = [Path(p) for p in payload["video_files"]]
     try:
+        # Rebuild all filesystem paths from server configuration and stable
+        # names. Browser-authored source/destination/file arrays are ignored.
+        payload = _validated_tv_payload(settings, payload)
+        source_path, dest_path = assert_operation_pair(
+            payload["source_path"], payload["dest_path"], settings,
+            "prepare_tv_source", "prepare_destination",
+            source_label="TV prepare source", destination_label="TV prepare destination",
+        )
+        files = [
+            assert_path_within_roots(
+                p, [source_path], "TV prepare file",
+                require_exists=True, require_directory=False,
+            )
+            for p in payload["video_files"]
+        ]
         # status may already be atomically claimed as running
-        set_job_status(job_id, "running", str(dest_path))
+        if not set_job_status(job_id, "running", str(dest_path)):
+            return
         if not source_path.exists():
             add_job_event(job_id, "copying", f"Source path does not exist: {source_path}", 100)
             finish_job(job_id, False); return
@@ -230,9 +338,13 @@ def run_tv_prepare(job_id, settings, payload):
         required_bytes = max(0, src_bytes - _dest_video_bytes(dest_path)) + reserve_bytes
         if not _wait_for_destination_space(job_id, settings, dest_path, required_bytes, 5):
             return
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before creating the destination"):
+            return
         add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
-        dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
-        add_job_event(job_id, "copying", "Starting rsync copy for TV season video files...", 15)
+        dest_path.mkdir(parents=True, exist_ok=True)
+        assert_no_symlinks_in_path(dest_path, "TV prepare destination")
+        _chmod_chown(dest_path, settings)
+        add_job_event(job_id, "copying", "Starting TV season video copy...", 15)
         include_args = ["--include=*/"]
         for ext in VIDEO_EXTS: include_args.extend([f"--include=*.{ext}", f"--include=*.{ext.upper()}"])
         include_args.append("--exclude=*")
@@ -242,14 +354,19 @@ def run_tv_prepare(job_id, settings, payload):
             f"--timeout={io_timeout}",
             "--info=progress2,name0",
         ] + include_args + [str(source_path) + "/", str(dest_path) + "/"]
-        add_job_event(job_id, "copying", f"Running: {' '.join(cmd)}"[:800], None)
-        rc = _run_rsync(cmd, job_id, settings=settings)
+        if shutil.which("rsync"):
+            add_job_event(job_id, "copying", f"Running: {' '.join(cmd)}"[:800], None)
+            rc = _run_rsync(cmd, job_id, settings=settings)
+        else:
+            add_job_event(job_id, "copying", "rsync is unavailable; using the built-in copy engine", None)
+            rc = 0 if _copy_files_with_python(job_id, source_path, dest_path, files) else 130
         if rc != 0:
-            if get_prepare_job_status(job_id).lower() == 'cancelled':
-                add_job_event(job_id, 'cancelled', 'Prepare job stopped by user', None)
+            if _stop_prepare_if_requested(job_id, "Prepare job stopped during TV copy"):
                 return
             add_job_event(job_id, "copying", f"rsync failed with exit code {rc}", 100)
             finish_job(job_id, False)
+            return
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before verification"):
             return
         add_job_event(job_id, "verifying", "Verifying copied video files...", 85)
         dest_files = [p for p in dest_path.rglob("*") if p.is_file() and p.suffix.lower().lstrip(".") in VIDEO_EXTS]
@@ -257,17 +374,38 @@ def run_tv_prepare(job_id, settings, payload):
         if dest_count < src_count or dest_bytes < src_bytes:
             add_job_event(job_id, "verifying", f"Verification failed: source {src_count} files / {human_bytes(src_bytes)}, dest {dest_count} files / {human_bytes(dest_bytes)}", 100)
             finish_job(job_id, False); return
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before finalization"):
+            return
+        if not begin_prepare_finalization(job_id):
+            return
         _apply_open_permissions_recursive(dest_path)
         save_prepared_item("tv", str(source_path), payload.get("source_rel",""), [str(p) for p in files], str(dest_path), src_bytes, dest_bytes, payload.get("detected_tags",{}), payload.get("chosen_bracket",""), settings.get("end_tag","CbHS"))
         add_job_event(job_id, "completed", f"TV prepare completed. Copied {src_count} files, {human_bytes(dest_bytes)}.", 100); finish_job(job_id, True)
     except Exception as e:
-        add_job_event(job_id, "failed", f"Unhandled error: {e}", 100); finish_job(job_id, False)
+        current_status = get_prepare_job_status(job_id).lower()
+        if current_status == "finalizing":
+            mark_prepare_outcome_unknown(
+                job_id,
+                "Prepare finalization failed after the commit boundary; verify and clean the destination before force retry.",
+            )
+        elif current_status not in {"cancelled", "failed", "outcome_unknown"}:
+            add_job_event(job_id, "failed", f"Unhandled error: {e}", 100); finish_job(job_id, False)
 
 def run_movie_prepare(job_id, settings, payload):
-    source_file = Path(payload["source_file"]); source_path = Path(payload["source_path"]); dest_path = Path(payload["dest_path"])
     try:
+        payload = _validated_movie_payload(settings, payload)
+        source_path, dest_path = assert_operation_pair(
+            payload["source_path"], payload["dest_path"], settings,
+            "prepare_movie_source", "prepare_destination",
+            source_label="movie prepare source", destination_label="movie prepare destination",
+        )
+        source_file = assert_path_within_roots(
+            payload["source_file"], [source_path], "movie prepare file",
+            require_exists=True, require_directory=False,
+        )
         # status may already be atomically claimed as running
-        set_job_status(job_id, "running", str(dest_path))
+        if not set_job_status(job_id, "running", str(dest_path)):
+            return
         if not source_file.exists():
             add_job_event(job_id, "copying", f"Source file does not exist: {source_file}", 100)
             finish_job(job_id, False); return
@@ -278,8 +416,12 @@ def run_movie_prepare(job_id, settings, payload):
         required_bytes = max(0, src_bytes - existing_bytes) + reserve_bytes
         if not _wait_for_destination_space(job_id, settings, dest_path, required_bytes, 5):
             return
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before creating the destination"):
+            return
         add_job_event(job_id, "creating destination", f"Creating {dest_path}", 5)
-        dest_path.mkdir(parents=True, exist_ok=True); _chmod_chown(dest_path, settings)
+        dest_path.mkdir(parents=True, exist_ok=True)
+        assert_no_symlinks_in_path(dest_path, "movie prepare destination")
+        _chmod_chown(dest_path, settings)
         add_job_event(job_id, "copying", f"Copying largest non-trailer file: {source_file.name}", 20)
         io_timeout = _int_setting(settings, "prepare_rsync_io_timeout_seconds", "PREPAC_PREPARE_RSYNC_IO_TIMEOUT_SECONDS", 600, 60)
         cmd = [
@@ -288,22 +430,38 @@ def run_movie_prepare(job_id, settings, payload):
             "--info=progress2,name0",
             str(source_file), str(dest_path) + "/"
         ]
-        add_job_event(job_id, "copying", f"Running: {' '.join(cmd)}"[:800], None)
-        rc = _run_rsync(cmd, job_id, settings=settings)
+        if shutil.which("rsync"):
+            add_job_event(job_id, "copying", f"Running: {' '.join(cmd)}"[:800], None)
+            rc = _run_rsync(cmd, job_id, settings=settings)
+        else:
+            add_job_event(job_id, "copying", "rsync is unavailable; using the built-in copy engine", None)
+            rc = 0 if _copy_files_with_python(job_id, source_path, dest_path, [source_file]) else 130
         if rc != 0:
-            if get_prepare_job_status(job_id).lower() == 'cancelled':
-                add_job_event(job_id, 'cancelled', 'Prepare job stopped by user', None)
+            if _stop_prepare_if_requested(job_id, "Prepare job stopped during movie copy"):
                 return
             add_job_event(job_id, "copying", f"rsync failed with exit code {rc}", 100)
             finish_job(job_id, False)
+            return
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before verification"):
             return
         add_job_event(job_id, "verifying", "Verifying copied file...", 85)
         dest_bytes = copied.stat().st_size if copied.exists() else 0
         if dest_bytes < src_bytes:
             add_job_event(job_id, "verifying", f"Verification failed: source {human_bytes(src_bytes)}, dest {human_bytes(dest_bytes)}", 100)
             finish_job(job_id, False); return
+        if _stop_prepare_if_requested(job_id, "Prepare job stopped before finalization"):
+            return
+        if not begin_prepare_finalization(job_id):
+            return
         _apply_open_permissions_recursive(dest_path)
         save_prepared_item("movie", str(source_path), payload.get("source_rel",""), [str(source_file)], str(dest_path), src_bytes, dest_bytes, payload.get("detected_tags",{}), payload.get("chosen_bracket",""), settings.get("end_tag","CbHS"))
         add_job_event(job_id, "completed", f"Movie prepare completed. Copied {source_file.name}, {human_bytes(dest_bytes)}.", 100); finish_job(job_id, True)
     except Exception as e:
-        add_job_event(job_id, "failed", f"Unhandled error: {e}", 100); finish_job(job_id, False)
+        current_status = get_prepare_job_status(job_id).lower()
+        if current_status == "finalizing":
+            mark_prepare_outcome_unknown(
+                job_id,
+                "Prepare finalization failed after the commit boundary; verify and clean the destination before force retry.",
+            )
+        elif current_status not in {"cancelled", "failed", "outcome_unknown"}:
+            add_job_event(job_id, "failed", f"Unhandled error: {e}", 100); finish_job(job_id, False)

@@ -1,10 +1,17 @@
 services:
   prepac:
     build: .
+    # The Docker image intentionally supports Linux AMD64 only.
+    platform: linux/amd64
+    # Optional non-root execution. Ensure every mounted path is writable by
+    # these numeric IDs before setting PREPAC_UID and PREPAC_GID.
+    user: "${PREPAC_UID:-0}:${PREPAC_GID:-0}"
     container_name: prepac
     ports:
       - "1234:1234"
     environment:
+      PREPAC_CONFIG_DIR: /config
+      PREPAC_SQLITE_JOURNAL_MODE: DELETE
       PREPAC_LOG_LEVEL: INFO
       PREPAC_LOG_JSON: "false"
     volumes:

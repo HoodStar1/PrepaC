@@ -2,7 +2,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-import os
+import uuid
 
 from app.plex_clean_preview import media_root_storage_paths, path_size, container_to_host_user_path
 YOUTUBE_ROOT_ALIASES = ["/media/youtube", "/media/Youtube Downloads", "/host_mnt/user/Youtube Downloads", "/mnt/user/Youtube Downloads"]
@@ -31,29 +31,32 @@ def _youtube_parent_folder_target(target_path: str):
         parent = p.parent
         return str(parent) if parent and str(parent) not in YOUTUBE_ROOT_ALIASES else None
     return None
-    low = text.lower()
-    if not any(low.startswith(alias.lower() + "/") or low == alias.lower() for alias in YOUTUBE_ROOT_ALIASES):
-        return None
-    parent = p.parent
-    if parent and str(parent) not in YOUTUBE_ROOT_ALIASES:
-        return str(parent)
-    return None
 
 from app.clean_actions import log_clean_action
 from app.db import load_settings
-from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
+from app.path_guardrails import (
+    assert_no_symlinks_in_path,
+    assert_operation_path,
+    assert_path_within_roots,
+    assert_paths_disjoint,
+)
+from app.plex_clean_preview import clean_candidate_id
 
 def _safe_name(p: str) -> str:
     return p.replace(":", "_").replace("\\", "_").replace("/", "_").strip("_")
 
 def move_to_recycle(targets, recycle_root):
+    assert_no_symlinks_in_path(recycle_root, "recycle root")
     recycle_root.mkdir(parents=True, exist_ok=True)
+    assert_no_symlinks_in_path(recycle_root, "recycle root")
     moved = []
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     for p in targets:
         if not p.exists():
             continue
-        dest = recycle_root / f"{timestamp}__{_safe_name(str(p))}"
+        assert_no_symlinks_in_path(p, "recycle source")
+        dest = recycle_root / f"{timestamp}_{uuid.uuid4().hex[:8]}__{_safe_name(str(p))}"
+        assert_path_within_roots(dest, [recycle_root], "recycle destination")
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(p), str(dest))
         moved.append({"from": str(p), "to": str(dest)})
@@ -190,17 +193,39 @@ def _is_season_like_folder(path_obj: Path) -> bool:
         return True
     return False
 
+
+def _validated_execution_targets(target_path):
+    targets = execution_paths(str(target_path))
+    safe = []
+    for target in targets:
+        target = Path(target)
+        assert_no_symlinks_in_path(target, "clean execution target")
+        resolved = target.resolve(strict=False)
+        if not resolved.anchor or resolved == Path(resolved.anchor):
+            raise RuntimeError("Clean execution target cannot be a filesystem root")
+        safe.append(target)
+    return safe
+
 def delete_candidate(candidate, dry_run=True, use_recycle_bin=True, recycle_bin_root="/media/dest/.prepac_recycle"):
     settings = load_settings()
-    allowed_roots = build_allowed_roots(settings)
+    settings = dict(settings or {})
+    settings["recycle_bin_root"] = str(recycle_bin_root)
+    supplied_id = str(candidate.get("candidate_id", "") or "").strip()
+    if not supplied_id or supplied_id != clean_candidate_id(candidate):
+        raise RuntimeError("Clean candidate identity is invalid; refresh the preview")
     target = candidate["target_path"]
     effective_target = _youtube_parent_folder_target(target) or target
     if effective_target != target:
         details_hint = {"youtube_parent_folder_target": effective_target}
     else:
         details_hint = {}
-    assert_no_parent_traversal(effective_target, "clean target")
-    assert_path_within_roots(effective_target, allowed_roots, "clean target")
+    effective_target = assert_operation_path(
+        effective_target, settings, "clean_target", "clean target",
+    )
+    recycle_root = assert_operation_path(
+        recycle_bin_root, settings, "clean_recycle", "recycle root", allow_root=True,
+    )
+    assert_paths_disjoint(effective_target, recycle_root, "clean target", "recycle root")
     breakdown_targets = media_root_storage_paths(effective_target)
     if not breakdown_targets:
         host_user = container_to_host_user_path(target)
@@ -232,13 +257,20 @@ def delete_candidate(candidate, dry_run=True, use_recycle_bin=True, recycle_bin_
 
     if not dry_run:
         try:
-            exec_targets = execution_paths(effective_target)
+            # Revalidate immediately before the destructive operation.
+            effective_target = assert_operation_path(
+                effective_target, settings, "clean_target", "clean target",
+            )
+            exec_targets = _validated_execution_targets(effective_target)
             if use_recycle_bin:
-                assert_no_parent_traversal(recycle_bin_root, "recycle root")
-                assert_path_within_roots(recycle_bin_root, allowed_roots, "recycle root")
-                moved = move_to_recycle(exec_targets, Path(recycle_bin_root))
+                recycle_root = assert_operation_path(
+                    recycle_root, settings, "clean_recycle", "recycle root", allow_root=True,
+                )
+                assert_paths_disjoint(effective_target, recycle_root, "clean target", "recycle root")
+                moved = move_to_recycle(exec_targets, recycle_root)
                 if extra_show_folder_remove and extra_show_folder_remove.exists():
-                    moved += move_to_recycle([extra_show_folder_remove], Path(recycle_bin_root))
+                    assert_operation_path(extra_show_folder_remove, settings, "clean_target", "show folder")
+                    moved += move_to_recycle([extra_show_folder_remove], recycle_root)
                     details["removed_show_folder_because_only_season"] = str(extra_show_folder_remove)
                     message = "moved season folder and show folder to recycle bin"
                 else:
@@ -247,6 +279,7 @@ def delete_candidate(candidate, dry_run=True, use_recycle_bin=True, recycle_bin_
             else:
                 removed = []
                 for p in exec_targets:
+                    assert_no_symlinks_in_path(p, "clean execution target")
                     if p.is_dir():
                         shutil.rmtree(p)
                         removed.append(str(p))
@@ -254,6 +287,8 @@ def delete_candidate(candidate, dry_run=True, use_recycle_bin=True, recycle_bin_
                         p.unlink()
                         removed.append(str(p))
                 if extra_show_folder_remove and extra_show_folder_remove.exists():
+                    assert_operation_path(extra_show_folder_remove, settings, "clean_target", "show folder")
+                    assert_no_symlinks_in_path(extra_show_folder_remove, "show folder")
                     shutil.rmtree(extra_show_folder_remove)
                     removed.append(str(extra_show_folder_remove))
                     details["removed_show_folder_because_only_season"] = str(extra_show_folder_remove)

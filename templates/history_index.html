@@ -1,29 +1,13 @@
 {% extends "base.html" %}
+{% block title %}History · PrepaC{% endblock %}
+{% block page_label %}Workflow history{% endblock %}
 {% block content %}
-<section class="card">
-  <h2>History</h2>
-  <p>Browse completed work and previous actions.</p>
-  <div class="history-grid">
-    <a class="card history-choice" href="{{ url_for('history_prepare_page') }}">
-      <h3>Prepare History</h3>
-      <p>Prepared jobs.</p>
-    </a>
-    <a class="card history-choice" href="{{ url_for('history_clean_page') }}">
-      <h3>Clean History</h3>
-      <p>Cleaning actions.</p>
-    </a>
-    <a class="card history-choice" href="{{ url_for('history_packing_page') }}">
-      <h3>Packing History</h3>
-      <p>Packed jobs.</p>
-    </a>
-      <a class="card history-choice" href="{{ url_for('history_posting_page') }}">
-      <h3>Posting History</h3>
-      <p>Posted jobs.</p>
-    </a>
-    <a class="card history-choice" href="{{ url_for('history_share_page') }}">
-      <h3>Share History</h3>
-      <p>Submitted share jobs.</p>
-    </a>
+<section class="page-header"><div><span class="eyebrow">Library</span><h1>History</h1><p>Review completed work, previous actions, detailed events, and exportable records.</p></div></section>
+<div class="history-grid">
+  <a class="card history-choice" href="{{ url_for('history_prepare_page') }}"><span class="eyebrow">Stage 01</span><h2>Prepare</h2><p>Copied media, generated destinations, and job events.</p></a>
+  <a class="card history-choice" href="{{ url_for('history_packing_page') }}"><span class="eyebrow">Stage 02</span><h2>Packing</h2><p>RAR/PAR2 output, durations, and generated artifacts.</p></a>
+  <a class="card history-choice" href="{{ url_for('history_posting_page') }}"><span class="eyebrow">Stage 03</span><h2>Posting</h2><p>Provider-backed uploads and resulting NZB artifacts.</p></a>
+  <a class="card history-choice" href="{{ url_for('history_share_page') }}"><span class="eyebrow">Stage 04</span><h2>Share</h2><p>Destination submissions, categories, and remote IDs.</p></a>
+  <a class="card history-choice" href="{{ url_for('history_clean_page') }}"><span class="eyebrow">Maintenance</span><h2>Clean</h2><p>Dry runs, recycle actions, removals, and disk changes.</p></a>
 </div>
-</section>
 {% endblock %}

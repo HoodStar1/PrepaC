@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% block title %}Prepare history · PrepaC{% endblock %}
+{% block page_label %}Prepare history{% endblock %}
 {% block content %}
+<section class="page-header"><div><span class="eyebrow">Stage 01 history</span><h1>Prepare history</h1><p>Completed media copies and terminal Prepare jobs.</p></div><a class="button secondary" href="{{ url_for('api_history_export') }}">Download CSV</a></section>
 <section class="card">
-  <h2>Prepared History</h2>
-  <p><a href="{{ url_for('api_history_export') }}">Download CSV</a></p>
+  <div class="section-heading"><div><h2>Prepared items</h2><p>Recorded source and destination details.</p></div></div>
   {% if history %}
   <table>
     <tr><th>ID</th><th>Type</th><th>Source</th><th>Destination</th><th>Size</th><th>Time</th><th>Bracket</th><th>End Tag</th><th>Date</th></tr>
@@ -15,11 +17,11 @@
     <tr><td colspan="9"><details><summary>Copied files / tags</summary><p><strong>Copied files:</strong></p><pre>{{ h.copied_files_json|prettyjson }}</pre><p><strong>Detected tags:</strong></p><pre>{{ h.detected_tags_json|prettyjson }}</pre></details></td></tr>
     {% endfor %}
   </table>
-  {% else %}<p>No history yet.</p>{% endif %}
+  {% else %}<div class="empty-state"><strong>No prepared item history</strong></div>{% endif %}
 </section>
 
 <section class="card">
-  <h2>Prepare Job History</h2>
+  <div class="section-heading"><div><h2>Prepare job history</h2><p>Terminal job status and events.</p></div></div>
   {% if prepare_jobs %}
   <table>
     <tr><th>ID</th><th>Type</th><th>Status</th><th>Source</th><th>Destination</th><th>Time</th><th>Date</th></tr>
@@ -31,6 +33,6 @@
     <tr><td colspan="7"><details><summary>Details / Events</summary><p><strong>Phase:</strong> {{ j.phase or '' }}</p><p><strong>Message:</strong> {{ j.message or '' }}</p><pre>{{ j.events|prettyjson }}</pre></details></td></tr>
     {% endfor %}
   </table>
-  {% else %}<p>No prepare job history yet.</p>{% endif %}
+  {% else %}<div class="empty-state"><strong>No Prepare job history</strong></div>{% endif %}
 </section>
 {% endblock %}

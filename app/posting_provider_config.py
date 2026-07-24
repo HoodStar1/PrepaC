@@ -9,6 +9,7 @@ POSTING_PROVIDER_KEYS = {
     "password",
     "connections",
     "max_connections",
+    "account_group",
     "priority_up_to_gb",
 }
 

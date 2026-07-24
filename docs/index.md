@@ -1,11 +1,19 @@
-# Documentation
+# PrepaC documentation
 
-Use these guides for setup, settings, workflow, usage, and troubleshooting.
+PrepaC combines Prepare, Packing, Posting, Share, and Clean workflows in one self-hosted web app.
 
-## Highlights in this release line
+## Start here
 
-- Posting providers can be managed from a dynamic builder in Settings.
-- Existing Provider 1 and Provider 2 setups carry forward automatically.
-- Providers after Provider 1 can use **Prioritize jobs up to (GB)** for small-job routing.
-- Active Share jobs can be cancelled or removed from the Share screen.
-- Completed, failed, and cancelled Share jobs can be reviewed in Share History.
+1. Confirm your deployment is in the [supported platform matrix](platforms.md).
+2. Follow [Setup](setup.md) for Docker, direct Linux, or direct Windows.
+3. Configure paths and providers in [Settings](settings.md).
+4. Review [Operations](operations.md) before upgrading or running unattended jobs.
+
+Docker on Linux AMD64 is the recommended deployment. Direct Linux x86-64 and Windows x64 installs are supported with Python 3.13 or 3.14 and the required host tools. macOS and ARM64 are not supported.
+
+## Workflow guides
+
+- [Workflows](workflows.md) describes Prepare, Packing, Posting, Share, and Clean.
+- [Usage](usage.md) covers day-to-day behavior.
+- [Troubleshooting](troubleshooting.md) maps common failures to checks.
+- [Dependencies](dependencies.md) documents version locks and update procedure.

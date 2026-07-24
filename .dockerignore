@@ -10,8 +10,12 @@ __pycache__/
 .ruff_cache/
 .git/
 .github/
+.agents/
+.codex/
 .venv/
 venv/
 env/
 config/
 backups/
+GITHUB UPLOAD/
+docker-compose.yml

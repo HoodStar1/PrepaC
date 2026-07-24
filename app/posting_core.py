@@ -1,5 +1,5 @@
 import json
-import math
+import hashlib
 import os
 import random
 import re
@@ -7,9 +7,9 @@ import shutil
 import shlex
 import subprocess
 import time
-import pty
-import select
 import datetime
+import queue
+import threading
 from collections import deque
 from pathlib import Path
 from app.name_randomizer_data import RANDOMIZER_TEXT
@@ -19,29 +19,42 @@ from app.cache_store import SCAN_CACHE
 from app.metrics import inc, observe
 from app.subprocess_utils import run_command_with_output, terminate_process
 from app.workflow_paths import posting_nzb_root, posting_posted_root, posting_watch_root
-from app.packing_jobs import list_packing_history, has_large_running_packing_job
-from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
+from app.packing_jobs import list_packing_history
+from app.path_guardrails import (
+    assert_no_symlinks_in_path,
+    assert_operation_path,
+    assert_paths_disjoint,
+    assert_tree_has_no_symlinks,
+)
 from app.posting_jobs import (
     add_posting_event,
+    begin_posting_finalization,
     create_posting_job,
     finish_posting,
-    get_running_provider_names,
+    mark_posting_outcome_unknown,
     try_claim_posting_provider,
-    has_successful_posting,
-    start_posting,
     update_posting_job,
+    reset_posting_to_queued_if_active,
     get_existing_active_posting_job_id,
     has_outdated_or_missing_successful_posting,
     latest_successful_posting_job_id,
     reconcile_orphaned_running_posting_jobs,
-    has_large_queued_posting_job,
     get_posting_job_status,
     register_posting_proc,
     unregister_posting_proc,
 )
 
+try:
+    import pty
+    import select
+except ImportError:  # Windows has no POSIX pseudo-terminal module.
+    pty = None
+    select = None
+
 GB = 1024 ** 3
 POSTING_ACTIVE_JOB_IDS = set()
+POSTING_SCHEDULED_JOB_IDS = set()
+POSTING_JOB_SET_LOCK = threading.Lock()
 POSTING_PROVIDER_COOLDOWNS = {}
 NNTP_CONNECTION_FAILURE_MARKERS = (
     "nntperror",
@@ -49,6 +62,8 @@ NNTP_CONNECTION_FAILURE_MARKERS = (
     "unexpected response to auth pass",
     "too many connections",
     "code: 482",
+    "code: 502",
+    "max number of simultaneous ips",
     "connect timed out",
     "connection timed out",
     "disconnect timed out",
@@ -78,6 +93,35 @@ def _provider_id(value, fallback_idx):
     return value or f"provider{fallback_idx}"
 
 
+def _provider_group_id(value):
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _provider_lock_name(provider):
+    provider = provider or {}
+    account_group = _provider_group_id(provider.get("account_group", ""))
+    if account_group:
+        return f"account:{account_group}"
+    return str(provider.get("name") or provider.get("id") or "").strip()
+
+
+def _provider_lock_label(provider):
+    provider = provider or {}
+    account_group = _provider_group_id(provider.get("account_group", ""))
+    if account_group:
+        return f"account group {account_group}"
+    return str(provider.get("name") or provider.get("id") or "provider").strip()
+
+
+def _provider_choice_label(provider):
+    provider = provider or {}
+    name = str(provider.get("name") or provider.get("id") or "provider").strip()
+    lock_label = str(provider.get("provider_lock_label") or _provider_lock_label(provider)).strip()
+    if lock_label and lock_label != name:
+        return f"{name} ({lock_label})"
+    return name
+
+
 def _normalized_provider_dict(item, idx, fallback_priority_up_to_gb="0"):
     item = dict(item or {})
     priority_value = item.get("priority_up_to_gb", fallback_priority_up_to_gb)
@@ -92,6 +136,7 @@ def _normalized_provider_dict(item, idx, fallback_priority_up_to_gb="0"):
         "password": str(item.get("password", "") or ""),
         "connections": str(item.get("connections", "25") or "25").strip(),
         "max_connections": str(item.get("max_connections", item.get("connections", "25")) or item.get("connections", "25") or "25").strip(),
+        "account_group": _provider_group_id(item.get("account_group", "")),
         "priority_up_to_gb": str(priority_value if priority_value is not None else "0").strip() or "0",
     }
 
@@ -262,6 +307,11 @@ def update_template_groups(template_text: str, groups_csv: str):
     return "Group: " + groups_csv + "\n" + template_text
 
 
+def posting_candidate_id(packed_root):
+    canonical = str(Path(packed_root).resolve(strict=False))
+    return "posting:" + hashlib.sha256(canonical.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
+
+
 def scan_posting_candidates(settings):
     reconcile_orphaned_posting_jobs_in_process()
     packed_root = posting_watch_root(settings)
@@ -288,7 +338,7 @@ def scan_posting_candidates(settings):
             latest_packing_finished[packed_path] = finished_at
 
     for item in sorted(packed_root.iterdir()):
-        if not item.is_dir() or item.name == "output files":
+        if not item.is_dir() or item.is_symlink() or item.name == "output files":
             continue
         template = output_root / item.name / "template.txt"
         if not template.exists():
@@ -301,6 +351,7 @@ def scan_posting_candidates(settings):
         size_bytes = _packed_root_size_bytes(item)
         info = parse_template_info(template)
         results.append({
+            "candidate_id": posting_candidate_id(item),
             "job_name": item.name,
             "packed_root": packed_path,
             "output_files_root": str(output_root / item.name),
@@ -311,6 +362,15 @@ def scan_posting_candidates(settings):
         })
     observe("prepac_scan_seconds", max(0.0, time.time() - started), kind="posting")
     return SCAN_CACHE.set(cache_key, results, ttl_seconds=15)
+
+
+def resolve_posting_candidate(candidate_id, settings):
+    candidate_id = str(candidate_id or "").strip()
+    candidates = {item["candidate_id"]: item for item in scan_posting_candidates(settings)}
+    candidate = candidates.get(candidate_id)
+    if not candidate:
+        raise ValueError("Posting candidate is no longer available; refresh the list.")
+    return candidate
 
 
 def provider_config(settings, idx):
@@ -535,6 +595,8 @@ def _provider_priority_candidates(settings, size_bytes):
             continue
         threshold_gb = _provider_priority_threshold(provider, 0.0)
         candidate = dict(provider, name=provider.get("id") or f"provider{idx + 1}", provider_index=idx)
+        candidate["provider_lock"] = _provider_lock_name(candidate)
+        candidate["provider_lock_label"] = _provider_lock_label(candidate)
         if idx > 0 and threshold_gb > 0:
             if size_gb <= threshold_gb:
                 positive_matches.append((threshold_gb, idx, candidate))
@@ -588,9 +650,10 @@ def wait_for_provider(settings, size_bytes, job_id):
         candidates = []
         cooldown_notes = []
         for provider in configured_candidates:
-            remaining = _provider_cooldown_remaining(provider.get("name") or provider.get("id"))
+            provider_lock = provider.get("provider_lock") or _provider_lock_name(provider)
+            remaining = _provider_cooldown_remaining(provider_lock)
             if remaining > 0:
-                cooldown_notes.append(f"{provider.get('name') or provider.get('id')} cooling down for {remaining}s")
+                cooldown_notes.append(f"{_provider_choice_label(provider)} cooling down for {remaining}s")
                 continue
             candidates.append(provider)
 
@@ -604,15 +667,15 @@ def wait_for_provider(settings, size_bytes, job_id):
         else:
             no_candidate_started = None
         for provider in candidates:
-            if try_claim_posting_provider(job_id, provider["name"]):
+            provider_lock = provider.get("provider_lock") or _provider_lock_name(provider)
+            if try_claim_posting_provider(job_id, provider["name"], provider_lock):
                 return provider
 
         attempt_count += 1
-        update_posting_job(job_id, status="queued", provider_used="")
-        if get_posting_job_status(job_id).lower() == "cancelled":
+        if not reset_posting_to_queued_if_active(job_id):
             raise RuntimeError("Posting job cancelled")
         if candidates:
-            priority_names = ", ".join(str(provider.get("name") or provider.get("id") or "provider") for provider in candidates[:4])
+            priority_names = ", ".join(_provider_choice_label(provider) for provider in candidates[:4])
             msg = f"Waiting for an available posting provider (priority order: {priority_names})"
         elif cooldown_notes:
             msg = "Waiting for posting provider cooldown: " + "; ".join(cooldown_notes[:4])
@@ -676,7 +739,18 @@ def compress_nzb_with_rar(nzb_path: Path, output_rar: Path):
     output_rar.parent.mkdir(parents=True, exist_ok=True)
     if output_rar.exists():
         output_rar.unlink()
-    subprocess.run(["rar", "a", "-ep1", str(output_rar), str(nzb_path)], check=True, cwd=str(nzb_path.parent))
+    assert_no_symlinks_in_path(nzb_path, "NZB input")
+    assert_no_symlinks_in_path(output_rar, "NZB archive output")
+    rc, output = run_command_with_output(
+        ["rar", "a", "-ep", str(output_rar), str(nzb_path)],
+        cwd=str(nzb_path.parent),
+        start_new_session=True,
+        runtime_timeout_seconds=300,
+        inactivity_timeout_seconds=120,
+        max_output_bytes=1024 * 1024,
+    )
+    if rc != 0:
+        raise RuntimeError(f"RAR could not compress the NZB (exit {rc}): {output[-500:]}")
 
 
 def read_log_tail(path: Path, max_lines: int = 60):
@@ -737,7 +811,7 @@ def clear_posting_live(job_id):
     ACTIVE_POSTING_OUTPUT.pop(int(job_id), None)
     ACTIVE_POSTING_STATS.pop(int(job_id), None)
 
-def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_seconds=None, no_article_progress_timeout_seconds=None):
+def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_seconds=None, no_article_progress_timeout_seconds=None, runtime_timeout_seconds=None):
     state = {
         "total_articles": 0,
         "total_files": 0,
@@ -756,23 +830,82 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
 
     silence_timeout = int(silence_timeout_seconds or POSTING_SILENCE_TIMEOUT_SECONDS)
     no_article_timeout = int(no_article_progress_timeout_seconds or POSTING_NO_ARTICLE_PROGRESS_TIMEOUT_SECONDS)
+    runtime_timeout = max(3600, int(runtime_timeout_seconds or 604800))
+    started_monotonic = time.monotonic()
 
-    master_fd, slave_fd = pty.openpty()
     env = dict(os.environ)
     env.setdefault("TERM", "xterm")
+    master_fd = None
+    output_queue = None
+    output_reader = None
+    output_eof = {"done": False}
+    use_pty = bool(pty is not None and select is not None and os.name != "nt")
+    if use_pty:
+        master_fd, slave_fd = pty.openpty()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            text=False,
+            cwd=str(cwd),
+            env=env,
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave_fd)
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        text=False,
-        cwd=str(cwd),
-        env=env,
-        close_fds=True,
-        start_new_session=True,
-    )
-    os.close(slave_fd)
+        def read_chunk():
+            ready, _, _ = select.select([master_fd], [], [], 1.0)
+            if not ready:
+                return b""
+            try:
+                data = os.read(master_fd, 4096)
+                if not data:
+                    output_eof["done"] = True
+                return data
+            except OSError:
+                output_eof["done"] = True
+                return b""
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            cwd=str(cwd),
+            env=env,
+            close_fds=True,
+            creationflags=creationflags,
+            start_new_session=(os.name != "nt"),
+        )
+        output_queue = queue.Queue(maxsize=256)
+
+        def pipe_reader():
+            try:
+                while True:
+                    data = proc.stdout.read(4096) if proc.stdout else b""
+                    if not data:
+                        break
+                    output_queue.put(data)
+            finally:
+                output_queue.put(None)
+
+        output_reader = threading.Thread(target=pipe_reader, daemon=True)
+        output_reader.start()
+
+        def read_chunk():
+            try:
+                data = output_queue.get(timeout=1.0)
+            except queue.Empty:
+                return b""
+            if data is None:
+                output_eof["done"] = True
+                return b""
+            return data
+
     register_posting_proc(job_id, proc)
 
     pending = ""
@@ -782,14 +915,15 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
                 terminate_process(proc)
                 break
 
-            ready, _, _ = select.select([master_fd], [], [], 1.0)
-            if ready:
-                try:
-                    chunk = os.read(master_fd, 4096)
-                except OSError:
-                    chunk = b""
-                if chunk:
+            chunk = read_chunk()
+            if chunk:
                     pending += chunk.decode("utf-8", errors="replace")
+                    if len(pending) > 65536 and "\n" not in pending:
+                        line, pending = pending[:-65536], pending[-65536:]
+                        logf.write(line)
+                        logf.flush()
+                        _append_live_output(job_id, line[-2000:])
+                        state["last_output_monotonic"] = time.monotonic()
                     while "\n" in pending:
                         line, pending = pending.split("\n", 1)
                         line = line.rstrip("\r")
@@ -903,6 +1037,16 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
 
             if proc.poll() is None:
                 now_mono = time.monotonic()
+                runtime_age = now_mono - started_monotonic
+                if runtime_age >= runtime_timeout:
+                    state["watchdog_error"] = (
+                        f"Nyuu exceeded the {runtime_timeout}s runtime limit. "
+                        "Process terminated to unblock posting queue."
+                    )
+                    logf.write("\n=== WATCHDOG ===\n" + state["watchdog_error"] + "\n")
+                    logf.flush()
+                    _append_live_output(job_id, state["watchdog_error"])
+                    terminate_process(proc)
                 silence_age = now_mono - state["last_output_monotonic"]
                 if silence_age >= silence_timeout:
                     state["watchdog_error"] = (
@@ -931,17 +1075,25 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
                     _append_live_output(job_id, state["watchdog_error"])
                     terminate_process(proc)
 
-            if proc.poll() is not None:
+            if proc.poll() is not None and output_eof["done"]:
                 if pending:
                     for line in pending.splitlines():
                         _append_live_output(job_id, line)
                         logf.write(line + "\n")
                     logf.flush()
                 break
-    try:
-        os.close(master_fd)
-    except Exception:
-        pass
+    if master_fd is not None:
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+    if output_reader is not None:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        output_reader.join(timeout=1.0)
     try:
         rc = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -950,26 +1102,44 @@ def stream_nyuu_process(cmd, cwd, posting_log: Path, job_id, silence_timeout_sec
     unregister_posting_proc(job_id, proc)
     return rc, state
 def run_posting_job(job_id, packed_root_str, output_files_root_str, template_path_str, settings, size_bytes=None):
-    allowed_roots = build_allowed_roots(settings)
-    packed_root = Path(packed_root_str)
-    output_files_root = Path(output_files_root_str)
-    template_path = Path(template_path_str)
-    job_name = packed_root.name
-    posted_root = posting_posted_root(settings) / job_name
-    nzb_tmp_root = posted_root
-    nzb_rar_root = posting_nzb_root(settings)
-    size_bytes = _resolved_posting_size_bytes(packed_root, size_bytes=size_bytes)
-    posting_log = posted_root / "posting.log"
-
+    posted_root = None
+    posting_log = None
     try:
+        # Keep preflight under the lifecycle handler so invalid/missing inputs
+        # cannot leave a queued job stuck forever.
+        packed_root = assert_operation_path(
+            packed_root_str, settings, "posting_source", "packed source",
+            require_exists=True, require_directory=True,
+        )
+        output_files_root = assert_operation_path(
+            output_files_root_str, settings, "posting_source", "posting metadata source",
+            require_exists=True, require_directory=True,
+        )
+        template_path = assert_operation_path(
+            template_path_str, settings, "posting_source", "posting template",
+            require_exists=True, require_directory=False,
+        )
+        assert_paths_disjoint(packed_root, output_files_root, "packed source", "posting metadata source")
+        assert_tree_has_no_symlinks(packed_root, "packed source tree")
+        assert_tree_has_no_symlinks(output_files_root, "posting metadata tree")
+        job_name = packed_root.name
+        posted_root = posting_posted_root(settings) / job_name
+        nzb_tmp_root = posted_root
+        nzb_rar_root = posting_nzb_root(settings)
+        size_bytes = _resolved_posting_size_bytes(packed_root, size_bytes=size_bytes)
+        posting_log = posted_root / "posting.log"
+
         provider = wait_for_provider(settings, size_bytes, job_id)
+        provider_lock = provider.get("provider_lock") or _provider_lock_name(provider)
+        provider_lock_label = provider.get("provider_lock_label") or _provider_lock_label(provider)
         eff_connections, max_allowed, reserve = effective_connections(settings, provider)
-        update_posting_job(job_id, provider_used=provider["name"])
+        update_posting_job(job_id, provider_used=provider["name"], provider_lock=provider_lock)
         reserve_note = f", {reserve} reserved" if reserve else ""
+        lock_note = f"; lock {provider_lock_label}" if provider_lock_label and provider_lock_label != provider["name"] else ""
         add_posting_event(
             job_id,
             "prepare",
-            f"Using {provider['name']} for posting ({eff_connections}/{max_allowed} connections{reserve_note})",
+            f"Using {provider['name']} for posting ({eff_connections}/{max_allowed} connections{reserve_note}{lock_note})",
             5,
         )
 
@@ -987,10 +1157,12 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             size_bytes=size_bytes,
         )
 
-        assert_path_within_roots(posted_root, allowed_roots, "posted root")
-        assert_path_within_roots(nzb_tmp_root, allowed_roots, "nzb tmp root")
-        assert_path_within_roots(nzb_rar_root, allowed_roots, "nzb rar root")
+        posted_root = assert_operation_path(posted_root, settings, "posting_output", "posted job root")
+        nzb_tmp_root = assert_operation_path(nzb_tmp_root, settings, "posting_output", "NZB temporary root")
+        assert_operation_path(nzb_rar_root, settings, "posting_nzb", "NZB archive root", allow_root=True)
+        assert_paths_disjoint(packed_root, posted_root, "packed source", "posted job root")
         posted_root.mkdir(parents=True, exist_ok=True)
+        assert_no_symlinks_in_path(posted_root, "posted job root")
         nzb_path = nzb_tmp_root / f"{job_name}.nzb"
         cmd = build_nyuu_command(job_name, packed_root, nzb_path, header, password, groups_csv, from_header, provider, settings)
 
@@ -1003,6 +1175,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             logf.write("=== NYUU SAFE MODE VALIDATION ===\n")
             logf.write(f"Job: {job_name}\n")
             logf.write(f"Provider: {provider.get('name')}\n")
+            logf.write(f"Provider lock: {provider_lock_label or provider_lock}\n")
             logf.write(f"Packed root: {packed_root}\n")
             logf.write(f"Template: {template_path}\n")
             logf.write(f"Output files root: {output_files_root}\n")
@@ -1023,7 +1196,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             raise RuntimeError("Posting validation failed: " + " | ".join(non_connection_errors))
 
         update_posting_job(job_id, nzb_path=str(nzb_path), phase="posting")
-        add_posting_event(job_id, "posting", "Starting Nyuu posting", 20)
+        add_posting_event(job_id, "posting", "Nyuu preflight complete; preparing remote posting", 20)
 
         with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
             logf.write("\n=== NYUU OUTPUT ===\n")
@@ -1037,6 +1210,16 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             article_timeout = max(180, int(str(settings.get("posting_no_article_progress_timeout_seconds", os.environ.get("PREPAC_POSTING_NO_ARTICLE_PROGRESS_TIMEOUT_SECONDS", POSTING_NO_ARTICLE_PROGRESS_TIMEOUT_SECONDS)) or POSTING_NO_ARTICLE_PROGRESS_TIMEOUT_SECONDS).strip()))
         except Exception:
             article_timeout = POSTING_NO_ARTICLE_PROGRESS_TIMEOUT_SECONDS
+        try:
+            runtime_timeout = max(3600, int(str(settings.get("posting_runtime_timeout_seconds", os.environ.get("PREPAC_POSTING_RUNTIME_TIMEOUT_SECONDS", "604800")) or "604800").strip()))
+        except Exception:
+            runtime_timeout = 604800
+        # Nyuu can publish the first remote article as soon as it starts. Claim
+        # the non-cancellable commit boundary immediately before launching it
+        # so a crash, timeout, or stale-worker recovery is reported as
+        # outcome_unknown and never becomes an automatic retry.
+        if not begin_posting_finalization(job_id):
+            raise RuntimeError("Posting job cancelled before the remote upload commit boundary")
         rc, _state = stream_nyuu_process(
             cmd,
             packed_root,
@@ -1044,13 +1227,14 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
             job_id,
             silence_timeout_seconds=silence_timeout,
             no_article_progress_timeout_seconds=article_timeout,
+            runtime_timeout_seconds=runtime_timeout,
         )
 
         status_after_upload = get_posting_job_status(job_id).lower()
         if status_after_upload == "cancelled":
             add_posting_event(job_id, "cancelled", "Posting job stopped by user", None)
             return
-        if status_after_upload in {"failed", "done"}:
+        if status_after_upload in {"failed", "done", "outcome_unknown"}:
             add_posting_event(job_id, "stopped", f"Posting worker stopped because job is already {status_after_upload}", None)
             return
 
@@ -1063,12 +1247,12 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         if rc != 0:
             failure_message = _nyuu_failure_summary(posting_log, f"Nyuu exited with code {rc}")
             if _is_provider_connection_failure(failure_message):
-                cooldown_seconds = _cooldown_posting_provider(provider.get("name"), settings, failure_message)
+                cooldown_seconds = _cooldown_posting_provider(provider_lock, settings, failure_message)
                 if cooldown_seconds:
                     add_posting_event(
                         job_id,
                         "provider",
-                        f"{provider.get('name')} connection failed; cooling provider for {cooldown_seconds}s",
+                        f"{provider.get('name')} connection failed; cooling {provider_lock_label or provider_lock} for {cooldown_seconds}s",
                         None,
                     )
             raise RuntimeError(failure_message)
@@ -1077,7 +1261,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         if connection_warning:
             drain_seconds = _posting_provider_disconnect_drain_seconds(settings)
             cooldown_seconds = _cooldown_posting_provider(
-                provider.get("name"),
+                provider_lock,
                 settings,
                 connection_warning,
                 seconds=drain_seconds,
@@ -1086,7 +1270,7 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
                 add_posting_event(
                     job_id,
                     "provider",
-                    f"{provider.get('name')} reported a connection disconnect; waiting {cooldown_seconds}s before reusing it",
+                    f"{provider.get('name')} reported a connection disconnect; waiting {cooldown_seconds}s before reusing {provider_lock_label or provider_lock}",
                     None,
                 )
 
@@ -1094,13 +1278,21 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
 
         add_posting_event(job_id, "template", "Updating template.txt with posted groups", 97)
         updated_template = update_template_groups(info["text"], groups_csv)
+        assert_operation_path(
+            template_path, settings, "posting_source", "posting template",
+            require_exists=True, require_directory=False,
+        )
         template_path.write_text(updated_template, encoding="utf-8", errors="replace")
 
         add_posting_event(job_id, "nzb", "Compressing NZB with RAR", 98)
         nzb_rar_path = nzb_rar_root / f"{job_name}.rar"
+        assert_operation_path(nzb_rar_path, settings, "posting_nzb", "NZB archive path")
         compress_nzb_with_rar(nzb_path, nzb_rar_path)
 
         add_posting_event(job_id, "finalize", "Moving output files to posted folder", 99)
+        assert_operation_path(output_files_root, settings, "posting_source", "posting metadata source", require_exists=True, require_directory=True)
+        assert_operation_path(posted_root, settings, "posting_output", "posted job root", require_exists=True, require_directory=True)
+        assert_tree_has_no_symlinks(output_files_root, "posting metadata tree")
         if output_files_root.exists():
             for child in sorted(output_files_root.iterdir()):
                 target = posted_root / child.name
@@ -1127,10 +1319,12 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         )
 
         add_posting_event(job_id, "cleanup", "Deleting packed source after successful posting", 99)
+        assert_operation_path(packed_root, settings, "posting_source", "packed source", require_exists=True, require_directory=True)
+        assert_paths_disjoint(packed_root, posted_root, "packed source", "posted job root")
         if packed_root.exists():
             shutil.rmtree(packed_root)
 
-        update_posting_job(job_id, provider_used=provider["name"])
+        update_posting_job(job_id, provider_used=provider["name"], provider_lock=provider_lock)
         SCAN_CACHE.invalidate_prefix("scan:posting")
         finish_posting(job_id, True, "Posting complete")
         add_posting_event(job_id, "complete", "Posting complete", 100)
@@ -1149,30 +1343,51 @@ def run_posting_job(job_id, packed_root_str, output_files_root_str, template_pat
         # keep live output briefly available; stats remain for UI/history
     except Exception as e:
         try:
-            assert_path_within_roots(posted_root, allowed_roots, "posted root")
-            posted_root.mkdir(parents=True, exist_ok=True)
-            with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
-                logf.write("\n=== FAILURE ===\n")
-                logf.write(str(e) + "\n")
+            if posted_root is not None and posting_log is not None:
+                assert_operation_path(posted_root, settings, "posting_output", "posted root")
+                posted_root.mkdir(parents=True, exist_ok=True)
+                with open(posting_log, "a", encoding="utf-8", errors="replace") as logf:
+                    logf.write("\n=== FAILURE ===\n")
+                    logf.write(str(e) + "\n")
         except Exception:
             pass
         current_status = get_posting_job_status(job_id).lower()
         if current_status == "cancelled":
             add_posting_event(job_id, "cancelled", "Posting job stopped by user", None)
             return
-        if current_status in {"failed", "done"}:
+        if current_status == "finalizing":
+            mark_posting_outcome_unknown(
+                job_id,
+                "Posting finalization failed after the commit boundary; verify the remote post and local moves before force retry.",
+            )
+            return
+        if current_status in {"failed", "done", "outcome_unknown"}:
             add_posting_event(job_id, "stopped", f"Posting worker stopped because job is already {current_status}", None)
             return
         # Always ensure provider is released on failure
-        update_posting_job(job_id, provider_used="")
+        update_posting_job(job_id, provider_used="", provider_lock="")
         finish_posting(job_id, False, str(e))
         add_posting_event(job_id, "failed", str(e), None)
         import logging
         logging.getLogger(__name__).error(f"Posting job {job_id} failed with error: {e}", exc_info=True)
-def start_posting_job_async(packed_root, settings):
-    packed_root = Path(packed_root)
+def start_posting_job_async(packed_root, settings, idempotency_key=None):
+    packed_root = assert_operation_path(
+        packed_root, settings, "posting_source", "packed source",
+        require_exists=True, require_directory=True,
+    )
     output_files_root = posting_watch_root(settings) / "output files" / packed_root.name
     template_path = output_files_root / "template.txt"
+    assert_operation_path(
+        output_files_root, settings, "posting_source", "posting metadata source",
+        require_exists=True, require_directory=True,
+    )
+    assert_operation_path(
+        template_path, settings, "posting_source", "posting template",
+        require_exists=True, require_directory=False,
+    )
+    assert_paths_disjoint(packed_root, output_files_root, "packed source", "posting metadata source")
+    assert_tree_has_no_symlinks(packed_root, "packed source tree")
+    assert_tree_has_no_symlinks(output_files_root, "posting metadata tree")
     size_bytes = _resolved_posting_size_bytes(packed_root)
     reconcile_orphaned_posting_jobs_in_process()
     packed_root_str = str(packed_root)
@@ -1193,14 +1408,24 @@ def start_posting_job_async(packed_root, settings):
         existing_done_id = latest_successful_posting_job_id(packed_root_str)
         if existing_done_id:
             return existing_done_id
-    job_id = create_posting_job(packed_root.name, packed_root_str, str(output_files_root), str(template_path), size_bytes)
+    create_result = create_posting_job(
+        packed_root.name, packed_root_str, str(output_files_root), str(template_path), size_bytes,
+        idempotency_key=idempotency_key, return_created=True,
+    )
+    job_id, created = create_result if isinstance(create_result, tuple) else (create_result, True)
+    if not created:
+        return job_id
     import threading
+    with POSTING_JOB_SET_LOCK:
+        POSTING_SCHEDULED_JOB_IDS.add(int(job_id))
     def _runner():
-        _mark_posting_job_active(job_id)
         try:
+            _mark_posting_job_active(job_id)
             run_posting_job(job_id, str(packed_root), str(output_files_root), str(template_path), settings, size_bytes=size_bytes)
         finally:
             _mark_posting_job_inactive(job_id)
+            with POSTING_JOB_SET_LOCK:
+                POSTING_SCHEDULED_JOB_IDS.discard(int(job_id))
     SCAN_CACHE.invalidate_prefix("scan:posting")
     threading.Thread(target=_runner, daemon=True).start()
     return job_id

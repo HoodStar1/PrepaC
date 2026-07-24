@@ -1,11 +1,11 @@
-from datetime import datetime
 from app.db import get_conn
+from app.timestamp_utils import local_now_iso
 
 ACTIVE_SHARE_PROCS = {}
 
 
 def now():
-    return datetime.now().isoformat(timespec="seconds")
+    return local_now_iso()
 
 
 def _load_share_job_events(cur, job_ids, per_job_limit=50):
@@ -66,21 +66,55 @@ def get_imported_share_bundle(bundle_id):
     conn.close(); return dict(row) if row else None
 
 
-def create_share_job(**fields):
+def create_share_job(return_created=False, **fields):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO share_jobs(source_type, source_ref_id, posting_job_id, import_bundle_id, job_name, release_name, nzb_rar_path, template_path, detected_type, resolution_tier, category_key, selected_category_id, selected_category_label, destination_id, destination_name, status, nzb_hash, job_hash, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
-        (
-            fields.get('source_type',''), fields.get('source_ref_id',''), fields.get('posting_job_id'), fields.get('import_bundle_id'),
-            fields.get('job_name',''), fields.get('release_name',''), fields.get('nzb_rar_path',''), fields.get('template_path',''),
-            fields.get('detected_type',''), fields.get('resolution_tier',''), fields.get('category_key',''), fields.get('selected_category_id',''),
-            fields.get('selected_category_label',''), fields.get('destination_id',''), fields.get('destination_name',''),
-            fields.get('nzb_hash',''), fields.get('job_hash',''), now()
+    source_ref_id = str(fields.get('source_ref_id', '') or '')
+    destination_id = str(fields.get('destination_id', '') or '')
+    job_name = str(fields.get('job_name', '') or '')
+    nzb_hash = str(fields.get('nzb_hash', '') or '')
+    key = str(fields.get('idempotency_key') or f"share:{source_ref_id}:{destination_id}").strip() or None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        identities = (
+            ("idempotency_key=?", (key,)),
+            ("destination_id=? AND job_name=?", (destination_id, job_name)),
+            ("destination_id=? AND nzb_hash=?", (destination_id, nzb_hash)),
+            ("destination_id=? AND source_ref_id=?", (destination_id, source_ref_id)),
         )
-    )
-    job_id = cur.lastrowid
-    conn.commit(); conn.close(); return job_id
+        clauses = [clause for clause, values in identities if all(str(value or "").strip() for value in values)]
+        params = [
+            value
+            for _clause, values in identities
+            if all(str(value or "").strip() for value in values)
+            for value in values
+        ]
+        row = None
+        if clauses:
+            row = cur.execute(
+                "SELECT id FROM share_jobs WHERE (" + " OR ".join(clauses) + ") "
+                "AND status IN ('queued','running','uploading','outcome_unknown') ORDER BY id DESC LIMIT 1",
+                tuple(params),
+            ).fetchone()
+            if row:
+                conn.commit()
+                result = int(row[0])
+                return (result, False) if return_created else result
+        cur.execute(
+            """INSERT INTO share_jobs(source_type, source_ref_id, posting_job_id, import_bundle_id, job_name, release_name, nzb_rar_path, template_path, detected_type, resolution_tier, category_key, selected_category_id, selected_category_label, destination_id, destination_name, status, nzb_hash, job_hash, created_at, idempotency_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+            (
+                fields.get('source_type',''), source_ref_id, fields.get('posting_job_id'), fields.get('import_bundle_id'),
+                job_name, fields.get('release_name',''), fields.get('nzb_rar_path',''), fields.get('template_path',''),
+                fields.get('detected_type',''), fields.get('resolution_tier',''), fields.get('category_key',''), fields.get('selected_category_id',''),
+                fields.get('selected_category_label',''), destination_id, fields.get('destination_name',''),
+                nzb_hash, fields.get('job_hash',''), now(), key,
+            ),
+        )
+        job_id = cur.lastrowid
+        conn.commit()
+        return (job_id, True) if return_created else job_id
+    finally:
+        conn.close()
 
 
 def update_share_job(job_id, **fields):
@@ -110,17 +144,45 @@ def finish_share(job_id, success=True, message=""):
         return
     cur.execute(
         "UPDATE share_jobs SET status=?, finished_at=?, message=?, percent=? "
-        "WHERE id=? AND status NOT IN ('done','failed','cancelled')",
+        "WHERE id=? AND status IN ('running','uploading')",
         (("done" if success else "failed"), now(), message, (100 if success else None), int(job_id)),
     )
     conn.commit(); conn.close()
 
 
-def list_share_jobs(limit=500):
+def mark_share_outcome_unknown(job_id, message):
+    """Record an ambiguous result after the upload boundary was crossed."""
+    safe_message = str(message or "Upload outcome is unknown; verify the destination before force retry")[:1000]
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        timestamp = now()
+        cur.execute(
+            "UPDATE share_jobs SET status='outcome_unknown', phase='outcome_unknown', "
+            "finished_at=?, message=?, percent=NULL WHERE id=? AND status='uploading'",
+            (timestamp, safe_message, int(job_id)),
+        )
+        changed = cur.rowcount == 1
+        if changed:
+            cur.execute(
+                "INSERT INTO share_job_events(share_job_id, timestamp, phase, message, percent) "
+                "VALUES (?, ?, 'outcome_unknown', ?, NULL)",
+                (int(job_id), timestamp, safe_message),
+            )
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
+def list_share_jobs(limit=500, per_job_event_limit=50):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM share_jobs ORDER BY id DESC LIMIT ?", (limit,))
     jobs = [dict(r) for r in cur.fetchall()]
-    events_by_job = _load_share_job_events(cur, [j["id"] for j in jobs])
+    events_by_job = _load_share_job_events(
+        cur,
+        [j["id"] for j in jobs],
+        per_job_limit=max(0, min(100, int(per_job_event_limit))),
+    )
     for j in jobs:
         j["events"] = events_by_job.get(int(j["id"]), [])
     conn.close(); return jobs
@@ -138,21 +200,81 @@ def count_existing_share_duplicates(destination_id, job_name, nzb_hash, source_r
         'source_ref': False,
     }
     if destination_id and job_name:
-        cur.execute("SELECT 1 FROM share_jobs WHERE destination_id=? AND job_name=? AND status IN ('queued','running','done') LIMIT 1", (destination_id, job_name))
+        cur.execute("SELECT 1 FROM share_jobs WHERE destination_id=? AND job_name=? AND status IN ('queued','running','uploading','outcome_unknown','done') LIMIT 1", (destination_id, job_name))
         checks['destination_job'] = cur.fetchone() is not None
-    if nzb_hash:
-        cur.execute("SELECT 1 FROM share_jobs WHERE nzb_hash=? AND status IN ('queued','running','done') LIMIT 1", (nzb_hash,))
+    if destination_id and nzb_hash:
+        cur.execute("SELECT 1 FROM share_jobs WHERE destination_id=? AND nzb_hash=? AND status IN ('queued','running','uploading','outcome_unknown','done') LIMIT 1", (destination_id, nzb_hash))
         checks['nzb_hash'] = cur.fetchone() is not None
     if destination_id and source_ref_id:
-        cur.execute("SELECT 1 FROM share_jobs WHERE destination_id=? AND source_ref_id=? AND status IN ('queued','running','done') LIMIT 1", (destination_id, source_ref_id))
+        cur.execute("SELECT 1 FROM share_jobs WHERE destination_id=? AND source_ref_id=? AND status IN ('queued','running','uploading','outcome_unknown','done') LIMIT 1", (destination_id, source_ref_id))
         checks['source_ref'] = cur.fetchone() is not None
     conn.close(); return checks
 
 
 def increment_share_retry(job_id):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE share_jobs SET retry_count=COALESCE(retry_count,0)+1, status='queued', started_at=NULL, finished_at=NULL WHERE id=?", (int(job_id),))
+    cur.execute(
+        "UPDATE share_jobs SET retry_count=COALESCE(retry_count,0)+1, status='queued', "
+        "phase='queued', percent=0, message='Retry queued', started_at=NULL, finished_at=NULL "
+        "WHERE id=? AND status='failed'",
+        (int(job_id),),
+    )
+    changed = cur.rowcount > 0
+    if changed:
+        cur.execute(
+            "INSERT INTO share_job_events(share_job_id, timestamp, phase, message, percent) VALUES (?, ?, 'queued', 'Retry queued', 0)",
+            (int(job_id), now()),
+        )
     conn.commit(); conn.close()
+    return changed
+
+
+def force_retry_share_outcome_unknown(job_id):
+    """Explicit retry after an operator verifies the remote destination.
+
+    A normal retry intentionally accepts only ``failed``.  Keeping this as a
+    separate, conspicuously named transition prevents accidental replay of an
+    upload whose acknowledgement was lost.
+    """
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE share_jobs SET retry_count=COALESCE(retry_count,0)+1, status='queued', "
+            "phase='queued', percent=0, message='Manual force retry queued after unknown remote outcome was acknowledged', "
+            "started_at=NULL, finished_at=NULL WHERE id=? AND status='outcome_unknown'",
+            (int(job_id),),
+        )
+        changed = cur.rowcount == 1
+        if changed:
+            cur.execute(
+                "INSERT INTO share_job_events(share_job_id, timestamp, phase, message, percent) "
+                "VALUES (?, ?, 'queued', 'Manual force retry queued after unknown remote outcome was acknowledged', 0)",
+                (int(job_id), now()),
+            )
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
+def claim_share_job(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE share_jobs SET status='running', started_at=?, finished_at=NULL "
+        "WHERE id=? AND status='queued'",
+        (now(), int(job_id)),
+    )
+    changed = cur.rowcount > 0
+    conn.commit(); conn.close()
+    return changed
+
+
+def begin_share_upload(job_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE share_jobs SET status='uploading', phase='upload' WHERE id=? AND status='running'", (int(job_id),))
+    changed = cur.rowcount > 0
+    conn.commit(); conn.close()
+    return changed
 
 
 def get_share_job(job_id):
@@ -169,7 +291,7 @@ def get_share_job(job_id):
 
 def get_existing_active_share_job_ids(source_ref_id, destination_id):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id FROM share_jobs WHERE source_ref_id=? AND destination_id=? AND status IN ('queued','running') ORDER BY id DESC", (source_ref_id, destination_id))
+    cur.execute("SELECT id FROM share_jobs WHERE source_ref_id=? AND destination_id=? AND status IN ('queued','running','uploading','outcome_unknown') ORDER BY id DESC", (source_ref_id, destination_id))
     rows = [int(r[0]) for r in cur.fetchall()]
     conn.close(); return rows
 
@@ -184,7 +306,7 @@ def get_share_job_status(job_id):
 
 def cancel_share_job(job_id, reason="Cancelled by user"):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE share_jobs SET status='cancelled', finished_at=?, message=? WHERE id=? AND status IN ('queued','running','failed')", (now(), reason, int(job_id)))
+    cur.execute("UPDATE share_jobs SET status='cancelled', finished_at=?, message=? WHERE id=? AND status IN ('queued','running')", (now(), reason, int(job_id)))
     changed = cur.rowcount > 0
     if changed:
         cur.execute("INSERT INTO share_job_events(share_job_id, timestamp, phase, message, percent) VALUES (?, ?, ?, ?, ?)", (int(job_id), now(), 'cancelled', reason, None))

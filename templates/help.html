@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% block title %}Help · PrepaC{% endblock %}
+{% block page_label %}Help and workflow guide{% endblock %}
 {% block content %}
 <section class="hero-panel">
   <div>
-    <h2>Help</h2>
+    <h1>Help</h1>
     <p>Setup and workflow guidance for Prepare, Packing, Posting, Share, Clean, Settings, and everyday use.</p>
   </div>
 </section>
@@ -12,7 +14,7 @@
     <h3>Topics</h3>
     <nav class="help-nav">
       {% for topic in topics %}
-      <a class="help-link {% if active_topic == topic.slug %}active{% endif %}" href="{{ url_for('help_page', topic=topic.slug) }}">{{ topic.title }}</a>
+      <a class="help-link {% if active_topic == topic.slug %}active{% endif %}" {% if active_topic == topic.slug %}aria-current="page"{% endif %} href="{{ url_for('help_page', topic=topic.slug) }}">{{ topic.title }}</a>
       {% endfor %}
     </nav>
     <div class="help-side-note">

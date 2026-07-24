@@ -1,252 +1,132 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>PrepaC</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#080d14">
   <meta name="prepac-csrf-token" content="{{ csrf_token }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <title>{% block title %}PrepaC{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ build_number }}">
+  <script src="{{ url_for('static', filename='js/app.js') }}?v={{ build_number }}" defer></script>
+  <script src="{{ url_for('static', filename='js/scroll-bottom.js') }}?v={{ build_number }}" defer></script>
+  {% block head %}{% endblock %}
 </head>
-<body class="app-shell">
-  <header class="topbar">
-    <div class="wrap topbar-inner">
-      <div class="brand">
-        <div class="brand-mark">P</div>
-        <div class="brand-copy">
-          <h1>PrepaC</h1>
-          <span class="brand-subtitle">Preparation, Packing, Posting and Cleaning Workflow</span>
-        </div>
-      </div>
-      <nav class="main-nav">
-        <a class="{{ 'active' if request.path == '/' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a>
-        <a class="{{ 'active' if request.path.startswith('/prepare') else '' }}" href="{{ url_for('prepare_page') }}">Prepare</a>
-        <a class="{{ 'active' if request.path.startswith('/packing') else '' }}" href="{{ url_for('packing_page') }}">Packing</a>
-        <a class="{{ 'active' if request.path.startswith('/posting') else '' }}" href="{{ url_for('posting_page') }}">Posting</a>
-        <a class="{{ 'active' if request.path.startswith('/share') else '' }}" href="{{ url_for('share_page') }}">Share</a>
-        <a class="{{ 'active' if request.path.startswith('/clean') else '' }}" href="{{ url_for('clean_page') }}">Clean</a>
-        <a class="{{ 'active' if request.path.startswith('/history') else '' }}" href="{{ url_for('history_page') }}">History</a>
-        <a class="{{ 'active' if request.path.startswith('/settings') or request.path.startswith('/plex') or request.path.startswith('/setup') else '' }}" href="{{ url_for('settings_page') }}">Settings</a>
-        <a class="{{ 'active' if request.path.startswith('/help') else '' }}" href="{{ url_for('help_page') }}">Help</a>
-        <a id="updateBadge" class="update-badge" href="#" target="_blank" rel="noopener" style="display:none"></a>
-        {% if session.get("auth_ok") %}
-          <span class="session-pill">Signed in as {{ session.get("auth_user") }}</span>
-          <a href="{{ url_for('logout_page') }}">Logout</a>
-        {% endif %}
-      
+<body class="app-shell" data-page="{{ request.endpoint or '' }}">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
 
-</nav>
+  <div class="mobile-backdrop" id="mobileNavBackdrop" hidden></div>
+  <aside class="sidebar" id="appSidebar" aria-label="Application navigation">
+    <div class="sidebar-brand">
+      <a class="brand" href="{{ url_for('dashboard') if session.get('auth_ok') else url_for('login_page') }}" aria-label="PrepaC home">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <span class="brand-copy">
+          <strong>PrepaC</strong>
+          <small>Media workflow</small>
+        </span>
+      </a>
+      <button class="icon-button mobile-only" id="mobileNavClose" type="button" aria-label="Close navigation">Close</button>
     </div>
-  </header>
-  <main class="wrap page-shell">
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        <section class="flash-stack">
-        {% for category, msg in messages %}
-          <div class="flash {{ category }}">{{ msg }}</div>
-        {% endfor %}
-        </section>
+
+    {% if session.get("auth_ok") %}
+    <nav class="main-nav" aria-label="Primary">
+      <span class="nav-section-label">Workflow</span>
+      <a class="nav-link {{ 'active' if request.path == '/' else '' }}" {% if request.path == '/' %}aria-current="page"{% endif %} href="{{ url_for('dashboard') }}"><span aria-hidden="true">01</span> Dashboard</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/prepare') else '' }}" {% if request.path.startswith('/prepare') %}aria-current="page"{% endif %} href="{{ url_for('prepare_page') }}"><span aria-hidden="true">02</span> Prepare</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/packing') else '' }}" {% if request.path.startswith('/packing') %}aria-current="page"{% endif %} href="{{ url_for('packing_page') }}"><span aria-hidden="true">03</span> Packing</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/posting') else '' }}" {% if request.path.startswith('/posting') %}aria-current="page"{% endif %} href="{{ url_for('posting_page') }}"><span aria-hidden="true">04</span> Posting</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/share') else '' }}" {% if request.path.startswith('/share') %}aria-current="page"{% endif %} href="{{ url_for('share_page') }}"><span aria-hidden="true">05</span> Share</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/clean') else '' }}" {% if request.path.startswith('/clean') %}aria-current="page"{% endif %} href="{{ url_for('clean_page') }}"><span aria-hidden="true">06</span> Clean</a>
+      <span class="nav-section-label">Library</span>
+      <a class="nav-link {{ 'active' if request.path.startswith('/history') else '' }}" {% if request.path.startswith('/history') %}aria-current="page"{% endif %} href="{{ url_for('history_page') }}"><span aria-hidden="true">H</span> History</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/settings') or request.path.startswith('/plex') else '' }}" {% if request.path.startswith('/settings') or request.path.startswith('/plex') %}aria-current="page"{% endif %} href="{{ url_for('settings_page') }}"><span aria-hidden="true">S</span> Settings</a>
+      <a class="nav-link {{ 'active' if request.path.startswith('/help') else '' }}" {% if request.path.startswith('/help') %}aria-current="page"{% endif %} href="{{ url_for('help_page') }}"><span aria-hidden="true">?</span> Help</a>
+    </nav>
+    <div class="sidebar-account">
+      <span class="eyebrow">Signed in</span>
+      <strong class="account-name">{{ session.get("auth_user") }}</strong>
+      <form method="post" action="{{ url_for('logout_page') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="text-link logout-button" type="submit">Sign out</button>
+      </form>
+    </div>
+    {% else %}
+    <div class="sidebar-account auth-note">
+      <span class="eyebrow">Local access</span>
+      <p>Sign in to manage your PrepaC workflows.</p>
+    </div>
+    {% endif %}
+  </aside>
+
+  <div class="app-frame">
+    <header class="topbar">
+      <button class="icon-button nav-toggle" id="mobileNavToggle" type="button" aria-controls="appSidebar" aria-expanded="false">Menu</button>
+      <div class="topbar-title">
+        <span class="eyebrow">PrepaC</span>
+        <strong>{% block page_label %}Media workflow control{% endblock %}</strong>
+      </div>
+      <div class="topbar-actions">
+        <a id="updateBadge" class="status-chip warning" href="#" target="_blank" rel="noopener" hidden>Update available</a>
+        <span class="connection-state" aria-label="Local application"><span aria-hidden="true"></span> Local</span>
+      </div>
+    </header>
+
+    <main id="main-content" class="page-shell" tabindex="-1">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <section class="flash-stack" aria-label="Notifications">
+          {% for category, msg in messages %}
+            <div class="flash {{ category }}" role="{{ 'alert' if category in ['error', 'warning'] else 'status' }}">{{ msg }}</div>
+          {% endfor %}
+          </section>
+        {% endif %}
+      {% endwith %}
+
+      {% set live_settings = settings if settings is defined else none %}
+      {% if live_settings %}
+        {% if not live_settings.get("tv_root") or not live_settings.get("movie_root") or not live_settings.get("dest_root") %}
+          <section class="flash-stack"><div class="flash warning" role="status"><strong>Paths need attention.</strong> Some features will remain unavailable until media paths are configured.</div></section>
+        {% endif %}
+        {% if not live_settings.get("plex_token_configured") %}
+          <section class="flash-stack"><div class="flash info" role="status"><strong>Plex is not connected.</strong> Posters, watched status, and cleanup detection are limited.</div></section>
+        {% endif %}
       {% endif %}
-    {% endwith %}
 
-<script>
-window.PREPAC_CSRF_TOKEN = {{ csrf_token|tojson }};
-(function() {
-  const csrfToken = window.PREPAC_CSRF_TOKEN || '';
-  const unsafeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-  const originalFetch = window.fetch ? window.fetch.bind(window) : null;
-
-  function requestMethod(input, init){
-    return String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-  }
-
-  function requestUrl(input){
-    if (typeof input === 'string') return input;
-    return (input && input.url) || window.location.href;
-  }
-
-  if (originalFetch) {
-    window.fetch = function(input, init) {
-      const nextInit = init ? { ...init } : {};
-      if (nextInit.credentials === undefined) nextInit.credentials = 'same-origin';
-
-      const method = requestMethod(input, nextInit);
-      if (csrfToken && unsafeMethods.has(method)) {
-        let sameOrigin = true;
-        try {
-          sameOrigin = new URL(requestUrl(input), window.location.href).origin === window.location.origin;
-        } catch (_error) {}
-        if (sameOrigin) {
-          const headers = new Headers(nextInit.headers || (input && input.headers) || undefined);
-          if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrfToken);
-          nextInit.headers = headers;
-        }
-      }
-
-      return originalFetch(input, nextInit);
-    };
-  }
-
-  window.prepacEventStreamAuthErrorHandler = function(stream) {
-    return async function() {
-      if (window.__prepacAuthRedirecting) return;
-      let authLost = false;
-      try {
-        const res = await fetch('/api/version', { credentials: 'same-origin', cache: 'no-store' });
-        authLost = res.status === 401 || res.status === 403;
-        const contentType = res.headers.get('content-type') || '';
-        if (!authLost && contentType.includes('application/json')) {
-          const data = await res.json().catch(() => ({}));
-          const error = String((data && data.error) || '').toLowerCase();
-          authLost = data && data.ok === false && error.includes('auth');
-        }
-      } catch (_error) {
-        return;
-      }
-      if (!authLost) return;
-      window.__prepacAuthRedirecting = true;
-      try {
-        if (stream && stream.close) stream.close();
-      } catch (_error) {}
-      const next = encodeURIComponent(window.location.pathname + window.location.search);
-      window.location.href = `/login?next=${next}`;
-    };
-  };
-
-  if (window.EventSource && !window.__prepacEventSourceWrapped) {
-    const NativeEventSource = window.EventSource;
-    const activeStreams = new Set();
-    window.__prepacEventSourceWrapped = true;
-    window.prepacCloseEventStreams = function() {
-      activeStreams.forEach((stream) => {
-        try { stream.close(); } catch (_error) {}
-      });
-      activeStreams.clear();
-    };
-    window.EventSource = function(...args) {
-      const stream = new NativeEventSource(...args);
-      activeStreams.add(stream);
-      const nativeClose = stream.close.bind(stream);
-      stream.close = function() {
-        activeStreams.delete(stream);
-        return nativeClose();
-      };
-      return stream;
-    };
-    window.EventSource.prototype = NativeEventSource.prototype;
-    window.addEventListener('pagehide', window.prepacCloseEventStreams);
-    window.addEventListener('beforeunload', window.prepacCloseEventStreams);
-  }
-
-  document.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('form').forEach((form) => {
-      const method = String(form.getAttribute('method') || 'GET').toUpperCase();
-      if (!unsafeMethods.has(method)) return;
-      if (form.querySelector('input[name="csrf_token"]')) return;
-      const hidden = document.createElement('input');
-      hidden.type = 'hidden';
-      hidden.name = 'csrf_token';
-      hidden.value = csrfToken;
-      form.prepend(hidden);
-    });
-  });
-})();
-</script>
-
-{% set live_settings = settings if settings is defined else none %}
-{% if live_settings %}
-  {% if not live_settings.get("tv_root") or not live_settings.get("movie_root") or not live_settings.get("dest_root") %}
-    <section class="flash-stack"><div class="flash info">⚠️ Paths not configured — some features will not work yet.</div></section>
-  {% endif %}
-  {% if not live_settings.get("plex_token") %}
-    <section class="flash-stack"><div class="flash info">ℹ️ Plex not connected — posters, watched status and cleanup detection are limited.</div></section>
-  {% endif %}
-{% endif %}
-
-{% if db_corrupt %}
-<section class="flash-stack" id="dbCorruptBanner">
-  <div class="flash error">
-    <strong>&#9888; Database Corruption Detected</strong> &mdash; Some pages may show missing or incomplete data.
-    The corruption is limited to an index (your history data is intact).
-    Click <strong>Auto-Repair</strong> to rebuild indexes in-place without losing any history.
-    <span style="display:inline-flex;gap:.5rem;margin-top:.4rem;flex-wrap:wrap;align-items:center">
-      <button id="dbRepairBtn" onclick="prepacRepairDb()" style="cursor:pointer">&#128295; Auto-Repair (REINDEX)</button>
-      <a href="/api/db/integrity" target="_blank" rel="noopener" style="font-size:.85em">Check status</a>
-      <span id="dbRepairStatus" style="font-size:.85em"></span>
-    </span>
-    <details style="margin-top:.5rem;font-size:.85em">
-      <summary>Manual recovery commands (if auto-repair fails)</summary>
-      <pre style="margin:.4rem 0 0">sqlite3 /config/prepac.db '.recover' &gt; /tmp/recover.sql
+      {% if db_corrupt %}
+      <section class="flash-stack" id="dbCorruptBanner">
+        <div class="flash error" role="alert">
+          <div class="alert-heading">Database corruption detected</div>
+          <p>Some pages may show incomplete data. The detected issue is limited to an index; use the repair action to rebuild indexes in place.</p>
+          <div class="row">
+            <button id="dbRepairBtn" type="button">Auto-repair indexes</button>
+            <a class="button secondary" href="/api/db/integrity" target="_blank" rel="noopener">Check status</a>
+            <span id="dbRepairStatus" class="muted" role="status" aria-live="polite"></span>
+          </div>
+          <details>
+            <summary>Manual recovery commands</summary>
+            <pre>sqlite3 /config/prepac.db '.recover' &gt; /tmp/recover.sql
 sqlite3 /config/prepac_new.db &lt; /tmp/recover.sql
 cp /config/prepac.db /config/prepac.db.bak
 mv /config/prepac_new.db /config/prepac.db</pre>
-    </details>
+          </details>
+        </div>
+      </section>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="app-footer">
+      <span>{{ display_version }}</span>
+      <span>Private, local-first media workflow</span>
+      <a href="https://www.buymeacoffee.com/HoodStar" target="_blank" rel="noopener noreferrer">Support development</a>
+    </footer>
   </div>
-</section>
-<script>
-async function prepacRepairDb() {
-  const btn = document.getElementById('dbRepairBtn');
-  const status = document.getElementById('dbRepairStatus');
-  btn.disabled = true;
-  btn.textContent = 'Repairing…';
-  status.textContent = '';
-  try {
-    const res = await fetch('/api/db/repair', { method: 'POST', credentials: 'same-origin' });
-    const data = await res.json();
-    if (data.ok) {
-      status.textContent = '\u2705 Repair successful — reloading…';
-      document.getElementById('dbCorruptBanner').style.display = 'none';
-      setTimeout(() => location.reload(), 1200);
-    } else {
-      const issues = (data.issues || []).join('; ');
-      status.textContent = '\u274c Repair failed: ' + issues;
-      btn.disabled = false;
-      btn.textContent = '\uD83D\uDD27 Auto-Repair (REINDEX)';
-    }
-  } catch (e) {
-    status.textContent = '\u274c Request failed: ' + e;
-    btn.disabled = false;
-    btn.textContent = '\uD83D\uDD27 Auto-Repair (REINDEX)';
-  }
-}
-</script>
-{% endif %}
-    {% block content %}{% endblock %}
-  </main>
-  <footer class="app-footer">
-    <div class="wrap footer-inner">
-      <span class="footer-version">{{ display_version }}</span>
-      <div class="bmc-container">
-        <a href="https://www.buymeacoffee.com/HoodStar" target="_blank" rel="noopener">
-          <img src="https://img.buymeacoffee.com/button-api/?text=Buy me a juice&emoji=🧃&slug=HoodStar&button_colour=ff0000&font_colour=ffffff&font_family=Cookie&outline_colour=ffffff&coffee_colour=FFDD00" alt="Buy me a juice">
-        </a>
-      </div>
-    </div>
-  </footer>
 
-
-<script>
-async function prepacCheckForUpdates(force = false) {
-  try {
-    const res = await fetch(`/api/version/check${force ? '?force=1' : ''}`, { credentials: 'same-origin' });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const badge = document.getElementById('updateBadge');
-    if (badge && data && data.update_available) {
-      badge.textContent = `Update available: ${data.latest_tag || ('v' + data.latest_version)}`;
-      badge.href = data.asset_url || data.release_url || '#';
-      badge.style.display = 'inline-flex';
-    } else if (badge) {
-      badge.style.display = 'none';
-    }
-    return data;
-  } catch (_e) {
-    return null;
-  }
-}
-document.addEventListener('DOMContentLoaded', () => {
-  prepacCheckForUpdates(false);
-});
-</script>
-
+  <button id="goToBottom" class="go-to-bottom" type="button" aria-label="Go to bottom" aria-hidden="true" hidden>
+    <span aria-hidden="true">↓</span>
+  </button>
+  <div id="appToastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  {% block scripts %}{% endblock %}
 </body>
 </html>

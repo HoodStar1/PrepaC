@@ -1,140 +1,99 @@
 {% extends "base.html" %}
+{% block title %}Dashboard · PrepaC{% endblock %}
+{% block page_label %}Operational overview{% endblock %}
 {% block content %}
-<section class="hero-panel"><div><h2>Dashboard</h2><p>Operational overview.</p></div></section>
-<section class="card">
-  <h2>Overview of Currently Running</h2>
-  <div id="runningOverview">
+<section class="page-header">
+  <div><span class="eyebrow">Command center</span><h1>Dashboard</h1><p>Current workflow activity, totals, and recent actions in one view.</p></div>
+  <div class="actions"><a class="button secondary" href="{{ url_for('history_page') }}">View history</a><a class="button" href="{{ url_for('prepare_page') }}">Prepare media</a></div>
+</section>
+
+<section class="card" aria-labelledby="running-title">
+  <div class="section-heading"><div><h2 id="running-title">Currently running</h2><p>Live workflow progress updates automatically.</p></div><span class="status-chip success">Live</span></div>
+  <div id="runningOverview" aria-live="polite">
   {% if current_running %}
     {% for item in current_running %}
       <article class="job">
-        <h3>{{ item.kind }}</h3>
-        <p><strong>Item:</strong> <code>{{ item.title }}</code></p>
-        <p><strong>Phase:</strong> {{ item.phase }}</p>
-        <p><strong>Progress:</strong> {{ item.percent if item.percent is not none else '' }}{% if item.percent is not none %}%{% endif %}</p>
-        <p><strong>Message:</strong> {{ item.message }}</p>
+        {% set item_status = item.status|default('running', true)|lower %}
+        <div class="job-header"><h3>{{ item.kind }}</h3><span class="badge {{ item_status }}">{{ item_status|replace('_', ' ')|title }}</span></div>
+        <div class="job-meta"><div><strong>Item</strong><code>{{ item.title }}</code></div><div><strong>Phase</strong>{{ item.phase }}</div><div><strong>Progress</strong>{{ item.percent if item.percent is not none else '—' }}{% if item.percent is not none %}%{% endif %}</div></div>
+        {% if item.percent is not none %}<progress class="native-progress" aria-label="{{ item.kind }} progress" max="100" value="{{ item.percent }}">{{ item.percent }}%</progress>{% endif %}
+        <p class="muted">{{ item.message }}</p>
       </article>
     {% endfor %}
   {% else %}
-    <p>No jobs are currently running.</p>
+    <div class="empty-state"><strong>No active jobs</strong><span>Queued and running work will appear here.</span></div>
   {% endif %}
   </div>
 </section>
 
 <div class="grid two">
   <section class="card">
-    <h2>Prepare Stats</h2>
-    <p><strong>Total Prepare Jobs:</strong> {{ prepare_summary.total_prepare_jobs }}</p>
-    <p><strong>Total Prepared Items:</strong> {{ prepare_summary.total_prepared_items }}</p>
-    <p><strong>Prepared TV Items:</strong> {{ prepare_summary.tv_items }}</p>
-    <p><strong>Prepared Movie Items:</strong> {{ prepare_summary.movie_items }}</p>
-    <p><strong>Total Source Bytes Prepared:</strong> {{ prepare_summary.source_bytes_total|humansize }}</p>
-    <p><strong>Total Destination Bytes Prepared:</strong> {{ prepare_summary.dest_bytes_total|humansize }}</p>
+    <div class="section-heading"><div><span class="eyebrow">Stage 01</span><h2>Prepare</h2></div><a href="{{ url_for('history_prepare_page') }}">History</a></div>
+    <div class="stat-grid">
+      <div class="stat"><span class="stat-label">Jobs</span><div class="stat-value">{{ prepare_summary.total_prepare_jobs }}</div></div>
+      <div class="stat"><span class="stat-label">Items</span><div class="stat-value">{{ prepare_summary.total_prepared_items }}</div></div>
+      <div class="stat"><span class="stat-label">TV</span><div class="stat-value">{{ prepare_summary.tv_items }}</div></div>
+      <div class="stat"><span class="stat-label">Movies</span><div class="stat-value">{{ prepare_summary.movie_items }}</div></div>
+      <div class="stat"><span class="stat-label">Source data</span><div class="stat-value">{{ prepare_summary.source_bytes_total|humansize }}</div></div>
+      <div class="stat"><span class="stat-label">Prepared data</span><div class="stat-value">{{ prepare_summary.dest_bytes_total|humansize }}</div></div>
+    </div>
   </section>
   <section class="card">
-    <h2>Packing Stats</h2>
-    <p><strong>Total Packed Jobs:</strong> {{ packing_summary.total_jobs }}</p>
-    <p><strong>Total Packed Data:</strong> {{ packing_summary.total_bytes|humansize }}</p>
-    <p><strong>Largest Packed Job:</strong> {{ packing_summary.largest_bytes|humansize }}</p>
-    <p><strong>Average Packing Time:</strong> {{ packing_summary.avg_seconds|humanduration }}</p>
-  </section>
-</div>
-
-<div class="grid two">
-  <section class="card">
-    <h2>Posting Stats</h2>
-    <p><strong>Total Posted Jobs:</strong> {{ posting_summary.total_jobs }}</p>
-    <p><strong>Total Posted Data:</strong> {{ posting_summary.total_bytes|humansize }}</p>
-    <p><strong>Largest Posted Job:</strong> {{ posting_summary.largest_bytes|humansize }}</p>
-    <p><strong>Average Posting Time:</strong> {{ posting_summary.avg_seconds|humanduration }}</p>
+    <div class="section-heading"><div><span class="eyebrow">Stage 02</span><h2>Packing</h2></div><a href="{{ url_for('history_packing_page') }}">History</a></div>
+    <div class="stat-grid">
+      <div class="stat"><span class="stat-label">Packed jobs</span><div class="stat-value">{{ packing_summary.total_jobs }}</div></div>
+      <div class="stat"><span class="stat-label">Packed data</span><div class="stat-value">{{ packing_summary.total_bytes|humansize }}</div></div>
+      <div class="stat"><span class="stat-label">Largest job</span><div class="stat-value">{{ packing_summary.largest_bytes|humansize }}</div></div>
+      <div class="stat"><span class="stat-label">Average time</span><div class="stat-value">{{ packing_summary.avg_seconds|humanduration }}</div></div>
+    </div>
   </section>
   <section class="card">
-    <h2>Share Stats</h2>
-    <p><strong>Total Share Jobs:</strong> {{ share_summary.total_jobs }}</p>
-    <p><strong>Successful Shares:</strong> {{ share_summary.done_jobs }}</p>
-    <p><strong>Failed Shares:</strong> {{ share_summary.failed_jobs }}</p>
-    <p><strong>Queued Shares:</strong> {{ share_summary.queued_jobs }}</p>
-    <p><strong>Running Shares:</strong> {{ share_summary.running_jobs }}</p>
-    <p><strong>Destinations Used:</strong> {{ share_summary.destination_count }}</p>
-    <p><strong>From Posting:</strong> {{ share_summary.posting_jobs }}</p>
-    <p><strong>From Import:</strong> {{ share_summary.imported_jobs }}</p>
+    <div class="section-heading"><div><span class="eyebrow">Stage 03</span><h2>Posting</h2></div><a href="{{ url_for('history_posting_page') }}">History</a></div>
+    <div class="stat-grid">
+      <div class="stat"><span class="stat-label">Posted jobs</span><div class="stat-value">{{ posting_summary.total_jobs }}</div></div>
+      <div class="stat"><span class="stat-label">Posted data</span><div class="stat-value">{{ posting_summary.total_bytes|humansize }}</div></div>
+      <div class="stat"><span class="stat-label">Largest job</span><div class="stat-value">{{ posting_summary.largest_bytes|humansize }}</div></div>
+      <div class="stat"><span class="stat-label">Average time</span><div class="stat-value">{{ posting_summary.avg_seconds|humanduration }}</div></div>
+    </div>
   </section>
-</div>
-
-<div class="grid two">
   <section class="card">
-    <h2>Clean Stats</h2>
-    <p><strong>Total Clean Actions Logged:</strong> {{ clean_summary.total_actions }}</p>
-    <p><strong>Dry Runs:</strong> {{ clean_summary.dry_runs }}</p>
-    <p><strong>Real Runs:</strong> {{ clean_summary.real_runs }}</p>
-    <p><strong>Successes:</strong> {{ clean_summary.successes }}</p>
-    <p><strong>Failures:</strong> {{ clean_summary.failures }}</p>
-    <p><strong>Recycle Actions:</strong> {{ clean_summary.recycle_actions }}</p>
-    <p><strong>Total Bytes Processed:</strong> {{ clean_summary.bytes_total|humansize }}</p>
+    <div class="section-heading"><div><span class="eyebrow">Stage 04</span><h2>Share</h2></div><a href="{{ url_for('history_share_page') }}">History</a></div>
+    <div class="stat-grid">
+      <div class="stat"><span class="stat-label">Share jobs</span><div class="stat-value">{{ share_summary.total_jobs }}</div></div>
+      <div class="stat"><span class="stat-label">Successful</span><div class="stat-value">{{ share_summary.done_jobs }}</div></div>
+      <div class="stat"><span class="stat-label">Failed</span><div class="stat-value">{{ share_summary.failed_jobs }}</div></div>
+      <div class="stat"><span class="stat-label">Destinations</span><div class="stat-value">{{ share_summary.destination_count }}</div></div>
+    </div>
+  </section>
+  <section class="card">
+    <div class="section-heading"><div><span class="eyebrow">Maintenance</span><h2>Clean</h2></div><a href="{{ url_for('history_clean_page') }}">History</a></div>
+    <div class="stat-grid">
+      <div class="stat"><span class="stat-label">Actions</span><div class="stat-value">{{ clean_summary.total_actions }}</div></div>
+      <div class="stat"><span class="stat-label">Real runs</span><div class="stat-value">{{ clean_summary.real_runs }}</div></div>
+      <div class="stat"><span class="stat-label">Successes</span><div class="stat-value">{{ clean_summary.successes }}</div></div>
+      <div class="stat"><span class="stat-label">Processed</span><div class="stat-value">{{ clean_summary.bytes_total|humansize }}</div></div>
+    </div>
+  </section>
+  <section class="card">
+    <div class="section-heading"><div><span class="eyebrow">Data</span><h2>Quick exports</h2></div></div>
+    <div class="actions">
+      <a class="button secondary" href="{{ url_for('api_history_export') }}">Prepare CSV</a>
+      <a class="button secondary" href="{{ url_for('api_packing_history_export') }}">Packing CSV</a>
+      <a class="button secondary" href="{{ url_for('api_posting_history_export') }}">Posting CSV</a>
+      <a class="button secondary" href="{{ url_for('api_share_history_export') }}">Share CSV</a>
+      <a class="button secondary" href="{{ url_for('api_clean_logs_export') }}">Clean CSV</a>
+    </div>
   </section>
 </div>
 
 <section class="card">
-  <h2>Quick Exports</h2>
-  <p><a href="{{ url_for('api_history_export') }}">Download Prepared History CSV</a></p>
-  <p><a href="{{ url_for('api_clean_logs_export') }}">Download Clean Logs CSV</a></p>
-  <p><a href="{{ url_for('api_packing_history_export') }}">Download Packing History CSV</a></p>
-  <p><a href="{{ url_for('api_posting_history_export') }}">Download Posting History CSV</a></p>
-  <p><a href="{{ url_for('api_share_history_export') }}">Download Share History CSV</a></p>
-</section>
-
-<section class="card">
-  <h2>Recent Actions</h2>
+  <div class="section-heading"><div><h2>Recent actions</h2><p>The latest activity across all workflow stages.</p></div></div>
   {% if recent_actions %}
   <table>
-    <tr><th>Time</th><th>Kind</th><th>Media</th><th>Status</th><th>Item</th><th>Details</th></tr>
-    {% for a in recent_actions %}
-    <tr>
-      <td>{{ a.time }}</td>
-      <td>{{ a.kind }}</td>
-      <td>{{ a.media_type }}</td>
-      <td>{{ a.status }}</td>
-      <td><code>{{ a.title }}</code></td>
-      <td>{{ a.details }}</td>
-    </tr>
-    {% endfor %}
+    <thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col">Media</th><th scope="col">Status</th><th scope="col">Item</th><th scope="col">Details</th></tr></thead>
+    <tbody>{% for a in recent_actions %}<tr><td>{{ a.time }}</td><td>{{ a.kind }}</td><td>{{ a.media_type }}</td><td><span class="badge {{ a.status|lower }}">{{ a.status }}</span></td><td><code>{{ a.title }}</code></td><td>{{ a.details }}</td></tr>{% endfor %}</tbody>
   </table>
-  {% else %}
-  <p>No recent actions yet.</p>
-  {% endif %}
+  {% else %}<div class="empty-state"><strong>No recent actions</strong><span>Completed work will appear here.</span></div>{% endif %}
 </section>
-
-<script>
-let dashboardStream = null;
-function startDashboardStream(){
-  if(dashboardStream) dashboardStream.close();
-  dashboardStream = new EventSource('/api/dashboard/running/stream');
-  dashboardStream.onmessage = (event) => {
-    const d = JSON.parse(event.data || '{}');
-    const box = document.getElementById('runningOverview');
-    const items = d.running || [];
-    if(!items.length){
-      box.innerHTML = '<p>No jobs are currently running.</p>';
-      return;
-    }
-    box.innerHTML = items.map(item => `
-      <article class="job">
-        <h3>${item.kind || ''}</h3>
-        <p><strong>Item:</strong> <code>${item.title || ''}</code></p>
-        <p><strong>Phase:</strong> ${item.phase || ''}</p>
-        <p><strong>Progress:</strong> ${item.percent == null ? '' : item.percent + '%'}</p>
-        <p><strong>Message:</strong> ${item.message || ''}</p>
-      </article>
-    `).join('');
-  };
-  if (window.prepacEventStreamAuthErrorHandler) dashboardStream.onerror = window.prepacEventStreamAuthErrorHandler(dashboardStream);
-}
-document.addEventListener('visibilitychange', () => {
-  if(document.hidden){
-    if(dashboardStream) dashboardStream.close();
-  } else {
-    startDashboardStream();
-  }
-});
-startDashboardStream();
-</script>
 {% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/dashboard.js') }}?v={{ build_number }}" defer></script>{% endblock %}

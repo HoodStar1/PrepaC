@@ -1,5 +1,5 @@
 import csv
-import json
+import hashlib
 import math
 import os
 import random
@@ -11,7 +11,6 @@ import time
 from threading import Lock
 import pathlib
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 from PIL import Image, ImageOps, ImageDraw, ImageFont
@@ -19,23 +18,26 @@ from PIL import Image, ImageOps, ImageDraw, ImageFont
 from app.media_probe import detect_tags, build_bracket_from_detected
 from app.db import load_settings
 from app.jobs import list_jobs
-from app.secret_utils import resolve_secret
 from app.workflow_paths import packing_output_root, packing_watch_root
-from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
+from app.path_guardrails import (
+    assert_no_symlinks_in_path,
+    assert_operation_path,
+    assert_paths_disjoint,
+    assert_tree_has_no_symlinks,
+)
 from app.cache_store import SCAN_CACHE
 from app.metrics import inc, observe
 from app.subprocess_utils import run_command_with_output
 from app.packing_jobs import (
     add_packing_event,
+    begin_packing_output_reset,
+    begin_packing_finalization,
     create_packing_job,
     finish_packing,
-    has_successful_packing,
-    list_packing_jobs,
-    start_packing,
+    mark_packing_outcome_unknown,
     update_packing_job,
     get_existing_active_packing_job_id,
     has_outdated_or_missing_successful_packing,
-    count_running_packing_jobs,
     try_claim_packing_slot,
     latest_successful_packing_job_id,
     reconcile_orphaned_running_packing_jobs,
@@ -53,6 +55,7 @@ SECTION_RE = re.compile(r"^//([^/]+)//\s*$")
 PACKING_SLOT_LOCK = Lock()
 PACKING_ACTIVE_COUNT = 0
 PACKING_ACTIVE_JOB_IDS = set()
+PACKING_SCHEDULED_JOB_IDS = set()
 
 
 def _mark_packing_job_active(job_id):
@@ -96,6 +99,11 @@ def largest_video(path: Path):
             pass
     return best
 
+
+def packing_candidate_id(source_path):
+    canonical = str(Path(source_path).resolve(strict=False))
+    return "packing:" + hashlib.sha256(canonical.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
+
 def scan_watch_folder(settings):
     reconcile_orphaned_packing_jobs_in_process()
     watch = packing_watch_root(settings)
@@ -122,7 +130,7 @@ def scan_watch_folder(settings):
         if dest_path not in latest_prepare_finished or finished_at > latest_prepare_finished[dest_path]:
             latest_prepare_finished[dest_path] = finished_at
 
-    for p in sorted([x for x in watch.iterdir() if x.is_dir()]):
+    for p in sorted([x for x in watch.iterdir() if x.is_dir() and not x.is_symlink()]):
         if p.name.startswith("_packed"):
             continue
         source_path = str(p)
@@ -135,6 +143,7 @@ def scan_watch_folder(settings):
         probe = detect_tags(str(rep)) if rep else {}
         chosen_bracket = build_bracket_from_detected(probe) if probe else ""
         jobs.append({
+            "candidate_id": packing_candidate_id(p),
             "source_path": source_path,
             "job_name": p.name,
             "size_bytes": size,
@@ -148,6 +157,15 @@ def scan_watch_folder(settings):
         })
     observe("prepac_scan_seconds", max(0.0, time.time() - started), kind="packing")
     return SCAN_CACHE.set(cache_key, jobs, ttl_seconds=15)
+
+
+def resolve_packing_candidate(candidate_id, settings):
+    candidate_id = str(candidate_id or "").strip()
+    candidates = {item["candidate_id"]: item for item in scan_watch_folder(settings)}
+    candidate = candidates.get(candidate_id)
+    if not candidate:
+        raise ValueError("Packing candidate is no longer available; refresh the list.")
+    return candidate
 
 def choose_volume_size(total_bytes):
     estimates = [(s, math.ceil(total_bytes / s) if s else 0) for s in ALLOWED_VOLUMES]
@@ -224,7 +242,7 @@ def detect_hdr_filter(media_info):
 
 def ffprobe_duration(video_path):
     try:
-        out = subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","default=nk=1:nw=1",str(video_path)], stderr=subprocess.STDOUT).decode().strip()
+        out = subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","default=nk=1:nw=1",str(video_path)], stderr=subprocess.STDOUT, timeout=60).decode().strip()
         return float(out)
     except Exception:
         return 0.0
@@ -570,7 +588,7 @@ def create_collage(video_path: Path, out_path: Path, media_info):
                 cmd += ["-vf", vf]
             cmd += [str(thumb)]
             try:
-                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
                 if thumb.exists() and thumb.stat().st_size > 0:
                     thumbs.append((slot, thumb, ts))
                     break
@@ -680,7 +698,7 @@ def resolve_thumbnail_code_second_pass(existing_code, settings):
     return existing_code or ""
 def mediainfo_summary(video_path):
     try:
-        out = subprocess.check_output(["mediainfo", str(video_path)], stderr=subprocess.STDOUT).decode("utf-8","replace")
+        out = subprocess.check_output(["mediainfo", str(video_path)], stderr=subprocess.STDOUT, timeout=60).decode("utf-8","replace")
         return out
     except Exception:
         return ""
@@ -739,6 +757,15 @@ def template_text(job_name, header_name, groups, size_gb, password, nzb_name, im
         parts.append(f"[img]{imgbox_url}[/img]")
     return "\n".join(parts)
 
+def safe_csv_cell(value):
+    """Neutralize formula-like cells while preserving human-readable text."""
+    text = str(value if value is not None else "")
+    probe = text.lstrip(" \t\r\n")
+    if probe.startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
 def append_joblist(csv_path: Path, row):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     exists = csv_path.exists()
@@ -746,7 +773,7 @@ def append_joblist(csv_path: Path, row):
         w = csv.writer(f)
         if not exists:
             w.writerow(["Job Name", "Header", "Password", "Source Size", "Estimated Payload", "Date"])
-        w.writerow(row)
+        w.writerow([safe_csv_cell(value) for value in row])
 
 def run_cmd(cmd, cwd=None):
     return run_command_with_output(cmd, cwd=cwd, retries=1)
@@ -788,7 +815,9 @@ def strip_dest_root_prefix(text: str, dest_root: str) -> str:
 
 
 def _reset_directory_contents(path: Path):
+    assert_no_symlinks_in_path(path, "packing output directory")
     path.mkdir(parents=True, exist_ok=True)
+    assert_no_symlinks_in_path(path, "packing output directory")
     for child in list(path.iterdir()):
         try:
             if child.is_dir() and not child.is_symlink():
@@ -810,30 +839,58 @@ def media_type_for_job_path(job_path: Path):
         return "movie"
     return "packing"
 def run_packing_job(job_id, source_path, settings):
-    allowed_roots = build_allowed_roots(settings)
-    assert_no_parent_traversal(source_path, "packing source")
-    assert_path_within_roots(source_path, allowed_roots, "packing source")
-    source = Path(source_path)
-    job_name = source.name
-    packed_root = packing_output_root(settings)
-    pack_job_root = packed_root / job_name
-    output_files_root = packed_root / "output files" / job_name
-    _prepare_clean_packing_roots(pack_job_root, output_files_root)
     try:
-        command_silence_timeout = max(120, int(str(settings.get("packing_command_silence_timeout_seconds", os.environ.get("PREPAC_PACKING_COMMAND_SILENCE_TIMEOUT_SECONDS", "1200")) or "1200").strip()))
-    except Exception:
-        command_silence_timeout = 1200
-    try:
-        command_runtime_timeout = max(300, int(str(settings.get("packing_command_runtime_timeout_seconds", os.environ.get("PREPAC_PACKING_COMMAND_RUNTIME_TIMEOUT_SECONDS", "21600")) or "21600").strip()))
-    except Exception:
-        command_runtime_timeout = 21600
-
-    try:
+        # Keep preflight cancellable, then atomically claim the destructive
+        # output-reset boundary. The inverse cancellation CAS guarantees that
+        # either cancellation wins before cleanup or this worker owns cleanup;
+        # a cancelled job can never be resurrected and clear prior output.
         current_status = get_packing_job_status(job_id).lower()
         if current_status == "cancelled":
             return
+        source = assert_operation_path(
+            source_path, settings, "packing_source", "packing source",
+            require_exists=True, require_directory=True,
+        )
+        assert_tree_has_no_symlinks(source, "packing source tree")
+        job_name = source.name
+        packed_root = packing_output_root(settings)
+        pack_job_root = assert_operation_path(
+            packed_root / job_name, settings, "packing_output", "packed job output",
+        )
+        output_files_root = assert_operation_path(
+            packed_root / "output files" / job_name, settings, "packing_output", "packing metadata output",
+        )
+        assert_paths_disjoint(source, pack_job_root, "packing source", "packed job output")
+        assert_paths_disjoint(source, output_files_root, "packing source", "packing metadata output")
+        assert_paths_disjoint(pack_job_root, output_files_root, "packed job output", "packing metadata output")
+        if not begin_packing_output_reset(job_id):
+            current_status = get_packing_job_status(job_id).lower()
+            if current_status == "cancelled":
+                return
+            raise RuntimeError(
+                f"Packing job cannot claim output reset from status {current_status or 'missing'}"
+            )
+        add_packing_event(
+            job_id,
+            "resetting",
+            "Packing output claimed; clearing prior output directories",
+            1,
+        )
+        _prepare_clean_packing_roots(pack_job_root, output_files_root)
+        try:
+            command_silence_timeout = max(120, int(str(settings.get("packing_command_silence_timeout_seconds", os.environ.get("PREPAC_PACKING_COMMAND_SILENCE_TIMEOUT_SECONDS", "1200")) or "1200").strip()))
+        except Exception:
+            command_silence_timeout = 1200
+        try:
+            command_runtime_timeout = max(300, int(str(settings.get("packing_command_runtime_timeout_seconds", os.environ.get("PREPAC_PACKING_COMMAND_RUNTIME_TIMEOUT_SECONDS", "21600")) or "21600").strip()))
+        except Exception:
+            command_runtime_timeout = 21600
+
+        current_status = get_packing_job_status(job_id).lower()
         if current_status != "running":
-            start_packing(job_id)
+            raise RuntimeError(
+                f"Packing worker lost output ownership while status became {current_status or 'missing'}"
+            )
         add_packing_event(job_id, "stability", "Checking folder stability...", 2)
         delay = int(settings.get("packing_stability_delay","30") or 30)
         size1 = folder_size(source)
@@ -843,6 +900,13 @@ def run_packing_job(job_id, source_path, settings):
         size2 = folder_size(source)
         if size1 != size2:
             add_packing_event(job_id, "stability", f"Folder changed during check. Latest size: {round(size2/GB,2)} GB", 6)
+        assert_operation_path(
+            source, settings, "packing_source", "packing source",
+            require_exists=True, require_directory=True,
+        )
+        assert_tree_has_no_symlinks(source, "packing source tree")
+        assert_no_symlinks_in_path(pack_job_root, "packed job output")
+        assert_no_symlinks_in_path(output_files_root, "packing metadata output")
         size_bytes = size2
         update_packing_job(job_id, size_bytes=size_bytes, output_root=str(pack_job_root), output_files_root=str(output_files_root))
         add_packing_event(job_id, "analysis", f"Calculating job details for {round(size_bytes/GB,2)} GB", 10)
@@ -965,6 +1029,13 @@ def run_packing_job(job_id, source_path, settings):
         update_packing_job(job_id, par2_size_bytes=par_total_bytes, par2_time_seconds=par_elapsed)
         add_packing_event(job_id, "par2", f"PAR2 generation complete: {len(par_files)} parity files written", 80)
 
+        # From this point onward the workflow writes final metadata and may remove
+        # the source. Claim a non-cancellable finalization state atomically so a
+        # late cancel cannot report success while deletion still proceeds.
+        if not begin_packing_finalization(job_id):
+            raise RuntimeError("Packing job cancelled before finalization")
+        add_packing_event(job_id, "finalizing", "Finalizing packing outputs", 81)
+
         # Thumbnail + imgbox
         rep = largest_video(source)
         probe = detect_tags(str(rep)) if rep else {}
@@ -1060,6 +1131,12 @@ def run_packing_job(job_id, source_path, settings):
         if str(settings.get("packing_delete_source_after_success","true")).lower() == "true":
             add_packing_event(job_id, "cleanup", "Deleting source folder after successful packing", 99)
             try:
+                assert_operation_path(
+                    source, settings, "packing_source", "packing source",
+                    require_exists=True, require_directory=True,
+                )
+                assert_tree_has_no_symlinks(source, "packing source tree")
+                assert_paths_disjoint(source, pack_job_root, "packing source", "packed job output")
                 shutil.rmtree(source)
             except Exception as delete_error:
                 raise RuntimeError(f"Packed successfully but failed to delete source folder: {delete_error}")
@@ -1073,16 +1150,32 @@ def run_packing_job(job_id, source_path, settings):
         if current_status == "cancelled":
             add_packing_event(job_id, "cancelled", "Packing job stopped by user", None)
             return
-        if current_status in {"failed", "done"}:
+        if current_status == "finalizing":
+            mark_packing_outcome_unknown(
+                job_id,
+                "Packing finalization failed after the commit boundary; verify outputs and source cleanup before force retry.",
+            )
+            return
+        if current_status in {"failed", "done", "outcome_unknown"}:
             add_packing_event(job_id, "stopped", f"Packing worker stopped because job is already {current_status}", None)
             return
         finish_packing(job_id, False, str(e))
         add_packing_event(job_id, "failed", str(e), None)
-def start_packing_job_async(source_path, settings):
-    source = Path(source_path)
+def start_packing_job_async(source_path, settings, idempotency_key=None):
+    source = assert_operation_path(
+        source_path, settings, "packing_source", "packing source",
+        require_exists=True, require_directory=True,
+    )
+    assert_tree_has_no_symlinks(source, "packing source tree")
     packed_root = packing_output_root(settings)
-    pack_job_root = packed_root / source.name
-    output_files_root = packed_root / "output files" / source.name
+    pack_job_root = assert_operation_path(
+        packed_root / source.name, settings, "packing_output", "packed job output",
+    )
+    output_files_root = assert_operation_path(
+        packed_root / "output files" / source.name, settings, "packing_output", "packing metadata output",
+    )
+    assert_paths_disjoint(source, pack_job_root, "packing source", "packed job output")
+    assert_paths_disjoint(source, output_files_root, "packing source", "packing metadata output")
     reconcile_orphaned_packing_jobs_in_process()
     existing_active_id = get_existing_active_packing_job_id(str(source))
     if existing_active_id:
@@ -1102,10 +1195,19 @@ def start_packing_job_async(source_path, settings):
         existing_done_id = latest_successful_packing_job_id(source_key)
         if existing_done_id:
             return existing_done_id
-    job_id = create_packing_job(str(source), source.name, str(pack_job_root), str(output_files_root))
+    create_result = create_packing_job(
+        str(source), source.name, str(pack_job_root), str(output_files_root),
+        idempotency_key=idempotency_key, return_created=True,
+    )
+    job_id, created = create_result if isinstance(create_result, tuple) else (create_result, True)
+    if not created:
+        return job_id
     import threading
 
-    def _runner():
+    with PACKING_SLOT_LOCK:
+        PACKING_SCHEDULED_JOB_IDS.add(int(job_id))
+
+    def _queued_runner():
         last_wait_event_ts = 0.0
         last_wait_max_jobs = None
         wait_started_ts = time.monotonic()
@@ -1144,6 +1246,14 @@ def start_packing_job_async(source_path, settings):
         try:
             run_packing_job(job_id, str(source), load_settings())
         finally:
+            _mark_packing_job_inactive(job_id)
+
+    def _runner():
+        try:
+            _queued_runner()
+        finally:
+            with PACKING_SLOT_LOCK:
+                PACKING_SCHEDULED_JOB_IDS.discard(int(job_id))
             _mark_packing_job_inactive(job_id)
 
     SCAN_CACHE.invalidate_prefix("scan:packing")

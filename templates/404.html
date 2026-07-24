@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Page not found · PrepaC{% endblock %}
+{% block page_label %}Page not found{% endblock %}
+{% block content %}
+<section class="error-page card" aria-labelledby="error-title">
+  <span class="error-code" aria-hidden="true">404</span>
+  <div>
+    <span class="eyebrow">Not found</span>
+    <h1 id="error-title">This page is not available</h1>
+    <p>The address may be incorrect, or the page may have moved.</p>
+    <div class="actions">
+      <a class="button" href="{{ url_for('dashboard') }}">Return to dashboard</a>
+      <a class="button secondary" href="{{ url_for('help_page') }}">Open help</a>
+    </div>
+  </div>
+</section>
+{% endblock %}

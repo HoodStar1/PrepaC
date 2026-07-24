@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% block title %}Clean history · PrepaC{% endblock %}
+{% block page_label %}Clean history{% endblock %}
 {% block content %}
+<section class="page-header"><div><span class="eyebrow">Maintenance history</span><h1>Clean history</h1><p>Dry runs, file actions, logical sizes, and recorded results.</p></div><a class="button secondary" href="{{ url_for('api_clean_logs_export') }}">Download CSV</a></section>
 <section class="card">
-  <h2>Clean History</h2>
-  <p><a href="{{ url_for('api_clean_logs_export') }}">Download CSV</a></p>
+  <div class="section-heading"><div><h2>Recorded actions</h2><p>Expand a row to inspect storage and execution details.</p></div></div>
   {% if logs %}
   <table>
     <tr><th>Date</th><th>Type</th><th>Reason</th><th>Target</th><th>Dry Run</th><th>Success</th><th>Logical Size</th><th>Message</th></tr>
@@ -22,7 +24,6 @@
         <details><summary>Breakdown / Details</summary>
           <p><strong>Breakdown:</strong></p>
           <pre>{{ l.breakdown_json|prettyjson }}</pre>
-          <p><strong>Actual freed:</strong> {% set d = l.details_json|prettyjson %}</p>
           <p><strong>Details:</strong></p>
           <pre>{{ l.details_json|prettyjson }}</pre>
         </details>
@@ -31,7 +32,7 @@
     {% endfor %}
   </table>
   {% else %}
-  <p>No clean actions yet.</p>
+  <div class="empty-state"><strong>No clean actions</strong></div>
   {% endif %}
 </section>
 {% endblock %}

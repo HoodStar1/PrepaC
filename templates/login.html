@@ -1,18 +1,22 @@
 {% extends "base.html" %}
+{% block title %}Sign in · PrepaC{% endblock %}
+{% block page_label %}Secure local access{% endblock %}
 {% block content %}
-<section class="card" style="max-width: 460px; margin: 2rem auto;">
-  <h2>Sign In</h2>
-  <form method="post" action="{{ url_for('login_page') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="next" value="{{ next_url }}">
-    <div class="form-grid">
-      <label><span>Username</span><input type="text" name="username" required></label>
-      <label><span>Password</span><input type="password" name="password" required></label>
-    </div>
-    <div class="row" style="margin-top:1rem;">
-      <button type="submit">Sign In</button>
-      <a href="{{ url_for('reset_password_page') }}">Forgot password?</a>
-    </div>
-  </form>
-</section>
+<div class="auth-shell">
+  <section class="card auth-card" aria-labelledby="login-title">
+    <span class="brand-mark" aria-hidden="true">P</span>
+    <h1 id="login-title">Welcome back</h1>
+    <p>Sign in to manage your media workflows.</p>
+    <form method="post" action="{{ url_for('login_page') }}" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label for="login-username"><span>Username</span><input id="login-username" type="text" name="username" autocomplete="username" required autofocus></label>
+      <label for="login-password"><span>Password</span><input id="login-password" type="password" name="password" autocomplete="current-password" required></label>
+      <div class="actions">
+        <button type="submit">Sign in</button>
+        <a class="button ghost" href="{{ url_for('reset_password_page') }}">Forgot password?</a>
+      </div>
+    </form>
+  </section>
+</div>
 {% endblock %}

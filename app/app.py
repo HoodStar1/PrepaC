@@ -1,5 +1,7 @@
 
 import csv
+import hashlib
+import hmac
 import io
 import os
 import logging
@@ -7,37 +9,48 @@ import pathlib
 import json
 import re
 import threading
-import signal
 import atexit
 import time
 import secrets
 import requests
-from flask import Flask, jsonify, redirect, render_template, request, url_for, flash, Response, session, stream_with_context
+from flask import Flask, jsonify, redirect, render_template, request, url_for, flash, Response, session, stream_with_context, has_request_context, send_file
+from flask.sessions import SecureCookieSessionInterface
 from urllib.parse import urlencode, urlparse
 from jsonschema import validate, ValidationError as JsonSchemaValidationError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from app.db import init_db, load_settings, save_settings, get_conn
-from app.jobs import create_job, add_job_event, list_jobs, list_jobs_by_status, interrupt_running_prepare_jobs, try_claim_prepare_slot, cancel_prepare_job, get_prepare_job_status, register_prepare_worker, unregister_prepare_worker, reconcile_prepare_running_jobs, finish_job
-from app.history_db import list_history, delete_prepared_by_source_path, delete_prepared_by_id
+from app.db import (
+    CONFIG_DIR,
+    DB_PATH,
+    SCHEMA_VERSION,
+    AUTH_SETTING_KEYS,
+    db_is_corrupt,
+    init_db,
+    load_settings,
+    save_settings_patch,
+    update_auth_settings_atomic,
+    get_conn,
+)
+from app.jobs import create_job, add_job_event, list_jobs, list_jobs_by_status, try_claim_prepare_slot, cancel_prepare_job, register_prepare_worker, unregister_prepare_worker, set_job_status, prepare_should_stop, acknowledge_prepare_outcome_unknown_for_resubmission, fail_prepare_job_if_active
+from app.history_db import list_history, delete_prepared_by_id
 from app.clean_actions import list_clean_actions
 from app.prepare_tv import search_shows, list_seasons, preview_tv
 from app.prepare_movie import search_movies, preview_movie
 from app.copy_engine import run_tv_prepare, run_movie_prepare
-from app.plex_clean_preview import list_libraries, preview_clean, search_posters_for_prepare
+from app.plex_clean_preview import preview_clean, search_posters_for_prepare, resolve_clean_candidate_ids, clean_candidate_id, normalize_clean_filter_scope
 from app.clean_engine import delete_candidate
 from app.plex_auth import create_pin, check_pin, list_servers_for_token, save_selected_server, build_auth_url, choose_best_server_connection
 from app.plex_notify import notify_after_clean
 from app.posters import show_poster, movie_poster
-from app.packing_core import scan_watch_folder, start_packing_job_async
-from app.packing_jobs import list_packing_jobs, list_packing_jobs_by_status, list_packing_history, interrupt_running_packing_jobs, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job
-from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats, get_posting_providers
+from app.packing_core import scan_watch_folder, start_packing_job_async, resolve_packing_candidate
+from app.packing_jobs import list_packing_jobs, list_packing_jobs_by_status, list_packing_history, get_existing_active_packing_job_id, has_outdated_or_missing_successful_packing, add_packing_event, cancel_packing_job, acknowledge_packing_outcome_unknown_for_resubmission
+from app.posting_core import scan_posting_candidates, start_posting_job_async, get_posting_live_output, get_posting_live_stats, get_posting_providers, resolve_posting_candidate
 from app.posting_provider_config import sanitize_posting_provider_items
-from app.data_sanitizer import redact_sensitive_data, redact_cli_command, sanitize_provider_param
-from app.posting_jobs import list_posting_jobs, list_posting_jobs_by_status, list_posting_history, interrupt_running_posting_jobs, add_posting_event, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job
+from app.data_sanitizer import redact_sensitive_data
+from app.posting_jobs import list_posting_jobs, list_posting_jobs_by_status, list_posting_history, get_existing_active_posting_job_id, has_outdated_or_missing_successful_posting, cancel_posting_job, acknowledge_posting_outcome_unknown_for_resubmission
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
-from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, maybe_auto_share_posting_job, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
-from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry, cancel_share_job
+from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, normalize_share_base_url, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
+from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry, force_retry_share_outcome_unknown, cancel_share_job
 from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
@@ -55,8 +68,13 @@ from app.web_security import (
     is_unsafe_http_method,
     share_import_limit_bytes,
     share_import_limit_mebibytes,
+    host_is_allowed,
+    is_trusted_proxy_peer,
+    resolve_client_ip,
+    normalize_service_base_url,
 )
 from app.workflow_paths import posting_posted_root, settings_with_effective_workflow_paths
+from app.timestamp_utils import local_now, parse_local_timestamp
 
 
 
@@ -68,13 +86,14 @@ _POSTING_PROVIDER_SCHEMA = {
         "id": {"type": "string", "maxLength": 256},
         "name": {"type": "string", "maxLength": 256},
         "enabled": {"type": "boolean"},
-        "host": {"type": "string", "minLength": 1, "maxLength": 256},
+        "host": {"type": "string", "maxLength": 256},
         "port": {"type": ["string", "integer"], "minimum": 1, "maximum": 65535},
         "ssl": {"type": "boolean"},
         "username": {"type": "string", "maxLength": 256},
         "password": {"type": "string", "maxLength": 128},
         "connections": {"type": ["string", "integer"], "minimum": 1, "maximum": 1000},
         "max_connections": {"type": ["string", "integer"], "minimum": 1, "maximum": 1000},
+        "account_group": {"type": "string", "maxLength": 256},
         "priority_up_to_gb": {"type": ["string", "integer"], "minimum": 0, "maximum": 999999},
     },
     "additionalProperties": False,
@@ -91,6 +110,27 @@ def _validate_posting_providers(provider_items):
         
         try:
             validate(instance=item, schema=_POSTING_PROVIDER_SCHEMA)
+            if item.get("enabled") and not str(item.get("host") or "").strip():
+                raise JsonSchemaValidationError("Enabled providers require a host")
+            for key, minimum, maximum in (
+                ("port", 1, 65535),
+                ("connections", 1, 1000),
+                ("max_connections", 1, 1000),
+                ("priority_up_to_gb", 0, 999999),
+            ):
+                raw_value = item.get(key)
+                if raw_value is None or str(raw_value).strip() == "":
+                    continue
+                if isinstance(raw_value, bool):
+                    raise JsonSchemaValidationError(f"{key} must be an integer")
+                try:
+                    parsed_value = int(str(raw_value).strip(), 10)
+                except (TypeError, ValueError) as exc:
+                    raise JsonSchemaValidationError(f"{key} must be an integer") from exc
+                if not minimum <= parsed_value <= maximum:
+                    raise JsonSchemaValidationError(
+                        f"{key} must be between {minimum} and {maximum}"
+                    )
         except JsonSchemaValidationError as e:
             raise JsonSchemaValidationError(f"Provider {idx}: {e.message}")
 
@@ -112,6 +152,7 @@ def _default_posting_provider(idx):
         "password": "",
         "connections": "25",
         "max_connections": "25",
+        "account_group": "",
         "priority_up_to_gb": "0" if idx == 1 else "0",
     }
 
@@ -125,14 +166,55 @@ def _display_posting_providers(settings, display_settings):
         item.update(provider or {})
         item["id"] = _provider_slug(item.get("id") or item.get("name"), idx)
         item["name"] = str(item.get("name") or f"Provider {idx}").strip() or f"Provider {idx}"
-        item["password"] = "" if source in {"secret_file", "env_var"} else (display_settings.get(f"posting_provider{idx}_password") if idx <= 2 else ("********" if str(item.get("password") or "").strip() else ""))
+        item["password_configured"] = bool(str(item.get("password") or "").strip())
+        item["password"] = ""
         item["password_source"] = display_settings.get(f"posting_provider{idx}_password_source", "saved_setting" if str(provider.get("password") or "").strip() else "unset") if idx <= 2 else ("saved_setting" if str(provider.get("password") or "").strip() else "unset")
+        item["account_group"] = str(item.get("account_group", "") or "").strip()
         item["priority_up_to_gb"] = str(item.get("priority_up_to_gb", "0") or "0").strip() or "0"
         normalized.append(item)
     while len(normalized) < 2:
         normalized.append(_default_posting_provider(len(normalized) + 1))
-    editor_value = settings.get("posting_providers_json", "[]") if source == "saved_setting" else ""
+    editor_value = json.dumps(normalized, ensure_ascii=False, indent=2) if source == "saved_setting" else ""
     return normalized, editor_value, source
+
+
+_SHARE_DESTINATION_KEYS = {
+    "id", "name", "enabled", "mode", "base_url", "api_key", "basic_auth",
+    "username", "password", "include_nfo", "include_mediainfo", "includemeta",
+    "categories_cache", "category_overrides",
+}
+
+
+def _display_share_destinations(settings):
+    source = secret_source("share_destinations_json", settings)
+    public = []
+    for idx, destination in enumerate(get_share_destinations(settings), start=1):
+        entry = {key: value for key, value in destination.items() if key in _SHARE_DESTINATION_KEYS}
+        entry["id"] = _provider_slug(entry.get("id") or entry.get("name"), idx)
+        entry["name"] = str(entry.get("name") or f"Destination {idx}").strip() or f"Destination {idx}"
+        entry["api_key_configured"] = bool(str(entry.get("api_key") or "").strip())
+        entry["password_configured"] = bool(str(entry.get("password") or "").strip())
+        entry["api_key"] = ""
+        entry["password"] = ""
+        public.append(entry)
+    editor = json.dumps(public, ensure_ascii=False, indent=2) if source == "saved_setting" else ""
+    return public, editor, source
+
+
+def _template_safe_settings(settings):
+    """Preserve non-secret UI settings without placing credentials in page HTML."""
+    safe = dict(settings or {})
+    secret_keys = set(SECRET_SPECS) | {
+        "auth_password_hash", "auth_recovery_hash",
+    }
+    for key in secret_keys:
+        if key in safe:
+            safe[key] = ""
+    safe["posting_providers_json"] = "[]"
+    safe["share_destinations_json"] = "[]"
+    safe["plex_token_configured"] = secret_source("plex_token", settings) != "unset"
+    safe["packing_freeimage_api_key_configured"] = secret_source("packing_freeimage_api_key", settings) != "unset"
+    return safe
 
 
 def _sync_legacy_posting_provider_settings(data, providers):
@@ -166,13 +248,20 @@ def _metrics_token_valid() -> bool:
     configured = _metrics_token()
     if not configured:
         return False
-    provided = str(request.headers.get("X-Prepac-Metrics-Token", "") or request.args.get("token", "") or "").strip()
+    provided = str(request.headers.get("X-Prepac-Metrics-Token", "") or "").strip()
     return bool(provided) and secrets.compare_digest(provided, configured)
 
 
 def _session_cookie_mode() -> str:
-    mode = str(os.environ.get("PREPAC_SESSION_COOKIE_MODE", "legacy") or "legacy").strip().lower()
+    mode = str(os.environ.get("PREPAC_SESSION_COOKIE_MODE", "auto") or "auto").strip().lower()
     return mode if mode in {"legacy", "auto", "always", "never"} else "legacy"
+
+
+def _proxy_headers_trusted() -> bool:
+    if not _bool_env("PREPAC_TRUST_PROXY_HEADERS", False):
+        return False
+    configured = os.environ.get("PREPAC_TRUSTED_PROXIES")
+    return is_trusted_proxy_peer(request.remote_addr, configured)
 
 
 def _resolve_session_cookie_secure() -> bool:
@@ -187,7 +276,7 @@ def _resolve_session_cookie_secure() -> bool:
     # auto mode: enable for direct HTTPS or trusted proxy HTTPS headers.
     if request.is_secure:
         return True
-    if _bool_env("PREPAC_TRUST_PROXY_HEADERS", False):
+    if _proxy_headers_trusted():
         forwarded_proto = str(request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
         if forwarded_proto == "https":
             return True
@@ -198,32 +287,51 @@ def _load_or_create_flask_secret() -> str:
     env_value = (os.environ.get("PREPAC_FLASK_SECRET_KEY", "") or "").strip()
     if env_value:
         return env_value
-    secret_path = pathlib.Path("/config/flask_secret_key")
-    try:
-        secret_path.parent.mkdir(parents=True, exist_ok=True)
-        if secret_path.exists():
-            existing = secret_path.read_text(encoding="utf-8", errors="replace").strip()
-            if existing:
-                return existing
-        generated = secrets.token_urlsafe(64)
-        secret_path.write_text(generated, encoding="utf-8")
+    secret_path = CONFIG_DIR / "flask_secret_key"
+    secret_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for _ in range(50):
         try:
-            os.chmod(secret_path, 0o600)
-        except Exception:
-            pass
-        return generated
-    except Exception:
-        return secrets.token_urlsafe(64)
+            if secret_path.exists():
+                existing = secret_path.read_text(encoding="utf-8", errors="strict").strip()
+                if existing:
+                    try:
+                        os.chmod(secret_path, 0o600)
+                    except OSError:
+                        pass
+                    return existing
+                time.sleep(0.02)
+                continue
+            generated = secrets.token_urlsafe(64)
+            fd = os.open(str(secret_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(generated + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return generated
+        except FileExistsError:
+            time.sleep(0.02)
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"Unable to create or read the persistent Flask secret at {secret_path}") from exc
+    raise RuntimeError(f"Persistent Flask secret at {secret_path} remained empty or unstable")
+
+
+class AdaptiveSecureCookieSessionInterface(SecureCookieSessionInterface):
+    def get_cookie_secure(self, app_obj):
+        if has_request_context():
+            return _resolve_session_cookie_secure()
+        return super().get_cookie_secure(app_obj)
 
 setup_logging()
 LOG = logging.getLogger(__name__)
 
 app = Flask(__name__, template_folder="../templates", static_folder="../static")
+app.session_interface = AdaptiveSecureCookieSessionInterface()
 app.secret_key = _load_or_create_flask_secret()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=_bool_env("PREPAC_SESSION_COOKIE_SECURE", True),  # Changed default to True
+    SESSION_COOKIE_SECURE=_bool_env("PREPAC_SESSION_COOKIE_SECURE", False),
     MAX_CONTENT_LENGTH=share_import_limit_bytes(os.environ.get("PREPAC_SHARE_IMPORT_MAX_MB")),
 )
 init_db()
@@ -261,12 +369,58 @@ def auth_recovery_hash(settings=None):
     settings = settings or load_settings()
     return str(settings.get("auth_recovery_hash", "") or "").strip()
 
+
+_COMMON_PASSWORDS = {
+    "admin", "changeme", "letmein", "password", "password1", "prepac",
+    "qwerty", "welcome", "12345678", "123456789", "1234567890",
+}
+_AUTH_DUMMY_HASH = generate_password_hash(secrets.token_urlsafe(32))
+
+
+def _password_policy_error(password: str) -> str | None:
+    candidate = str(password or "")
+    if len(candidate) < 12:
+        return "Password must be at least 12 characters."
+    if candidate.casefold() in _COMMON_PASSWORDS:
+        return "Choose a less common password."
+    return None
+
+
+def _password_requires_change(password: str) -> bool:
+    return _password_policy_error(password) is not None
+
+
+def _next_auth_session_epoch(settings) -> int:
+    return _auth_session_epoch(settings) + 1
+
+
+def _establish_authenticated_session(settings, username: str):
+    session.clear()
+    ensure_csrf_token(session)
+    session["auth_ok"] = True
+    session["auth_user"] = str(username or "")
+    session["auth_epoch"] = _auth_session_epoch(settings)
+
 def reset_token_configured():
     token = resolve_secret("auth_password_reset_token", {})
     return bool(str(token or "").strip())
 
-def is_authenticated():
-    return session.get("auth_ok") is True
+def _auth_session_epoch(settings=None):
+    settings = settings or load_settings()
+    try:
+        return max(1, int(str(settings.get("auth_session_epoch", "1") or "1")))
+    except Exception:
+        return 1
+
+
+def is_authenticated(settings=None):
+    if session.get("auth_ok") is not True:
+        return False
+    settings = settings or load_settings()
+    try:
+        return int(session.get("auth_epoch", 0) or 0) == _auth_session_epoch(settings)
+    except Exception:
+        return False
 
 
 def current_external_base_url():
@@ -276,6 +430,9 @@ def current_external_base_url():
         forwarded_proto=request.headers.get("X-Forwarded-Proto", ""),
         forwarded_host=request.headers.get("X-Forwarded-Host", ""),
         trust_proxy=_bool_env("PREPAC_TRUST_PROXY_HEADERS", False),
+        peer_address=request.remote_addr,
+        trusted_proxy_networks=os.environ.get("PREPAC_TRUSTED_PROXIES"),
+        trusted_hosts=os.environ.get("PREPAC_TRUSTED_HOSTS"),
     )
 
 
@@ -308,8 +465,12 @@ def _track_request_start():
 
 
 @app.before_request
-def _apply_session_cookie_mode_per_request():
-    app.config["SESSION_COOKIE_SECURE"] = _resolve_session_cookie_secure()
+def _validate_request_host():
+    try:
+        if not host_is_allowed(request.host, os.environ.get("PREPAC_TRUSTED_HOSTS")):
+            raise ValueError("host is not allowed")
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid or untrusted Host header"}), 400
 
 
 @app.before_request
@@ -337,12 +498,46 @@ def _enforce_csrf():
     flash(message, "error")
     return redirect(_safe_next_url(_current_request_relative_url()))
 
+
+@app.before_request
+def _limit_json_request_bodies():
+    content_length = request.content_length
+    if request.path.startswith("/api/") and request.is_json:
+        if content_length is not None and content_length > 1024 * 1024:
+            return jsonify({"ok": False, "error": "JSON request body is limited to 1 MiB"}), 413
+        if is_unsafe_http_method(request.method):
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                return jsonify({"ok": False, "error": "A valid JSON object is required"}), 400
+    if (
+        is_unsafe_http_method(request.method)
+        and request.endpoint not in {"api_share_import", "api_share_import_bulk"}
+        and content_length is not None
+        and content_length > 2 * 1024 * 1024
+    ):
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "Request body is limited to 2 MiB"}), 413
+        return "Request body too large", 413
+
 @app.after_request
 def _track_request_metrics(response):
     started_at = getattr(request, "_prepac_started_at", None)
     if started_at:
         observe("prepac_http_request_seconds", max(0.0, time.time() - started_at), method=request.method, endpoint=request.endpoint or "unknown")
     inc("prepac_http_requests", 1, method=request.method, status=str(response.status_code))
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+        "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    )
+    if request.endpoint != "static":
+        response.headers.setdefault("Cache-Control", "no-store")
+    if _bool_env("PREPAC_ENABLE_HSTS", False) and _resolve_session_cookie_secure():
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return response
 
 
@@ -360,11 +555,58 @@ def _handle_request_entity_too_large(_exc):
     flash("Request body too large", "error")
     return redirect(_safe_next_url(_current_request_relative_url()))
 
+
+@app.errorhandler(404)
+def _handle_not_found(_exc):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Not found"}), 404
+    return render_template("404.html"), 404
+
+
+@app.errorhandler(500)
+def _handle_internal_error(_exc):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
+    return render_template("500.html"), 500
+
+
+def _database_unavailable_response(exc):
+    safe_message = redact_sensitive_data(str(exc))[:300]
+    LOG.error(
+        "Settings database unavailable for %s (%s): %s",
+        request.path,
+        type(exc).__name__,
+        safe_message,
+    )
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({
+            "ok": False,
+            "error": "Configuration database temporarily unavailable",
+        }), 503
+    return render_template(
+        "500.html",
+        error_status=503,
+        error_label="Service unavailable",
+        error_eyebrow="Database unavailable",
+        error_title="PrepaC cannot read its configuration database",
+        error_message=(
+            "Wait a moment and try again. If the issue continues, check the "
+            "application logs and configuration storage before restarting active work."
+        ),
+    ), 503
+
+
 @app.before_request
 def enforce_authentication():
     endpoint = request.endpoint or ""
-    allowed = {"health_page", "login_page", "setup_page", "reset_password_page", "logout_page", "static", "metrics_page"}
-    settings = load_settings()
+    allowed = {"health_page", "login_page", "setup_page", "reset_password_page", "static", "metrics_page"}
+    # Liveness and static assets must not depend on a readable settings database.
+    if endpoint in {"health_page", "static"}:
+        return None
+    try:
+        settings = load_settings()
+    except Exception as exc:
+        return _database_unavailable_response(exc)
 
     if endpoint in allowed:
         if endpoint == "metrics_page":
@@ -373,15 +615,15 @@ def enforce_authentication():
             if not _metrics_token():
                 if not auth_initialized(settings):
                     return jsonify({"ok": False, "error": "Authentication setup required"}), 403
-                if not is_authenticated():
+                if not is_authenticated(settings):
                     return jsonify({"ok": False, "error": "Authentication required"}), 401
                 return None
-            if _metrics_token_valid() or is_authenticated():
+            if _metrics_token_valid() or is_authenticated(settings):
                 return None
             return jsonify({"ok": False, "error": "Metrics token required"}), 401
         if endpoint == "setup_page":
             return None
-        if not auth_initialized(settings) and endpoint not in {"health_page", "setup_page", "static"}:
+        if not auth_initialized(settings) and endpoint != "setup_page":
             return redirect(url_for("setup_page"))
         return None
 
@@ -390,25 +632,34 @@ def enforce_authentication():
             return jsonify({"ok": False, "error": "Authentication setup required"}), 403
         return redirect(url_for("setup_page"))
 
-    if not is_authenticated():
+    if not is_authenticated(settings):
+        if session.get("auth_ok"):
+            session.clear()
+            ensure_csrf_token(session)
         if request.path.startswith("/api/"):
             return jsonify({"ok": False, "error": "Authentication required"}), 401
         return redirect(url_for("login_page", next=request.path))
 
+    if str(settings.get("auth_force_password_change", "false")).lower() == "true" and endpoint not in {"change_password_page", "logout_page", "static"}:
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "Password change required", "code": "password_change_required"}), 403
+        return redirect(url_for("change_password_page", forced="1"))
+
 APP_RUNTIME_STATE = {
     "draining": False,
-    "shutdown_marked": False,
 }
 AUTH_RATE_STATE = {}
 AUTH_RATE_LOCK = threading.Lock()
 
 
 def _client_ip_address() -> str:
-    if _bool_env("PREPAC_TRUST_PROXY_HEADERS", False):
-        forwarded = str(request.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
-        if forwarded:
-            return forwarded
-    return str(request.remote_addr or "unknown")
+    if _proxy_headers_trusted():
+        return resolve_client_ip(
+            request.remote_addr,
+            request.headers.get("X-Forwarded-For", ""),
+            os.environ.get("PREPAC_TRUSTED_PROXIES"),
+        )[:64]
+    return str(request.remote_addr or "unknown")[:64]
 
 
 def _auth_rate_limits() -> tuple[int, int, int]:
@@ -427,50 +678,124 @@ def _auth_rate_limits() -> tuple[int, int, int]:
     return window_seconds, max_attempts, lockout_seconds
 
 
-def _auth_rate_key(kind: str, username: str) -> str:
-    return f"{kind}:{_client_ip_address()}:{str(username or '').strip().lower()}"
+def _auth_rate_keys(kind: str, username: str) -> tuple[str, str]:
+    supplied = str(username or "").strip().casefold()
+    expected = auth_username().casefold()
+    account_bucket = "known" if supplied and secrets.compare_digest(supplied, expected) else "unknown"
+    return (
+        f"{kind}:ip:{_client_ip_address()}",
+        f"{kind}:account:{account_bucket}",
+    )
+
+
+def _auth_rate_read_state(conn, key, now_ts, window_seconds):
+    row = conn.execute(
+        "SELECT failures_json, locked_until FROM auth_rate_limits WHERE rate_key=?",
+        (key,),
+    ).fetchone()
+    if not row:
+        return [], 0.0
+    try:
+        values = json.loads(row["failures_json"] or "[]")
+    except Exception:
+        values = []
+    failures = [float(ts) for ts in values if now_ts - float(ts) <= window_seconds]
+    return failures, float(row["locked_until"] or 0.0)
+
+
+def _auth_rate_write_state(conn, key, failures, locked_until, now_ts):
+    conn.execute(
+        """INSERT INTO auth_rate_limits(rate_key, failures_json, locked_until, updated_at)
+           VALUES(?, ?, ?, ?)
+           ON CONFLICT(rate_key) DO UPDATE SET
+             failures_json=excluded.failures_json,
+             locked_until=excluded.locked_until,
+             updated_at=excluded.updated_at""",
+        (key, json.dumps(failures[-100:]), float(locked_until or 0.0), now_ts),
+    )
 
 
 def _auth_rate_check(kind: str, username: str) -> tuple[bool, int]:
-    key = _auth_rate_key(kind, username)
     now_ts = time.time()
-    window_seconds, max_attempts, _lockout = _auth_rate_limits()
+    window_seconds, max_attempts, lockout_seconds = _auth_rate_limits()
+    rate_keys = _auth_rate_keys(kind, username)
     with AUTH_RATE_LOCK:
-        state = AUTH_RATE_STATE.get(key, {"fails": [], "locked_until": 0.0})
-        locked_until = float(state.get("locked_until", 0.0) or 0.0)
-        if locked_until > now_ts:
-            return False, int(max(1, round(locked_until - now_ts)))
-        fails = [float(ts) for ts in (state.get("fails") or []) if (now_ts - float(ts)) <= window_seconds]
-        state["fails"] = fails
-        state["locked_until"] = 0.0
-        AUTH_RATE_STATE[key] = state
-        if len(fails) >= max_attempts:
-            _window, _max, lockout_seconds = _auth_rate_limits()
-            state["locked_until"] = now_ts + lockout_seconds
-            return False, lockout_seconds
-        return True, 0
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            retry_after = 0
+            for key in rate_keys:
+                failures, locked_until = _auth_rate_read_state(conn, key, now_ts, window_seconds)
+                if locked_until <= now_ts and len(failures) >= max_attempts:
+                    locked_until = now_ts + lockout_seconds
+                _auth_rate_write_state(conn, key, failures, locked_until if locked_until > now_ts else 0.0, now_ts)
+                retry_after = max(retry_after, int(max(0, round(locked_until - now_ts))))
+            conn.commit()
+            return (retry_after <= 0), max(1, retry_after) if retry_after else 0
+        finally:
+            conn.close()
 
 
 def _auth_rate_record_failure(kind: str, username: str):
-    key = _auth_rate_key(kind, username)
     now_ts = time.time()
     window_seconds, max_attempts, lockout_seconds = _auth_rate_limits()
+    rate_keys = _auth_rate_keys(kind, username)
     with AUTH_RATE_LOCK:
-        state = AUTH_RATE_STATE.get(key, {"fails": [], "locked_until": 0.0})
-        fails = [float(ts) for ts in (state.get("fails") or []) if (now_ts - float(ts)) <= window_seconds]
-        fails.append(now_ts)
-        state["fails"] = fails
-        if len(fails) >= max_attempts:
-            state["locked_until"] = now_ts + lockout_seconds
-        AUTH_RATE_STATE[key] = state
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for key in rate_keys:
+                failures, locked_until = _auth_rate_read_state(conn, key, now_ts, window_seconds)
+                failures.append(now_ts)
+                if len(failures) >= max_attempts:
+                    locked_until = max(locked_until, now_ts + lockout_seconds)
+                _auth_rate_write_state(conn, key, failures, locked_until, now_ts)
+            stale_before = now_ts - max(window_seconds, lockout_seconds) * 2
+            conn.execute("DELETE FROM auth_rate_limits WHERE updated_at < ?", (stale_before,))
+            count = int(conn.execute("SELECT COUNT(*) FROM auth_rate_limits").fetchone()[0])
+            if count > 2048:
+                conn.execute(
+                    "DELETE FROM auth_rate_limits WHERE rate_key IN (SELECT rate_key FROM auth_rate_limits ORDER BY updated_at ASC LIMIT ?)",
+                    (count - 2048,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _auth_rate_clear(kind: str, username: str):
-    key = _auth_rate_key(kind, username)
+    rate_keys = _auth_rate_keys(kind, username)
     with AUTH_RATE_LOCK:
-        AUTH_RATE_STATE.pop(key, None)
+        conn = get_conn()
+        try:
+            conn.executemany("DELETE FROM auth_rate_limits WHERE rate_key=?", [(key,) for key in rate_keys])
+            conn.commit()
+        finally:
+            conn.close()
 
-_WATCHER_LOCK_FILE = "/config/prepac_watcher.lock"
+# Reconcile process-local queues before watchers can enqueue new work. Only the
+# lock owner performs this one-time recovery and runs the background reconciler.
+_RECONCILIATION_LOCK_FILE = str(CONFIG_DIR / "prepac_reconciliation.lock")
+_RECONCILIATION_LOCK_HANDLE = None
+try:
+    _RECONCILIATION_LOCK_HANDLE = try_acquire_lock(_RECONCILIATION_LOCK_FILE)
+    if _RECONCILIATION_LOCK_HANDLE is None:
+        raise OSError("Reconciliation lock already held")
+    from app.job_reconciliation import background_reconciliation_loop, reconcile_abandoned_queued_jobs
+    recovered_queued_jobs = reconcile_abandoned_queued_jobs()
+    if recovered_queued_jobs:
+        LOG.warning("Recovered %s abandoned queued jobs during startup", recovered_queued_jobs)
+    threading.Thread(target=background_reconciliation_loop, daemon=True).start()
+except OSError:
+    # Another worker already runs reconciliation; skip in this worker.
+    release_lock(_RECONCILIATION_LOCK_HANDLE)
+    _RECONCILIATION_LOCK_HANDLE = None
+except Exception as exc:
+    release_lock(_RECONCILIATION_LOCK_HANDLE)
+    _RECONCILIATION_LOCK_HANDLE = None
+    LOG.warning("Unable to start background job reconciliation: %s", exc)
+
+_WATCHER_LOCK_FILE = str(CONFIG_DIR / "prepac_watcher.lock")
 _WATCHER_LOCK_HANDLE = None
 try:
     _WATCHER_LOCK_HANDLE = try_acquire_lock(_WATCHER_LOCK_FILE)
@@ -478,7 +803,7 @@ try:
         raise OSError("Watcher lock already held")
     start_watchers(load_settings())
 except OSError:
-    # Another worker already holds the watcher lock — skip starting watchers in this worker
+    # Another worker already holds the watcher lock; skip in this worker.
     release_lock(_WATCHER_LOCK_HANDLE)
     _WATCHER_LOCK_HANDLE = None
 except Exception as exc:
@@ -486,62 +811,43 @@ except Exception as exc:
     _WATCHER_LOCK_HANDLE = None
     LOG.warning("Unable to start file-system watchers: %s", exc)
 
-def mark_running_jobs_interrupted(reason="Interrupted by container shutdown", recovery=False):
-    if APP_RUNTIME_STATE.get("shutdown_marked") and not recovery:
-        return 0
-    total = 0
-    try:
-        total += interrupt_running_prepare_jobs(reason=reason, recovery=recovery)
-    except Exception:
-        pass
-    try:
-        total += interrupt_running_packing_jobs(reason=reason, recovery=recovery)
-    except Exception:
-        pass
-    try:
-        total += interrupt_running_posting_jobs(reason=reason, recovery=recovery)
-    except Exception:
-        pass
-    if not recovery:
-        APP_RUNTIME_STATE["shutdown_marked"] = True
-    return total
 
-# Leave running jobs intact on startup. A new worker cannot know whether another
-# worker or recently orphaned subprocess is still active, so stale recovery is
-# handled by the reconciliation loop using persisted job activity.
-
-def begin_graceful_shutdown(reason="Container shutdown requested"):
+def begin_graceful_shutdown(reason="Application shutdown requested"):
+    """Stop accepting work and wait briefly for this process's workers only."""
+    if APP_RUNTIME_STATE.get("draining"):
+        return
     APP_RUNTIME_STATE["draining"] = True
-    mark_running_jobs_interrupted(reason=reason, recovery=False)
+    LOG.info("%s; draining local workers", reason)
 
-def _signal_handler(signum, frame):
-    begin_graceful_shutdown(reason=f"Container shutdown requested (signal {signum})")
-
-for _sig in (signal.SIGTERM, signal.SIGINT):
     try:
-        signal.signal(_sig, _signal_handler)
-    except Exception:
-        pass
+        stop_watchers()
+    except Exception as exc:
+        LOG.warning("Unable to stop file-system watchers cleanly: %s", exc)
+
+    try:
+        configured_timeout = float(
+            str(os.environ.get("PREPAC_SHUTDOWN_DRAIN_SECONDS", "10") or "10").strip()
+        )
+    except (TypeError, ValueError):
+        configured_timeout = 10.0
+    drain_timeout = max(0.0, min(120.0, configured_timeout))
+
+    try:
+        from app.job_reconciliation import wait_for_local_workers
+        drained, active = wait_for_local_workers(timeout_seconds=drain_timeout)
+    except Exception as exc:
+        LOG.warning("Unable to inspect local workers during shutdown: %s", exc)
+        return
+    if not drained:
+        active_counts = {kind: len(job_ids) for kind, job_ids in active.items() if job_ids}
+        LOG.warning(
+            "Shutdown drain timed out after %.1fs with local workers still active: %s",
+            drain_timeout,
+            active_counts,
+        )
+
 
 atexit.register(lambda: begin_graceful_shutdown(reason="Application exiting"))
-
-# Start background job reconciliation to detect and recover stuck jobs (one worker only via flock)
-_RECONCILIATION_LOCK_FILE = "/config/prepac_reconciliation.lock"
-_RECONCILIATION_LOCK_HANDLE = None
-try:
-    _RECONCILIATION_LOCK_HANDLE = try_acquire_lock(_RECONCILIATION_LOCK_FILE)
-    if _RECONCILIATION_LOCK_HANDLE is None:
-        raise OSError("Reconciliation lock already held")
-    from app.job_reconciliation import background_reconciliation_loop
-    threading.Thread(target=background_reconciliation_loop, daemon=True).start()
-except OSError:
-    # Another worker already runs reconciliation — skip in this worker
-    release_lock(_RECONCILIATION_LOCK_HANDLE)
-    _RECONCILIATION_LOCK_HANDLE = None
-except Exception as exc:
-    release_lock(_RECONCILIATION_LOCK_HANDLE)
-    _RECONCILIATION_LOCK_HANDLE = None
-    LOG.warning("Unable to start background job reconciliation: %s", exc)
 
 
 @app.context_processor
@@ -604,16 +910,8 @@ def humanduration_filter(seconds):
         return f"{mins}m {secs}s"
     return f"{secs}s"
 
-PREPARE_QUEUE_LOCK = threading.Lock()
-PACKING_QUEUE_LOCK = threading.Lock()
-
-HEALTH_FAILURE_STATE = {"count": 0, "reason": "", "exit_scheduled": False}
-
 def _parse_iso(ts):
-    try:
-        return datetime.fromisoformat(ts) if ts else None
-    except Exception:
-        return None
+    return parse_local_timestamp(ts)
 
 def _latest_job_activity(job):
     times = []
@@ -633,7 +931,6 @@ def _evaluate_health_state():
         "db": "ok",
         "running": {"prepare": 0, "packing": 0, "posting": 0},
         "stalled": [],
-        "failure_count": HEALTH_FAILURE_STATE["count"],
     }
 
     if APP_RUNTIME_STATE.get("draining"):
@@ -641,20 +938,27 @@ def _evaluate_health_state():
         payload["reason"] = "container is draining for graceful shutdown"
         return True, payload
 
-    # DB probe
+    # A missing database must remain missing; get_conn() otherwise creates it and
+    # could make an uninitialized installation appear healthy.
     try:
+        if not DB_PATH.is_file() or DB_PATH.stat().st_size <= 0 or db_is_corrupt():
+            raise RuntimeError("database is unavailable")
         conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.fetchone()
-        conn.close()
+        try:
+            if conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone() is None:
+                raise RuntimeError("settings table is empty")
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            if not version_row or int(version_row[0]) < SCHEMA_VERSION:
+                raise RuntimeError("database schema is not current")
+        finally:
+            conn.close()
     except Exception as e:
         payload["status"] = "error"
         payload["db"] = "error"
         payload["reason"] = f"db probe failed: {e}"
         return False, payload
 
-    now_dt = datetime.now()
+    now_dt = local_now()
     thresholds = {
         "prepare": 10 * 60,
         "packing": 15 * 60,
@@ -662,9 +966,9 @@ def _evaluate_health_state():
     }
 
     try:
-        prepare_jobs = list_jobs_by_status(["running"], 500)
-        packing_jobs = list_packing_jobs_by_status(["running"], 500)
-        posting_jobs = list_posting_jobs_by_status(["running"], 500)
+        prepare_jobs = list_jobs_by_status(["running", "finalizing"], 500)
+        packing_jobs = list_packing_jobs_by_status(["running", "finalizing"], 500)
+        posting_jobs = list_posting_jobs_by_status(["running", "finalizing"], 500)
     except Exception as e:
         payload["status"] = "error"
         payload["reason"] = f"job listing failed: {e}"
@@ -672,7 +976,10 @@ def _evaluate_health_state():
 
     def inspect(kind, jobs, threshold_seconds):
         stalled = []
-        running = [j for j in jobs if str(j.get("status", "")).lower() == "running"]
+        running = [
+            j for j in jobs
+            if str(j.get("status", "")).lower() in {"running", "finalizing"}
+        ]
         payload["running"][kind] = len(running)
         for job in running:
             last_dt = _latest_job_activity(job)
@@ -701,31 +1008,97 @@ def _evaluate_health_state():
 
     return True, payload
 
-def _schedule_unhealthy_exit():
-    if HEALTH_FAILURE_STATE["exit_scheduled"]:
-        return
-    HEALTH_FAILURE_STATE["exit_scheduled"] = True
+def _prepare_queue_unavailable(exc, media_type):
+    safe_message = redact_sensitive_data(str(exc))[:300]
+    LOG.error(
+        "Unable to persist %s Prepare queue submission (%s): %s",
+        media_type,
+        type(exc).__name__,
+        safe_message,
+        exc_info=True,
+    )
+    return jsonify({
+        "ok": False,
+        "error": "Prepare queue is temporarily unavailable. Try again in a few seconds.",
+    }), 503
 
-    def _killer():
-        time.sleep(1.0)
-        os._exit(1)
 
-    threading.Thread(target=_killer, daemon=True).start()
+def _launch_prepare_worker(job_id, media_type, settings, worker_payload):
+    try:
+        threading.Thread(
+            target=run_prepare_job_when_slot,
+            args=(job_id, media_type, settings, worker_payload),
+            daemon=True,
+        ).start()
+        return True
+    except Exception as exc:
+        safe_message = redact_sensitive_data(str(exc))[:300]
+        LOG.error(
+            "Unable to launch %s Prepare worker for job %s (%s): %s",
+            media_type,
+            job_id,
+            type(exc).__name__,
+            safe_message,
+            exc_info=True,
+        )
+        try:
+            fail_prepare_job_if_active(
+                job_id,
+                "Prepare worker could not be started; submit this item again.",
+                "dispatch_failed",
+            )
+        except Exception as cleanup_exc:
+            LOG.error(
+                "Unable to terminalize undispatched Prepare job %s (%s): %s",
+                job_id,
+                type(cleanup_exc).__name__,
+                redact_sensitive_data(str(cleanup_exc))[:300],
+                exc_info=True,
+            )
+        return False
 
 
-def _prepare_running_count():
-    return len(list_jobs_by_status(["running"], 500))
+_OUTCOME_UNKNOWN_CONFIRMATION = "I VERIFIED THE DESTINATION"
 
-def _packing_running_count():
-    return len(list_packing_jobs_by_status(["running"], 500))
 
-def _find_active_prepare_job(source_path):
-    """Return job_id if source_path already has a queued or running prepare job, else None."""
-    active = list_jobs_by_status(["queued", "running"], 500)
-    for j in active:
-        if j.get("source_path") == source_path:
-            return j["id"]
-    return None
+def _acknowledge_ambiguous_outcome(workflow, acknowledge):
+    """Release deduplication only after an explicit administrator attestation."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        job_id = int(payload.get("job_id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
+    if job_id <= 0:
+        return jsonify({"ok": False, "error": "A valid job_id is required"}), 400
+    if payload.get("acknowledge_ambiguous_outcome") is not True:
+        return jsonify({
+            "ok": False,
+            "error": "Explicit ambiguous-outcome acknowledgement is required",
+        }), 400
+    confirmation = str(payload.get("confirmation") or "")
+    if len(confirmation) > 128 or not hmac.compare_digest(
+        confirmation,
+        _OUTCOME_UNKNOWN_CONFIRMATION,
+    ):
+        return jsonify({
+            "ok": False,
+            "error": f'Type "{_OUTCOME_UNKNOWN_CONFIRMATION}" exactly after verifying the destination',
+        }), 400
+    if not acknowledge(job_id):
+        return jsonify({
+            "ok": False,
+            "error": f"Only outcome_unknown {workflow.lower()} jobs can be acknowledged",
+        }), 409
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "status": "failed",
+        "resubmission_unblocked": True,
+        "warning": (
+            f"{workflow} job #{job_id} is now eligible for a fresh manual submission. "
+            "The prior operation may still have completed, so resubmission can duplicate its effects."
+        ),
+    })
 
 def run_prepare_job_when_slot(job_id, media_type, settings, payload):
     register_prepare_worker(job_id)
@@ -741,19 +1114,22 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
     except Exception:
         max_wait_seconds = 0
     try:
+        if prepare_should_stop(job_id):
+            return
         while True:
+            if prepare_should_stop(job_id):
+                return
             current = load_settings()
             try:
                 max_jobs = max(1, int(current.get("prepare_max_concurrent_jobs", settings.get("prepare_max_concurrent_jobs", "1")) or 1))
             except Exception:
                 max_jobs = 1
-            reconcile_prepare_running_jobs()
-            if get_prepare_job_status(job_id).lower() == "cancelled":
+            if prepare_should_stop(job_id):
                 return
             waited = int(time.monotonic() - wait_started_ts)
             if max_wait_seconds and waited >= max_wait_seconds:
                 add_job_event(job_id, "failed", f"Timed out waiting for prepare slot after {waited} seconds.", None)
-                finish_job(job_id, False)
+                set_job_status(job_id, "failed")
                 return
             if try_claim_prepare_slot(job_id, max_jobs):
                 break
@@ -763,38 +1139,47 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
                 last_wait_event_ts = now_ts
                 last_wait_max_jobs = max_jobs
             time.sleep(1)
+        if prepare_should_stop(job_id):
+            return
         if media_type == "tv":
             run_tv_prepare(job_id, load_settings(), payload)
         else:
             run_movie_prepare(job_id, load_settings(), payload)
+    except Exception as exc:
+        safe_message = redact_sensitive_data(str(exc))[:300]
+        LOG.error(
+            "Prepare worker %s stopped before completion (%s): %s",
+            job_id,
+            type(exc).__name__,
+            safe_message,
+            exc_info=True,
+        )
+        try:
+            fail_prepare_job_if_active(
+                job_id,
+                "Prepare worker stopped before the copy completed. Submit the item again.",
+                "worker_failed",
+            )
+        except Exception as cleanup_exc:
+            LOG.error(
+                "Unable to terminalize failed Prepare worker %s (%s): %s",
+                job_id,
+                type(cleanup_exc).__name__,
+                redact_sensitive_data(str(cleanup_exc))[:300],
+                exc_info=True,
+            )
     finally:
         unregister_prepare_worker(job_id)
-
-def run_packing_job_when_slot(source_path, settings, existing_job_id=None):
-    while True:
-        current = load_settings()
-        try:
-            max_jobs = max(1, int(current.get("packing_max_concurrent_jobs", settings.get("packing_max_concurrent_jobs", "1")) or 1))
-        except Exception:
-            max_jobs = 1
-        with PACKING_QUEUE_LOCK:
-            if _packing_running_count() < max_jobs:
-                break
-        if existing_job_id:
-            try:
-                from packing_jobs import add_packing_event
-                add_packing_event(existing_job_id, "queued", f"Waiting for packing slot ({max_jobs} max concurrent jobs).", 0)
-            except Exception:
-                pass
-        time.sleep(1)
-    from packing_core import run_packing_job
-    return run_packing_job(existing_job_id, source_path, load_settings())
 
 def _job_duration_seconds(started_at, finished_at):
     if not started_at or not finished_at:
         return 0
     try:
-        return max(0, int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds()))
+        started = parse_local_timestamp(started_at)
+        finished = parse_local_timestamp(finished_at)
+        if not started or not finished:
+            return 0
+        return max(0, int((finished - started).total_seconds()))
     except Exception:
         return 0
 
@@ -885,7 +1270,10 @@ def summarize_packing_stats(packing_jobs):
         if s and f:
             try:
 
-                durations.append((datetime.fromisoformat(f) - datetime.fromisoformat(s)).total_seconds())
+                started = parse_local_timestamp(s)
+                finished = parse_local_timestamp(f)
+                if started and finished:
+                    durations.append((finished - started).total_seconds())
             except Exception:
                 pass
     avg_seconds = int(sum(durations)/len(durations)) if durations else 0
@@ -908,7 +1296,10 @@ def summarize_posting_stats(posting_jobs):
         if s and f:
             try:
 
-                durations.append((datetime.fromisoformat(f) - datetime.fromisoformat(s)).total_seconds())
+                started = parse_local_timestamp(s)
+                finished = parse_local_timestamp(f)
+                if started and finished:
+                    durations.append((finished - started).total_seconds())
             except Exception:
                 pass
     avg_seconds = int(sum(durations)/len(durations)) if durations else 0
@@ -923,13 +1314,21 @@ def summarize_posting_stats(posting_jobs):
 
 def parse_posting_log_stats(log_path):
     import re
-    from pathlib import Path
 
     p = pathlib.Path(log_path)
     stats = {"transfer_rate": "", "percent_transferred": "", "eta": ""}
     if not p.exists():
         return stats
-    text = p.read_text(encoding="utf-8", errors="replace")
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as handle:
+            head = handle.read(64 * 1024)
+            if size > 1024 * 1024:
+                handle.seek(max(0, size - 1024 * 1024))
+            tail = handle.read(1024 * 1024)
+        text = (head + b"\n" + tail).decode("utf-8", errors="replace")
+    except OSError:
+        return stats
     clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
 
     total_articles = 0
@@ -994,7 +1393,8 @@ def summarize_share_stats(share_jobs):
     done_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "done")
     failed_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "failed")
     queued_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "queued")
-    running_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "running")
+    running_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() in {"running", "uploading"})
+    attention_jobs = sum(1 for row in rows if str(row.get("status", "")).lower() == "outcome_unknown")
     destinations = sorted({str(row.get("destination_name") or row.get("destination_id") or "").strip() for row in rows if str(row.get("destination_name") or row.get("destination_id") or "").strip()})
     imported_jobs = sum(1 for row in rows if str(row.get("source_type", "")).lower() == "imported")
     posting_jobs = sum(1 for row in rows if str(row.get("source_type", "")).lower() == "posting")
@@ -1004,6 +1404,7 @@ def summarize_share_stats(share_jobs):
         "failed_jobs": failed_jobs,
         "queued_jobs": queued_jobs,
         "running_jobs": running_jobs,
+        "attention_jobs": attention_jobs,
         "destination_count": len(destinations),
         "imported_jobs": imported_jobs,
         "posting_jobs": posting_jobs,
@@ -1013,14 +1414,17 @@ def summarize_share_stats(share_jobs):
 def summarize_running_jobs(prepare_jobs, packing_jobs, posting_jobs):
     running = []
     for j in prepare_jobs:
-        if str(j.get("status","")).lower() in ("queued","running"):
-            running.append({"kind":"Prepare","title":j.get("source_path",""),"phase":j.get("phase",""),"percent":j.get("percent"),"message":j.get("message","")})
+        status = str(j.get("status", "")).lower()
+        if status in ("queued", "running", "finalizing", "outcome_unknown"):
+            running.append({"kind":"Prepare","title":j.get("source_path",""),"status":status,"phase":j.get("phase",""),"percent":j.get("percent"),"message":j.get("message","")})
     for j in packing_jobs:
-        if str(j.get("status","")).lower() in ("queued","running"):
-            running.append({"kind":"Packing","title":j.get("job_name",""),"phase":j.get("phase",""),"percent":j.get("percent"),"message":j.get("message","")})
+        status = str(j.get("status", "")).lower()
+        if status in ("queued", "running", "finalizing", "outcome_unknown"):
+            running.append({"kind":"Packing","title":j.get("job_name",""),"status":status,"phase":j.get("phase",""),"percent":j.get("percent"),"message":j.get("message","")})
     for j in posting_jobs:
-        if str(j.get("status","")).lower() in ("queued","running"):
-            running.append({"kind":"Posting","title":j.get("job_name",""),"phase":j.get("phase",""),"percent":j.get("percent"),"message":j.get("message","")})
+        status = str(j.get("status", "")).lower()
+        if status in ("queued", "running", "finalizing", "outcome_unknown"):
+            running.append({"kind":"Posting","title":j.get("job_name",""),"status":status,"phase":j.get("phase",""),"percent":j.get("percent"),"message":j.get("message","")})
     return running
 
 def _tail_text_file(path_str, max_lines=120):
@@ -1028,8 +1432,11 @@ def _tail_text_file(path_str, max_lines=120):
     if not p.exists():
         return ""
     try:
-        with p.open("r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        with p.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - 512 * 1024))
+            chunk = handle.read(512 * 1024)
+        lines = chunk.decode("utf-8", errors="replace").splitlines(keepends=True)
         return "".join(lines[-max_lines:])
     except Exception:
         return ""
@@ -1101,8 +1508,9 @@ def _event_stream(generator_fn):
         while (time.monotonic() - started) < max_stream_seconds:
             try:
                 payload = generator_fn()
-            except Exception as e:
-                payload = {"ok": False, "error": str(e)}
+            except Exception as exc:
+                LOG.warning("SSE payload generation failed: %s", redact_sensitive_data(str(exc)))
+                payload = {"ok": False, "error": "Unable to refresh live data"}
             data = _sse_json(payload)
             if data != last:
                 yield data
@@ -1115,20 +1523,20 @@ def _event_stream(generator_fn):
     return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 def _dashboard_running_payload():
-    all_jobs = list_jobs_by_status(["queued", "running"], 500)
-    all_packing_jobs = list_packing_jobs_by_status(["queued", "running"], 500)
-    all_posting_jobs = list_posting_jobs_by_status(["queued", "running"], 500)
+    all_jobs = list_jobs_by_status(["queued", "running", "finalizing", "outcome_unknown"], 500)
+    all_packing_jobs = list_packing_jobs_by_status(["queued", "running", "finalizing", "outcome_unknown"], 500)
+    all_posting_jobs = list_posting_jobs_by_status(["queued", "running", "finalizing", "outcome_unknown"], 500)
     return {"ok": True, "running": summarize_running_jobs(all_jobs, all_packing_jobs, all_posting_jobs)}
 
 def _prepare_active_jobs_payload():
     try:
-        active_jobs = list_jobs_by_status(["queued", "running"], 500)
+        active_jobs = list_jobs_by_status(["queued", "running", "finalizing", "outcome_unknown"], 500)
         try:
             recent_window_seconds = max(10, int(str(os.environ.get("PREPAC_PREPARE_RECENT_TERMINAL_SECONDS", "120") or "120")))
         except Exception:
             recent_window_seconds = 120
         terminal_jobs = list_jobs_by_status(["done", "failed", "cancelled"], 200)
-        now_dt = datetime.now()
+        now_dt = local_now()
         recent_terminal_jobs = []
         for job in terminal_jobs:
             last_activity = _latest_job_activity(job)
@@ -1144,8 +1552,9 @@ def _prepare_active_jobs_payload():
         active_jobs.sort(key=lambda j: int(j.get("id") or 0))
         recent_terminal_jobs.sort(key=lambda j: int(j.get("id") or 0), reverse=True)
         jobs = active_jobs + recent_terminal_jobs
-    except Exception as e:
-        return {"jobs": [], "ok": False, "error": f"prepare job listing failed: {e}"}
+    except Exception as exc:
+        LOG.warning("Prepare job listing failed: %s", redact_sensitive_data(str(exc)))
+        return {"jobs": [], "ok": False, "error": "Prepare jobs could not be listed"}
     return {
         "jobs": jobs,
         "ok": True,
@@ -1153,10 +1562,32 @@ def _prepare_active_jobs_payload():
     }
 
 def _prepare_history_jobs(limit=500):
-    jobs = [j for j in list_jobs(limit) if str(j.get("status", "")).lower() in {"done", "failed", "cancelled"}]
+    jobs = [j for j in list_jobs(limit) if str(j.get("status", "")).lower() in {"done", "failed", "cancelled", "outcome_unknown"}]
     for j in jobs:
         j["duration_seconds"] = _job_duration_seconds(j.get("started_at"), j.get("finished_at"))
     return jobs
+
+
+_PUBLIC_JOB_SECRET_KEYS = {
+    "password", "password_value", "header_value", "provider_lock",
+    "raw_response", "nzb_hash", "job_hash", "idempotency_key",
+}
+
+
+def _public_api_value(value):
+    """Return a detached, recursively redacted value suitable for JSON/SSE clients."""
+    if isinstance(value, dict):
+        cleaned = {
+            str(key): _public_api_value(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _PUBLIC_JOB_SECRET_KEYS
+        }
+        return cleaned
+    if isinstance(value, list):
+        return [_public_api_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_api_value(item) for item in value]
+    return redact_sensitive_data(value) if isinstance(value, str) else value
 
 def _packing_jobs_payload():
     jobs = list_packing_jobs(200)
@@ -1166,13 +1597,51 @@ def _packing_jobs_payload():
             j["message"] = latest.get("message", j.get("message",""))
             j["phase"] = latest.get("phase", j.get("phase",""))
             j["percent"] = latest.get("percent", j.get("percent"))
-    jobs.sort(key=lambda j: (0 if str(j.get("status", "")).lower() in {"queued", "running"} else 1, int(j.get("id") or 0) if str(j.get("status", "")).lower() in {"queued", "running"} else -int(j.get("id") or 0)))
-    return {"ok": True, "jobs": jobs}
+    active_statuses = {"queued", "running", "finalizing", "outcome_unknown"}
+    jobs.sort(key=lambda j: (0 if str(j.get("status", "")).lower() in active_statuses else 1, int(j.get("id") or 0) if str(j.get("status", "")).lower() in active_statuses else -int(j.get("id") or 0)))
+    return {"ok": True, "jobs": [_public_api_value(job) for job in jobs]}
+
+
+_SHARE_LIVE_JOB_FIELDS = {
+    "id", "job_name", "destination_id", "destination_name",
+    "selected_category_id", "selected_category_label", "status", "phase",
+    "percent", "message", "remote_id", "remote_guid", "created_at",
+    "started_at", "finished_at", "retry_count", "events",
+}
+
+
+def _share_jobs_payload():
+    """Return the small operational view used by the Share page and SSE."""
+    try:
+        rows = list_share_jobs(200, per_job_event_limit=10)
+        active_statuses = {"queued", "running", "uploading", "outcome_unknown"}
+        active = [
+            row for row in rows
+            if str(row.get("status", "")).lower() in active_statuses
+        ]
+        recent_failed = [
+            row for row in rows
+            if str(row.get("status", "")).lower() == "failed"
+        ][:25]
+        selected = active + recent_failed
+        jobs = [
+            _public_api_value({
+                key: value
+                for key, value in row.items()
+                if key in _SHARE_LIVE_JOB_FIELDS
+            })
+            for row in selected
+        ]
+        return {"ok": True, "jobs": jobs}
+    except Exception as exc:
+        LOG.warning("Share job listing failed: %s", redact_sensitive_data(str(exc)))
+        return {"ok": False, "jobs": [], "error": "Share jobs could not be listed"}
+
 
 def _packing_completed_payload():
     jobs = enrich_packing_history_rows(list_packing_history(50))
     jobs = [j for j in jobs if str(j.get("status","")).lower() == "done"][:10]
-    return {"ok": True, "jobs": jobs}
+    return {"ok": True, "jobs": [_public_api_value(job) for job in jobs]}
 
 def _posting_jobs_payload():
     jobs = list_posting_jobs(200)
@@ -1190,8 +1659,9 @@ def _posting_jobs_payload():
             j["message"] = latest.get("message", j.get("message",""))
             j["phase"] = latest.get("phase", j.get("phase",""))
             j["percent"] = latest.get("percent", j.get("percent"))
-    jobs.sort(key=lambda j: (0 if str(j.get("status", "")).lower() in {"queued", "running"} else 1, int(j.get("id") or 0) if str(j.get("status", "")).lower() in {"queued", "running"} else -int(j.get("id") or 0)))
-    return {"ok": True, "jobs": jobs}
+    active_statuses = {"queued", "running", "finalizing", "outcome_unknown"}
+    jobs.sort(key=lambda j: (0 if str(j.get("status", "")).lower() in active_statuses else 1, int(j.get("id") or 0) if str(j.get("status", "")).lower() in active_statuses else -int(j.get("id") or 0)))
+    return {"ok": True, "jobs": [_public_api_value(job) for job in jobs]}
 
 
 
@@ -1228,10 +1698,13 @@ def _github_release_config(settings=None):
     settings = settings or load_settings()
     owner = (settings.get("github_repo_owner") or "HoodStar1").strip()
     repo = (settings.get("github_repo_name") or "PrepaC").strip()
+    slug_pattern = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+    if not slug_pattern.fullmatch(owner) or not slug_pattern.fullmatch(repo):
+        raise ValueError("GitHub owner and repository must be simple names")
     return owner, repo
 
 def _update_cache_file():
-    p = pathlib.Path("/config/update_check_cache.json")
+    p = CONFIG_DIR / "update_check_cache.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -1245,10 +1718,24 @@ def _load_update_cache():
         return {}
 
 def _save_update_cache(payload):
+    cache_path = _update_cache_file()
+    temp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        _update_cache_file().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        with temp_path.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temp_path, cache_path)
     except Exception:
-        pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 def check_latest_release(force=False):
     settings = load_settings()
@@ -1275,9 +1762,12 @@ def check_latest_release(force=False):
         "checked_at_display": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
     try:
-        r = requests.get(api_url, headers=headers, timeout=12)
+        r = requests.get(api_url, headers=headers, timeout=(5, 12), allow_redirects=False)
         r.raise_for_status()
-        data = r.json()
+        content = r.content
+        if len(content) > 2 * 1024 * 1024:
+            raise ValueError("GitHub release response exceeded 2 MiB")
+        data = json.loads(content.decode("utf-8"))
         latest_tag = str(data.get("tag_name") or f"v{current_version}")
         latest_version = latest_tag[1:] if latest_tag.startswith("v") else latest_tag
         assets = data.get("assets") or []
@@ -1299,11 +1789,10 @@ def check_latest_release(force=False):
 
 
 
-@app.route("/api/version/check")
+@app.route("/api/version/check", methods=["POST"])
 def api_version_check():
     settings = load_settings()
-    force = request.args.get("force") in {"1", "true", "yes"}
-    if str(settings.get("update_check_enabled", "true")).lower() != "true" and not force:
+    if str(settings.get("update_check_enabled", "true")).lower() != "true":
         return jsonify({
             "ok": True,
             "current_version": APP_VERSION,
@@ -1316,26 +1805,32 @@ def api_version_check():
             "asset_name": "",
             "asset_url": "",
         })
-    return jsonify(check_latest_release(force=force))
+    return jsonify(check_latest_release(force=True))
 
 @app.route("/health")
 def health_page():
-    healthy, payload = _evaluate_health_state()
-    set_gauge("prepac_health_failure_count", float(HEALTH_FAILURE_STATE["count"]))
-    if healthy:
-        HEALTH_FAILURE_STATE["count"] = 0
-        HEALTH_FAILURE_STATE["reason"] = ""
-        HEALTH_FAILURE_STATE["exit_scheduled"] = False
-        payload["failure_count"] = 0
-        return jsonify(payload), 200
-
-    HEALTH_FAILURE_STATE["count"] += 1
-    HEALTH_FAILURE_STATE["reason"] = payload.get("reason", "unhealthy")
-    payload["failure_count"] = HEALTH_FAILURE_STATE["count"]
-    if HEALTH_FAILURE_STATE["count"] >= 3:
-        payload["action"] = "terminating for docker restart"
-        _schedule_unhealthy_exit()
-    return jsonify(payload), 503
+    if APP_RUNTIME_STATE.get("draining"):
+        return jsonify({"status": "draining"}), 503
+    try:
+        if not DB_PATH.is_file() or DB_PATH.stat().st_size <= 0 or db_is_corrupt():
+            raise RuntimeError("database is unavailable")
+        conn = get_conn()
+        try:
+            if conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone() is None:
+                raise RuntimeError("settings table is empty")
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            if not version_row or int(version_row[0]) < SCHEMA_VERSION:
+                raise RuntimeError("database schema is not current")
+        finally:
+            conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as exc:
+        LOG.error(
+            "Health database probe failed (%s): %s",
+            type(exc).__name__,
+            redact_sensitive_data(str(exc))[:300],
+        )
+        return jsonify({"status": "error"}), 503
 
 def workflow_auto_chain_enabled(settings=None):
     settings = settings or load_settings()
@@ -1353,6 +1848,8 @@ def metrics_page():
 @app.route("/api/debug/job-status")
 def api_debug_job_status():
     """Debug endpoint showing current job queue state and stuck jobs."""
+    if not _bool_env("PREPAC_ENABLE_DEBUG_ENDPOINTS", False):
+        return jsonify({"ok": False, "error": "Not found"}), 404
     try:
         from app.job_reconciliation import STALE_THRESHOLDS
         from datetime import datetime
@@ -1361,12 +1858,12 @@ def api_debug_job_status():
             """Get seconds since the latest persisted activity for this job."""
             last_activity = _latest_job_activity(job)
             if last_activity:
-                return int((datetime.now() - last_activity).total_seconds())
+                return int((local_now() - last_activity).total_seconds())
             return None
         
-        prepare_jobs = list_jobs_by_status(["running"], 100)
-        packing_jobs = list_packing_jobs_by_status(["running"], 100)
-        posting_jobs = list_posting_jobs_by_status(["running"], 100)
+        prepare_jobs = list_jobs_by_status(["running", "finalizing"], 100)
+        packing_jobs = list_packing_jobs_by_status(["running", "finalizing"], 100)
+        posting_jobs = list_posting_jobs_by_status(["running", "finalizing"], 100)
         
         result = {
             "timestamp": datetime.now().isoformat(),
@@ -1424,9 +1921,10 @@ def api_debug_job_status():
                 "is_stale": age and age > STALE_THRESHOLDS.get("posting", 1200)
             })
         
-        return jsonify(result), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify(_public_api_value(result)), 200
+    except Exception as exc:
+        LOG.warning("Debug job status failed: %s", redact_sensitive_data(str(exc)))
+        return jsonify({"ok": False, "error": "Unable to build job status"}), 500
 
 
 def _prepare_has_auto_chain_event(job):
@@ -1497,7 +1995,7 @@ def auto_chain_loop():
         time.sleep(5)
 
 
-AUTO_CHAIN_LOCK_FILE = "/config/prepac_auto_chain.lock"
+AUTO_CHAIN_LOCK_FILE = str(CONFIG_DIR / "prepac_auto_chain.lock")
 AUTO_CHAIN_LOCK_HANDLE = None
 
 def start_auto_chain_thread_once():
@@ -1516,6 +2014,37 @@ def reject_if_draining():
     return None
 
 
+def _bounded_string_list(payload, key, *, max_items=200, max_length=4096):
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    values = payload.get(key)
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{key} must be a non-empty list")
+    if len(values) > max_items:
+        raise ValueError(f"{key} is limited to {max_items} items")
+    result = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or len(item) > max_length:
+            raise ValueError(f"Each {key} value must contain 1 to {max_length} characters")
+        result.append(item)
+    return result
+
+
+def _bounded_share_submission(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items or len(items) > 200 or any(not isinstance(item, dict) for item in items):
+        raise ValueError("items must contain between 1 and 200 objects")
+    if any(len(json.dumps(item, ensure_ascii=False)) > 32 * 1024 for item in items):
+        raise ValueError("Each share item is limited to 32 KiB")
+    destination_ids = _bounded_string_list(payload, "destination_ids", max_items=50, max_length=256)
+    if len(items) * len(destination_ids) > 200:
+        raise ValueError("A share request is limited to 200 item/destination combinations")
+    return items, destination_ids
+
+
 
 @app.route("/setup", methods=["GET", "POST"])
 def setup_page():
@@ -1529,23 +2058,32 @@ def setup_page():
         recovery = request.form.get("recovery_secret", "") or ""
         recovery_confirm = request.form.get("confirm_recovery_secret", "") or ""
 
-        if not username:
-            flash("Username is required.", "error")
+        if not username or len(username) > 128:
+            flash("Username must contain between 1 and 128 characters.", "error")
+        elif any(len(value) > 1024 for value in (password, confirm, recovery, recovery_confirm)):
+            flash("Credential fields are too long.", "error")
         elif password != confirm:
             flash("Passwords do not match.", "error")
-        elif len(password) < 8:
-            flash("Password must be at least 8 characters.", "error")
+        elif _password_policy_error(password):
+            flash(_password_policy_error(password), "error")
         elif recovery != recovery_confirm:
             flash("Recovery secrets do not match.", "error")
-        elif len(recovery) < 8:
-            flash("Recovery secret must be at least 8 characters.", "error")
+        elif len(recovery) < 12:
+            flash("Recovery secret must be at least 12 characters.", "error")
         else:
-            data = dict(settings)
-            data["auth_username"] = username
-            data["auth_password_hash"] = generate_password_hash(password)
-            data["auth_recovery_hash"] = generate_password_hash(recovery)
-            data["auth_initialized"] = "true"
-            save_settings(data)
+            updated = update_auth_settings_atomic(
+                {
+                    "auth_username": username,
+                    "auth_password_hash": generate_password_hash(password),
+                    "auth_recovery_hash": generate_password_hash(recovery),
+                    "auth_initialized": "true",
+                    "auth_force_password_change": "false",
+                },
+                expected={"auth_initialized": str(settings.get("auth_initialized", "false"))},
+            )
+            if updated is None:
+                flash("Account setup was already completed in another request. Please sign in.", "warning")
+                return redirect(url_for("login_page"))
             flash("Admin account created. Please sign in.", "success")
             return redirect(url_for("login_page"))
 
@@ -1562,14 +2100,34 @@ def login_page():
     if request.method == "POST":
         username = (request.form.get("username", "") or "").strip()
         password = request.form.get("password", "") or ""
+        if len(username) > 128 or len(password) > 1024:
+            _auth_rate_record_failure("login", username[:128])
+            flash("Invalid username or password.", "error")
+            return render_template("login.html", next_url=next_url), 400
         allowed, retry_after = _auth_rate_check("login", username)
         if not allowed:
             flash(f"Too many sign-in attempts. Try again in about {retry_after} seconds.", "error")
-            return render_template("login.html", next_url=next_url)
+            return render_template("login.html", next_url=next_url), 429, {"Retry-After": str(retry_after)}
         if username == auth_username(settings) and check_password_hash(auth_password_hash(settings), password):
-            session["auth_ok"] = True
-            session["auth_user"] = username
+            force_change = _password_requires_change(password)
+            if force_change and str(settings.get("auth_force_password_change", "false")).lower() != "true":
+                updated = update_auth_settings_atomic(
+                    {"auth_force_password_change": "true"},
+                    expected={
+                        "auth_username": auth_username(settings),
+                        "auth_password_hash": auth_password_hash(settings),
+                    },
+                    increment_session_epoch=False,
+                )
+                if updated is None:
+                    flash("Credentials changed during sign-in. Please try again.", "warning")
+                    return redirect(url_for("login_page"))
+                settings = {**settings, **updated}
+            _establish_authenticated_session(settings, username)
             _auth_rate_clear("login", username)
+            if force_change or str(settings.get("auth_force_password_change", "false")).lower() == "true":
+                flash("Please replace the legacy password before continuing.", "warning")
+                return redirect(url_for("change_password_page", forced="1"))
             flash("Logged in successfully.", "success")
             return redirect(_safe_next_url(next_url))
         _auth_rate_record_failure("login", username)
@@ -1585,38 +2143,96 @@ def reset_password_page():
         new_password = request.form.get("new_password", "") or ""
         confirm = request.form.get("confirm_password", "") or ""
 
+        if len(username) > 128 or any(len(value) > 1024 for value in (recovery_secret, new_password, confirm)):
+            _auth_rate_record_failure("reset_password", username[:128])
+            flash("Unable to reset the password with the provided credentials.", "error")
+            return render_template("reset_password.html"), 400
+
         allowed, retry_after = _auth_rate_check("reset_password", username)
         if not allowed:
             flash(f"Too many reset attempts. Try again in about {retry_after} seconds.", "error")
-            return render_template("reset_password.html", username_value=auth_username(settings))
+            return render_template("reset_password.html"), 429, {"Retry-After": str(retry_after)}
 
-        if username != auth_username(settings):
-            _auth_rate_record_failure("reset_password", username)
-            flash("Invalid username.", "error")
-        elif not auth_recovery_hash(settings):
-            _auth_rate_record_failure("reset_password", username)
-            flash("No recovery secret is configured for this installation.", "error")
-        elif not check_password_hash(auth_recovery_hash(settings), recovery_secret):
-            _auth_rate_record_failure("reset_password", username)
-            flash("Invalid recovery secret.", "error")
-        elif new_password != confirm:
+        # Validate the new credential before checking recovery credentials so
+        # field-level feedback cannot be used as a recovery-secret oracle.
+        if new_password != confirm:
             flash("Passwords do not match.", "error")
-        elif len(new_password) < 8:
-            flash("Password must be at least 8 characters.", "error")
+        elif _password_policy_error(new_password):
+            flash(_password_policy_error(new_password), "error")
         else:
-            data = dict(settings)
-            data["auth_password_hash"] = generate_password_hash(new_password)
-            save_settings(data)
+            username_ok = secrets.compare_digest(username.casefold(), auth_username(settings).casefold())
+            configured_recovery_hash = auth_recovery_hash(settings)
+            recovery_ok = check_password_hash(configured_recovery_hash or _AUTH_DUMMY_HASH, recovery_secret)
+            if not username_ok or not configured_recovery_hash or not recovery_ok:
+                _auth_rate_record_failure("reset_password", username)
+                flash("Unable to reset the password with the provided credentials.", "error")
+                return render_template("reset_password.html")
+            data = update_auth_settings_atomic(
+                {
+                    "auth_password_hash": generate_password_hash(new_password),
+                    "auth_force_password_change": "false",
+                },
+                expected={
+                    "auth_username": auth_username(settings),
+                    "auth_password_hash": auth_password_hash(settings),
+                    "auth_recovery_hash": configured_recovery_hash,
+                },
+            )
+            if data is None:
+                flash("Credentials changed during the reset. Please try again.", "warning")
+                return redirect(url_for("reset_password_page"))
             _auth_rate_clear("reset_password", username)
+            session.clear()
+            ensure_csrf_token(session)
             flash("Password reset successful. Please sign in.", "success")
             return redirect(url_for("login_page"))
-    return render_template("reset_password.html", username_value=auth_username(settings))
+    return render_template("reset_password.html")
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout_page():
     session.clear()
     flash("Logged out.", "success")
     return redirect(url_for("login_page"))
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+def change_password_page():
+    settings = load_settings()
+    if request.method == "POST":
+        current_password = request.form.get("current_password", "") or ""
+        new_password = request.form.get("new_password", "") or ""
+        confirm = request.form.get("confirm_password", "") or ""
+        if any(len(value) > 1024 for value in (current_password, new_password, confirm)):
+            flash("Credential fields are too long.", "error")
+        elif not check_password_hash(auth_password_hash(settings), current_password):
+            flash("Current password is incorrect.", "error")
+        elif new_password != confirm:
+            flash("Passwords do not match.", "error")
+        elif check_password_hash(auth_password_hash(settings), new_password):
+            flash("The new password must be different from the current password.", "error")
+        elif _password_policy_error(new_password):
+            flash(_password_policy_error(new_password), "error")
+        else:
+            data = update_auth_settings_atomic(
+                {
+                    "auth_password_hash": generate_password_hash(new_password),
+                    "auth_force_password_change": "false",
+                },
+                expected={
+                    "auth_username": auth_username(settings),
+                    "auth_password_hash": auth_password_hash(settings),
+                },
+            )
+            if data is None:
+                flash("Credentials changed before the password update completed. Please try again.", "warning")
+                return redirect(url_for("login_page"))
+            _establish_authenticated_session(data, auth_username(data))
+            flash("Password updated. Other signed-in sessions were revoked.", "success")
+            return redirect(url_for("dashboard"))
+    return render_template(
+        "change_password.html",
+        forced=str(settings.get("auth_force_password_change", "false")).lower() == "true",
+    )
 
 
 @app.route("/change-recovery-secret", methods=["GET", "POST"])
@@ -1624,57 +2240,68 @@ def change_recovery_secret_page():
     settings = load_settings()
     if not auth_initialized(settings):
         return redirect(url_for("setup_page"))
-    if not is_authenticated():
+    if not is_authenticated(settings):
         return redirect(url_for("login_page", next=url_for("change_recovery_secret_page")))
     if request.method == "POST":
         current_password = request.form.get("current_password", "") or ""
         new_secret = request.form.get("new_recovery_secret", "") or ""
         confirm_secret = request.form.get("confirm_recovery_secret", "") or ""
 
-        if not check_password_hash(auth_password_hash(settings), current_password):
+        if any(len(value) > 1024 for value in (current_password, new_secret, confirm_secret)):
+            flash("Credential fields are too long.", "error")
+        elif not check_password_hash(auth_password_hash(settings), current_password):
             flash("Current password is incorrect.", "error")
         elif new_secret != confirm_secret:
             flash("Recovery secrets do not match.", "error")
-        elif len(new_secret) < 8:
-            flash("Recovery secret must be at least 8 characters.", "error")
+        elif len(new_secret) < 12:
+            flash("Recovery secret must be at least 12 characters.", "error")
         else:
-            data = dict(settings)
-            data["auth_recovery_hash"] = generate_password_hash(new_secret)
-            save_settings(data)
-            flash("Recovery secret updated successfully.", "success")
+            data = update_auth_settings_atomic(
+                {"auth_recovery_hash": generate_password_hash(new_secret)},
+                expected={
+                    "auth_username": auth_username(settings),
+                    "auth_password_hash": auth_password_hash(settings),
+                    "auth_recovery_hash": auth_recovery_hash(settings),
+                },
+            )
+            if data is None:
+                flash("Credentials changed before the recovery update completed. Please try again.", "warning")
+                return redirect(url_for("change_recovery_secret_page"))
+            _establish_authenticated_session(data, auth_username(data))
+            flash("Recovery secret updated. Other signed-in sessions were revoked.", "success")
             return redirect(url_for("settings_page"))
-    return render_template("change_recovery_secret.html")
+    return render_template("change_recovery_secret.html", has_recovery=bool(auth_recovery_hash(settings)))
 
 @app.route("/")
 def dashboard():
     settings = load_settings()
     try:
-        all_jobs = list_jobs(5000)
+        all_jobs = list_jobs(500)
     except Exception as exc:
         LOG.error("Dashboard prepare jobs read failed: %s", exc)
         all_jobs = []
     try:
-        all_history = list_history(5000)
+        all_history = list_history(500)
     except Exception as exc:
         LOG.error("Dashboard prepare history read failed: %s", exc)
         all_history = []
     try:
-        all_clean_logs = list_clean_actions(5000)
+        all_clean_logs = list_clean_actions(500)
     except Exception as exc:
         LOG.error("Dashboard clean log read failed: %s", exc)
         all_clean_logs = []
     try:
-        all_packing_jobs = list_packing_jobs(5000)
+        all_packing_jobs = list_packing_jobs(500)
     except Exception as exc:
         LOG.error("Dashboard packing jobs read failed: %s", exc)
         all_packing_jobs = []
     try:
-        all_posting_jobs = list_posting_jobs(5000)
+        all_posting_jobs = list_posting_jobs(500)
     except Exception as exc:
         LOG.error("Dashboard posting jobs read failed: %s", exc)
         all_posting_jobs = []
     try:
-        all_share_jobs = list_share_history(5000)
+        all_share_jobs = list_share_history(500)
     except Exception as exc:
         LOG.error("Dashboard share history read failed: %s", exc)
         all_share_jobs = []
@@ -1687,7 +2314,7 @@ def dashboard():
     recent_actions = build_recent_actions(all_history, all_clean_logs, all_packing_jobs, all_posting_jobs, 10)
     return render_template(
         "dashboard.html",
-        settings=settings,
+        settings=_template_safe_settings(settings),
         jobs=all_jobs[:10],
         history=all_history[:10],
         clean_logs=all_clean_logs[:10],
@@ -1726,21 +2353,21 @@ def help_page():
     valid = {t["slug"] for t in HELP_TOPICS}
     if topic not in valid:
         topic = "getting-started"
-    return render_template("help.html", topics=HELP_TOPICS, active_topic=topic, settings=load_settings())
+    return render_template("help.html", topics=HELP_TOPICS, active_topic=topic, settings=_template_safe_settings(load_settings()))
 @app.route("/settings")
 def settings_page():
     settings = load_settings()
-    display_settings = settings_with_effective_workflow_paths(settings)
+    display_settings = _template_safe_settings(settings_with_effective_workflow_paths(settings))
     for key in SECRET_SPECS.keys():
         display_settings[key] = masked_secret_value(key, settings)
         display_settings[key + "_source"] = secret_source(key, settings)
-    share_destinations_source = secret_source("share_destinations_json", settings)
-    display_settings["share_destinations_editor"] = settings.get("share_destinations_json", "[]") if share_destinations_source == "saved_setting" else ""
+    share_destinations, share_destinations_editor, share_destinations_source = _display_share_destinations(settings)
+    display_settings["share_destinations_editor"] = share_destinations_editor
     display_settings["share_destinations_source"] = share_destinations_source
     posting_providers, posting_providers_editor, posting_providers_source = _display_posting_providers(settings, display_settings)
     display_settings["posting_providers_editor"] = posting_providers_editor
     display_settings["posting_providers_source"] = posting_providers_source
-    return render_template("settings.html", settings=display_settings, posting_providers=posting_providers, share_destinations=get_share_destinations(settings), share_category_options=CATEGORY_KEY_OPTIONS)
+    return render_template("settings.html", settings=display_settings, posting_providers=posting_providers, share_destinations=share_destinations, share_category_options=CATEGORY_KEY_OPTIONS)
 
 @app.route("/plex")
 def plex_page():
@@ -1748,7 +2375,7 @@ def plex_page():
 
 @app.route("/clean")
 def clean_page():
-    return render_template("clean.html", settings=load_settings())
+    return render_template("clean.html", settings=_template_safe_settings(load_settings()))
 
 @app.route("/clean/logs")
 def clean_logs_page():
@@ -1761,9 +2388,27 @@ def api_settings_save():
     for k in ["tv_root","movie_root","youtube_root","dest_root","end_tag","prepare_max_concurrent_jobs","prepare_permissions_mode","packing_max_concurrent_jobs","recycle_bin_root","plex_url","plex_token","plex_tv_library","plex_movie_library","plex_youtube_library","packing_watch_root","packing_output_root","posting_watch_root","packing_stability_delay","packing_password_prefix","packing_password_length","packing_par2_threads","packing_par2_memory_mb","packing_par2_block_size","packing_name_length","packing_name_fixed_tag","packing_name_fixed_pos","packing_thumbnail_host","packing_freeimage_api_key","posting_posted_root","posting_nzb_root","posting_article_size","posting_yenc_line_size","posting_retries","posting_retry_delay","posting_connection_headroom","posting_provider_failure_cooldown_seconds","posting_provider_disconnect_drain_seconds","posting_comment","posting_provider2_max_gb_when_busy","posting_provider1_host","posting_provider1_port","posting_provider1_username","posting_provider1_password","posting_provider1_connections","posting_provider1_max_connections","posting_provider2_host","posting_provider2_port","posting_provider2_username","posting_provider2_password","posting_provider2_connections","posting_provider2_max_connections","posting_providers_json","auth_username","github_repo_owner","github_repo_name","share_watch_root","share_import_root","share_request_timeout","share_destinations_json"]:
         if k in request.form:
             incoming = request.form.get(k, current.get(k, "")).strip()
-            if k in SECRET_SPECS and incoming.startswith("********"):
-                incoming = current.get(k, "")
+            clear_requested = str(request.form.get(f"clear_{k}", "")).lower() in {"1", "true", "yes", "on"}
+            if k in SECRET_SPECS:
+                source = secret_source(k, current)
+                if source in {"secret_file", "env_var"}:
+                    if k not in {"posting_providers_json", "share_destinations_json"} and (
+                        clear_requested or (incoming and not incoming.startswith("********"))
+                    ):
+                        flash(f"{k} is managed externally and was not overwritten.", "warning")
+                    data[k] = current.get(k, "")
+                    continue
+                if clear_requested:
+                    incoming = ""
+                elif not incoming or incoming.startswith("********"):
+                    incoming = current.get(k, "")
             data[k] = incoming
+    submitted_username = str(data.get("auth_username", "") or "").strip()
+    if not submitted_username or len(submitted_username) > 128:
+        flash("Admin username must contain between 1 and 128 characters.", "error")
+        return redirect(url_for("settings_page"))
+    auth_identity_changed = not secrets.compare_digest(submitted_username, auth_username(current))
+    data["auth_username"] = submitted_username
     data["clean_dry_run"] = "true" if request.form.get("clean_dry_run") else "false"
     data["clean_use_recycle_bin"] = "true" if request.form.get("clean_use_recycle_bin") else "false"
     data["packing_delete_source_after_success"] = "true" if request.form.get("packing_delete_source_after_success") else "false"
@@ -1777,52 +2422,124 @@ def api_settings_save():
     data["share_auto_after_posting"] = "true" if request.form.get("share_auto_after_posting") else "false"
 
     provider_source = secret_source("posting_providers_json", current)
-    try:
-        raw_providers = request.form.get("posting_providers_json", data.get("posting_providers_json", "[]"))
-        provider_items = json.loads(raw_providers or "[]") if provider_source != "secret_file" and provider_source != "env_var" else get_posting_providers(current)
-        if not isinstance(provider_items, list):
-            raise ValueError("posting_providers_json must be a list")
-        provider_items = sanitize_posting_provider_items(provider_items)
-        # Validate against schema
-        _validate_posting_providers(provider_items)
-    except JsonSchemaValidationError as e:
-        flash(f"Posting providers validation failed: {e.message}. Previous provider list was kept.", "warning")
-        provider_items = get_posting_providers(current)
-    except Exception as e:
-        flash(f"Posting providers could not be parsed: {str(e)[:200]}. Previous provider list was kept.", "warning")
-        provider_items = get_posting_providers(current)
+    if provider_source in {"secret_file", "env_var"}:
+        data["posting_providers_json"] = current.get("posting_providers_json", "[]")
+        normalized_providers = get_posting_providers(current)
+        if "posting_providers_json" in request.form:
+            flash("Posting providers are managed externally and were not overwritten.", "warning")
+    else:
+        try:
+            raw_providers = request.form.get("posting_providers_json", data.get("posting_providers_json", "[]"))
+            submitted_providers = json.loads(raw_providers or "[]")
+            if not isinstance(submitted_providers, list) or len(submitted_providers) > 20:
+                raise ValueError("posting_providers_json must be a list of at most 20 providers")
+            provider_items = sanitize_posting_provider_items(submitted_providers)
+            _validate_posting_providers(provider_items)
+        except JsonSchemaValidationError as exc:
+            flash(f"Posting providers validation failed: {exc.message}. Previous provider list was kept.", "warning")
+            submitted_providers = get_posting_providers(current)
+            provider_items = sanitize_posting_provider_items(submitted_providers)
+        except Exception as exc:
+            flash(f"Posting providers could not be parsed: {str(exc)[:200]}. Previous provider list was kept.", "warning")
+            submitted_providers = get_posting_providers(current)
+            provider_items = sanitize_posting_provider_items(submitted_providers)
 
-    existing_providers = get_posting_providers(current)
-    normalized_providers = []
-    for idx, item in enumerate(provider_items, start=1):
-        if not isinstance(item, dict):
-            continue
-        merged = dict(_default_posting_provider(idx))
-        merged.update(item)
-        merged["id"] = _provider_slug(merged.get("id") or merged.get("name"), idx)
-        merged["name"] = str(merged.get("name") or f"Provider {idx}").strip() or f"Provider {idx}"
-        merged["enabled"] = bool(merged.get("enabled"))
-        merged["ssl"] = bool(merged.get("ssl", True))
-        merged["host"] = str(merged.get("host", "") or "").strip()
-        merged["port"] = str(merged.get("port", "563") or "563").strip()
-        merged["username"] = str(merged.get("username", "") or "").strip()
-        merged["connections"] = str(merged.get("connections", "25") or "25").strip()
-        merged["max_connections"] = str(merged.get("max_connections", merged.get("connections", "25")) or merged.get("connections", "25") or "25").strip()
-        merged["priority_up_to_gb"] = str(merged.get("priority_up_to_gb", "0") or "0").strip() or "0"
-        password_value = str(merged.get("password", "") or "")
-        if password_value.startswith("********"):
-            if idx <= len(existing_providers):
-                password_value = str(existing_providers[idx - 1].get("password", "") or "")
-            else:
+        existing_providers = get_posting_providers(current)
+        existing_by_id = {
+            str(item.get("id") or "").strip().casefold(): item
+            for item in existing_providers if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        normalized_providers = []
+        for idx, item in enumerate(provider_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            submitted = submitted_providers[idx - 1] if idx <= len(submitted_providers) and isinstance(submitted_providers[idx - 1], dict) else {}
+            merged = dict(_default_posting_provider(idx))
+            merged.update(item)
+            merged["id"] = _provider_slug(merged.get("id") or merged.get("name"), idx)
+            merged["name"] = str(merged.get("name") or f"Provider {idx}").strip() or f"Provider {idx}"
+            merged["enabled"] = bool(merged.get("enabled"))
+            merged["ssl"] = bool(merged.get("ssl", True))
+            merged["host"] = str(merged.get("host", "") or "").strip()
+            merged["port"] = str(merged.get("port", "563") or "563").strip()
+            merged["username"] = str(merged.get("username", "") or "").strip()
+            merged["connections"] = str(merged.get("connections", "25") or "25").strip()
+            merged["max_connections"] = str(merged.get("max_connections", merged.get("connections", "25")) or merged.get("connections", "25") or "25").strip()
+            merged["account_group"] = _provider_slug(merged.get("account_group", ""), 0) if str(merged.get("account_group", "") or "").strip() else ""
+            merged["priority_up_to_gb"] = str(merged.get("priority_up_to_gb", "0") or "0").strip() or "0"
+            previous = existing_by_id.get(merged["id"].casefold())
+            if previous is None and idx <= len(existing_providers):
+                previous = existing_providers[idx - 1]
+            password_value = str(merged.get("password", "") or "")
+            clear_password = str(submitted.get("clear_password", "")).lower() in {"1", "true", "yes", "on"}
+            if clear_password:
                 password_value = ""
-        merged["password"] = password_value
-        normalized_providers.append(merged)
+            elif not password_value or password_value.startswith("********"):
+                password_value = str((previous or {}).get("password", "") or "")
+            merged["password"] = password_value
+            normalized_providers.append(merged)
 
-    data["posting_providers_json"] = json.dumps(normalized_providers, ensure_ascii=False, indent=2)
-    _sync_legacy_posting_provider_settings(data, normalized_providers)
+        data["posting_providers_json"] = json.dumps(normalized_providers, ensure_ascii=False, indent=2)
+        _sync_legacy_posting_provider_settings(data, normalized_providers)
+
+    share_source = secret_source("share_destinations_json", current)
+    if share_source in {"secret_file", "env_var"}:
+        data["share_destinations_json"] = current.get("share_destinations_json", "[]")
+        if "share_destinations_json" in request.form:
+            flash("Share destinations are managed externally and were not overwritten.", "warning")
+    else:
+        existing_destinations = get_share_destinations(current)
+        existing_by_id = {
+            str(item.get("id") or "").strip().casefold(): item
+            for item in existing_destinations if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        try:
+            submitted_destinations = json.loads(request.form.get("share_destinations_json", data.get("share_destinations_json", "[]")) or "[]")
+            if not isinstance(submitted_destinations, list) or len(submitted_destinations) > 50:
+                raise ValueError("share_destinations_json must be a list of at most 50 destinations")
+            normalized_destinations = []
+            for idx, item in enumerate(submitted_destinations, start=1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Share destination {idx} must be an object")
+                entry = {key: value for key, value in item.items() if key in _SHARE_DESTINATION_KEYS}
+                entry["id"] = _provider_slug(entry.get("id") or entry.get("name"), idx)
+                entry["name"] = str(entry.get("name") or f"Destination {idx}").strip()[:256] or f"Destination {idx}"
+                entry["base_url"] = normalize_share_base_url(entry.get("base_url", ""))
+                previous = existing_by_id.get(entry["id"].casefold())
+                if previous is None and idx <= len(existing_destinations):
+                    previous = existing_destinations[idx - 1]
+                for secret_name in ("api_key", "password"):
+                    incoming = str(entry.get(secret_name, "") or "")
+                    clear_secret = str(item.get(f"clear_{secret_name}", "")).lower() in {"1", "true", "yes", "on"}
+                    if clear_secret:
+                        entry[secret_name] = ""
+                    elif not incoming or incoming.startswith("********"):
+                        entry[secret_name] = str((previous or {}).get(secret_name, "") or "")
+                normalized_destinations.append(entry)
+            data["share_destinations_json"] = json.dumps(normalized_destinations, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            flash(f"Share destinations could not be saved: {str(exc)[:200]}. Previous destination list was kept.", "warning")
+            data["share_destinations_json"] = current.get("share_destinations_json", "[]")
 
     data, warnings = normalize_settings(data)
-    save_settings(data)
+    if auth_identity_changed:
+        auth_result = update_auth_settings_atomic(
+            {"auth_username": submitted_username},
+            expected={
+                "auth_username": auth_username(current),
+                "auth_password_hash": auth_password_hash(current),
+            },
+        )
+        if auth_result is None:
+            flash("Account settings changed in another request. Reload and try again.", "warning")
+            return redirect(url_for("settings_page"))
+        data.update(auth_result)
+        _establish_authenticated_session(auth_result, submitted_username)
+    changed_settings = {
+        key: value for key, value in data.items()
+        if key not in AUTH_SETTING_KEYS and str(current.get(key, "")) != str(value)
+    }
+    save_settings_patch(changed_settings)
     try:
         start_watchers(data)
     except Exception as exc:
@@ -1836,12 +2553,32 @@ def api_settings_save():
 def api_plex_save():
     current = load_settings()
     data = dict(current)
-    data["plex_url"] = request.form.get("plex_url","").strip()
-    data["plex_token"] = request.form.get("plex_token","").strip()
+    plex_url = request.form.get("plex_url", "").strip()
+    if plex_url:
+        try:
+            plex_url = normalize_service_base_url(plex_url)
+        except Exception as exc:
+            flash(f"Plex URL is invalid: {exc}", "error")
+            return redirect(url_for("settings_page"))
+    data["plex_url"] = plex_url
+    submitted_token = request.form.get("plex_token", "").strip()
+    clear_token = str(request.form.get("clear_plex_token", "")).lower() in {"1", "true", "yes", "on"}
+    token_source = secret_source("plex_token", current)
+    if token_source in {"secret_file", "env_var"}:
+        if clear_token or (submitted_token and not submitted_token.startswith("********")):
+            flash("The Plex token is managed externally and was not overwritten.", "warning")
+    elif clear_token:
+        data["plex_token"] = ""
+    elif submitted_token and not submitted_token.startswith("********"):
+        data["plex_token"] = submitted_token
     data["plex_tv_library"] = request.form.get("plex_tv_library","").strip()
     data["plex_movie_library"] = request.form.get("plex_movie_library","").strip()
     data["plex_youtube_library"] = request.form.get("plex_youtube_library","").strip()
-    save_settings(data)
+    save_settings_patch({
+        key: value for key, value in data.items()
+        if key in {"plex_url", "plex_token", "plex_tv_library", "plex_movie_library", "plex_youtube_library"}
+        and str(current.get(key, "")) != str(value)
+    })
     flash("Plex settings saved.", "success")
     return redirect(url_for("plex_page"))
 
@@ -1849,6 +2586,9 @@ def api_plex_save():
 @app.route("/plex/signin")
 def plex_signin():
     s = load_settings()
+    if secret_source("plex_token", s) in {"secret_file", "env_var"}:
+        flash("The Plex token is managed externally. Remove that external setting before using Plex sign-in.", "warning")
+        return redirect(url_for("settings_page"))
     client_id = s.get("plex_client_id", "prepac-local-client")
     product = s.get("plex_product_name", "PrepaC")
     pin = create_pin(client_id, product)
@@ -1863,9 +2603,13 @@ def plex_callback():
     s = load_settings()
     client_id = s.get("plex_client_id", "prepac-local-client")
     product = s.get("plex_product_name", "PrepaC")
-    pin_id = request.args.get("pin_id", "") or session.get("plex_pending_pin_id", "")
+    pending_pin_id = str(session.get("plex_pending_pin_id", "") or "")
+    pin_id = str(request.args.get("pin_id", "") or pending_pin_id)
     if not pin_id:
         flash("Plex sign-in could not be completed because the PIN information was missing.", "error")
+        return redirect(url_for("settings_page"))
+    if not pending_pin_id or not secrets.compare_digest(pin_id, pending_pin_id):
+        flash("Plex sign-in state did not match. Start the sign-in flow again.", "error")
         return redirect(url_for("settings_page"))
 
     try:
@@ -1886,11 +2630,14 @@ def plex_callback():
     except Exception:
         servers = []
 
-    settings = load_settings()
-    settings["plex_token"] = token
+    if secret_source("plex_token", s) in {"secret_file", "env_var"}:
+        session.pop("plex_pending_pin_id", None)
+        flash("The Plex token became externally managed during sign-in and was not saved.", "warning")
+        return redirect(url_for("settings_page"))
+    plex_patch = {"plex_token": token}
     if chosen_url:
-        settings["plex_url"] = chosen_url
-    save_settings(settings)
+        plex_patch["plex_url"] = chosen_url
+    save_settings_patch(plex_patch)
     session.pop("plex_pending_pin_id", None)
 
     if chosen_url:
@@ -1910,22 +2657,60 @@ def api_plex_pin_check():
 @app.route("/api/plex/servers")
 def api_plex_servers():
     s = load_settings()
-    token = s.get("plex_token", "").strip()
+    token = resolve_secret("plex_token", s)
     if not token:
         return jsonify({"ok": False, "error": "No Plex token saved yet."}), 400
     client_id = s.get("plex_client_id", "prepac-local-client")
     product = s.get("plex_product_name", "PrepaC")
     servers = list_servers_for_token(token, client_id, product)
+    nonce = secrets.token_urlsafe(18)
+    signing_key = str(app.secret_key or "").encode("utf-8")
+    issued = 0
+    for server in servers:
+        filtered_connections = []
+        for connection in server.get("connections", []) if isinstance(server, dict) else []:
+            try:
+                normalized_url = normalize_service_base_url(connection.get("uri", ""))
+            except Exception:
+                continue
+            if issued >= 100:
+                break
+            connection["uri"] = normalized_url
+            connection["choice_token"] = hmac.new(
+                signing_key,
+                f"plex-server-choice\0{nonce}\0{normalized_url}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            filtered_connections.append(connection)
+            issued += 1
+        if isinstance(server, dict):
+            server["connections"] = filtered_connections
+    session["plex_server_choice_nonce"] = nonce
     return jsonify({"ok": True, "servers": servers})
 
 @app.route("/api/plex/server/select", methods=["POST"])
 def api_plex_server_select():
-    data = request.get_json(force=True)
-    server_url = (data.get("server_url") or "").strip()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "A JSON object is required"}), 400
+    try:
+        server_url = normalize_service_base_url(data.get("server_url", "")) if isinstance(data, dict) else ""
+    except Exception:
+        server_url = ""
     if not server_url:
         return jsonify({"ok": False, "error": "server_url required"}), 400
+    nonce = str(session.get("plex_server_choice_nonce", "") or "")
+    supplied_token = str(data.get("choice_token", "") or "")
+    expected_token = hmac.new(
+        str(app.secret_key or "").encode("utf-8"),
+        f"plex-server-choice\0{nonce}\0{server_url}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not nonce or not supplied_token or not hmac.compare_digest(supplied_token, expected_token):
+        return jsonify({"ok": False, "error": "Refresh the Plex server list and select one of the returned connections."}), 400
     s = save_selected_server(server_url)
-    return jsonify({"ok": True, "plex_url": s.get("plex_url"), "token_saved": bool(s.get("plex_token"))})
+    session.pop("plex_server_choice_nonce", None)
+    return jsonify({"ok": True, "plex_url": s.get("plex_url"), "token_saved": bool(resolve_secret("plex_token", s))})
 
 
 
@@ -1936,13 +2721,19 @@ def api_local_image():
         return ("", 404)
     try:
         settings = load_settings()
-        allowed_roots = [r for r in build_allowed_roots(settings) if str(r) != "/config"]
+        config_root = CONFIG_DIR.resolve(strict=False)
+        allowed_roots = [r for r in build_allowed_roots(settings) if pathlib.Path(r).resolve(strict=False) != config_root]
         assert_no_parent_traversal(path, "local image path")
         assert_path_within_roots(path, allowed_roots, "local image path")
     except Exception:
         return ("", 404)
     p = pathlib.Path(path)
     if not p.exists() or not p.is_file():
+        return ("", 404)
+    try:
+        if p.stat().st_size > 10 * 1024 * 1024:
+            return ("", 413)
+    except OSError:
         return ("", 404)
     ext = p.suffix.lower()
     mime = {
@@ -1954,39 +2745,86 @@ def api_local_image():
     if mime == "application/octet-stream":
         return ("", 404)
     try:
-        return Response(p.read_bytes(), mimetype=mime, headers={"Cache-Control": "no-cache"})
+        return send_file(p, mimetype=mime, conditional=True, max_age=0)
     except Exception:
         return ("", 404)
+
+
+def _bounded_upstream_image(url, *, headers=None, params=None, max_bytes=8 * 1024 * 1024):
+    response = requests.get(
+        url,
+        headers=headers or {},
+        params=params,
+        timeout=(5, 30),
+        allow_redirects=False,
+        stream=True,
+    )
+    try:
+        if response.status_code != 200:
+            return None
+        content_type = str(response.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"}:
+            return None
+        try:
+            declared_size = int(response.headers.get("Content-Length", "0") or 0)
+        except Exception:
+            declared_size = 0
+        if declared_size > max_bytes:
+            return None
+        chunks = []
+        size = 0
+        iterator = response.iter_content(chunk_size=64 * 1024) if hasattr(response, "iter_content") else [getattr(response, "content", b"")]
+        for chunk in iterator:
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > max_bytes:
+                return None
+            chunks.append(chunk)
+        if not chunks:
+            return None
+        return Response(b"".join(chunks), mimetype=content_type, headers={"Cache-Control": "private, no-store"})
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 @app.route("/api/plex/image")
 def api_plex_image():
     settings = load_settings()
     plex_url = (settings.get("plex_url") or "").strip()
-    plex_token = (settings.get("plex_token") or "").strip()
+    plex_token = resolve_secret("plex_token", settings)
     path = (request.args.get("path") or "").strip()
-    if not plex_url or not plex_token or not path:
+    if not plex_url or not plex_token or not path or len(path) > 2048 or not path.startswith("/") or "://" in path:
         return ("", 404)
+
+    try:
+        plex_url = normalize_service_base_url(plex_url)
+        width = min(1600, max(16, int(request.args.get("width", "400"))))
+        height = min(1600, max(16, int(request.args.get("height", "600"))))
+    except Exception:
+        return ("", 400)
 
     headers = {"X-Plex-Token": plex_token}
     photo_url = f"{plex_url.rstrip('/')}/photo/:/transcode"
     params = {
         "url": path,
-        "width": request.args.get("width", "400"),
-        "height": request.args.get("height", "600"),
+        "width": str(width),
+        "height": str(height),
         "minSize": "1",
         "upscale": "1",
     }
     try:
-        r = requests.get(photo_url, headers=headers, params=params, timeout=60)
-        if r.status_code == 200 and r.content:
-            return Response(r.content, mimetype=r.headers.get("Content-Type", "image/jpeg"), headers={"Cache-Control":"no-cache"})
+        image_response = _bounded_upstream_image(photo_url, headers=headers, params=params)
+        if image_response is not None:
+            return image_response
     except Exception:
         pass
 
     try:
-        direct = requests.get(f"{plex_url.rstrip('/')}{path}", headers=headers, timeout=60)
-        if direct.status_code == 200 and direct.content:
-            return Response(direct.content, mimetype=direct.headers.get("Content-Type", "image/jpeg"), headers={"Cache-Control":"no-cache"})
+        image_response = _bounded_upstream_image(f"{plex_url.rstrip('/')}{path}", headers=headers)
+        if image_response is not None:
+            return image_response
     except Exception:
         pass
 
@@ -1995,50 +2833,36 @@ def api_plex_image():
 @app.route("/api/clean/reset_prepared", methods=["POST"])
 def api_clean_reset_prepared():
     try:
-        data = request.get_json(force=True)
-        prepared_item_id = data.get("prepared_item_id")
-        source_path = (data.get("source_path") or "").strip()
+        data = request.get_json(silent=True) or {}
+        try:
+            prepared_item_id = int(data.get("prepared_item_id") or 0)
+        except (TypeError, ValueError):
+            prepared_item_id = 0
+        if prepared_item_id <= 0:
+            return jsonify({"ok": False, "error": "A valid prepared_item_id is required"}), 400
 
-        removed = 0
-        removed_by = None
-
-        if prepared_item_id not in (None, ""):
-            try:
-                removed = delete_prepared_by_id(int(prepared_item_id))
-                if removed:
-                    removed_by = "id"
-            except Exception:
-                removed = 0
-
-        if removed == 0 and source_path:
-            try:
-                removed = delete_prepared_by_source_path(source_path)
-                if removed:
-                    removed_by = "source_path"
-            except Exception:
-                removed = 0
+        removed = delete_prepared_by_id(prepared_item_id)
 
         if removed == 0:
             return jsonify({
                 "ok": False,
                 "error": "No prepared record was removed",
                 "prepared_item_id": prepared_item_id,
-                "source_path": source_path,
             }), 404
 
         return jsonify({
             "ok": True,
             "removed": removed,
-            "removed_by": removed_by,
+            "removed_by": "id",
             "prepared_item_id": prepared_item_id,
-            "source_path": source_path,
         })
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"Failed to reset prepared record: {exc}"}), 500
+        LOG.warning("Prepared record reset failed: %s", redact_sensitive_data(str(exc)))
+        return jsonify({"ok": False, "error": "Failed to reset the prepared record"}), 500
 
 @app.route("/prepare")
 def prepare_page():
-    return render_template("prepare.html", settings=load_settings())
+    return render_template("prepare.html", settings=_template_safe_settings(load_settings()))
 
 @app.route("/prepare/tv")
 def prepare_tv_page():
@@ -2056,7 +2880,7 @@ def jobs_page():
 
 @app.route("/packing")
 def packing_page():
-    return render_template("packing.html", settings=settings_with_effective_workflow_paths(load_settings()))
+    return render_template("packing.html", settings=_template_safe_settings(settings_with_effective_workflow_paths(load_settings())))
 
 @app.route("/api/packing/scan", methods=["POST"])
 def api_packing_scan():
@@ -2071,11 +2895,24 @@ def api_packing_start():
     blocked = reject_if_draining()
     if blocked:
         return blocked
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True) or {}
+    try:
+        candidate_ids = _bounded_string_list(data, "candidate_ids", max_items=200, max_length=256)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     settings = load_settings()
+    if not candidate_ids:
+        return jsonify({"ok": False, "error": "Select at least one packing candidate."}), 400
+    try:
+        candidates = [resolve_packing_candidate(candidate_id, settings) for candidate_id in candidate_ids]
+    except Exception as exc:
+        LOG.info("Packing candidate resolution rejected: %s", redact_sensitive_data(str(exc)))
+        return jsonify({"ok": False, "error": "One or more packing candidates expired. Scan again and retry."}), 409
+    if any(candidate is None for candidate in candidates):
+        return jsonify({"ok": False, "error": "One or more packing candidates expired. Scan again and retry."}), 409
     started = []
-    for source_path in data.get("source_paths", []):
-        started.append(start_packing_job_async(source_path, settings))
+    for candidate_id, candidate in zip(candidate_ids, candidates):
+        started.append(start_packing_job_async(candidate["source_path"], settings, idempotency_key=f"packing:{candidate_id}"))
     return jsonify({"ok": True, "job_ids": started})
 
 @app.route("/api/packing/jobs")
@@ -2098,7 +2935,7 @@ def api_packing_completed_stream():
 
 @app.route("/posting")
 def posting_page():
-    return render_template("posting.html", settings=settings_with_effective_workflow_paths(load_settings()))
+    return render_template("posting.html", settings=_template_safe_settings(settings_with_effective_workflow_paths(load_settings())))
 
 @app.route("/api/posting/scan", methods=["POST"])
 def api_posting_scan():
@@ -2113,11 +2950,24 @@ def api_posting_start():
     blocked = reject_if_draining()
     if blocked:
         return blocked
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True) or {}
+    try:
+        candidate_ids = _bounded_string_list(data, "candidate_ids", max_items=200, max_length=256)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     settings = load_settings()
+    if not candidate_ids:
+        return jsonify({"ok": False, "error": "Select at least one posting candidate."}), 400
+    try:
+        candidates = [resolve_posting_candidate(candidate_id, settings) for candidate_id in candidate_ids]
+    except Exception as exc:
+        LOG.info("Posting candidate resolution rejected: %s", redact_sensitive_data(str(exc)))
+        return jsonify({"ok": False, "error": "One or more posting candidates expired. Scan again and retry."}), 409
+    if any(candidate is None for candidate in candidates):
+        return jsonify({"ok": False, "error": "One or more posting candidates expired. Scan again and retry."}), 409
     started = []
-    for packed_root in data.get("packed_roots", []):
-        started.append(start_posting_job_async(packed_root, settings))
+    for candidate_id, candidate in zip(candidate_ids, candidates):
+        started.append(start_posting_job_async(candidate["packed_root"], settings, idempotency_key=f"posting:{candidate_id}"))
     return jsonify({"ok": True, "job_ids": started})
 
 @app.route("/api/posting/jobs")
@@ -2134,14 +2984,14 @@ def api_posting_output(job_id):
     raw_output = get_posting_live_output(job_id)
     stats = get_posting_live_stats(job_id)
     if raw_output:
-        return jsonify({"ok": True, "raw_output": raw_output, "stats": stats, "source": "memory"})
-    jobs = list_posting_jobs(5000)
+        return jsonify({"ok": True, "raw_output": redact_sensitive_data(raw_output), "stats": _public_api_value(stats), "source": "memory"})
+    jobs = list_posting_jobs(500)
     job = next((j for j in jobs if int(j.get("id", 0)) == int(job_id)), None)
     if not job:
         return jsonify({"ok": False, "error": "Job not found"}), 404
     posted_root = job.get("posted_root") or str(posting_posted_root(load_settings()) / str(job.get("job_name", "")))
     log_path = pathlib.Path(posted_root) / "posting.log"
-    return jsonify({"ok": True, "raw_output": _tail_text_file(str(log_path), 200), "stats": parse_posting_log_stats(str(log_path)), "source": "log"})
+    return jsonify({"ok": True, "raw_output": redact_sensitive_data(_tail_text_file(str(log_path), 200)), "stats": _public_api_value(parse_posting_log_stats(str(log_path))), "source": "log"})
 
 @app.route("/clean/result")
 def clean_result_page():
@@ -2151,7 +3001,7 @@ def clean_result_page():
 @app.route("/share")
 def share_page():
     settings = load_settings()
-    return render_template("share.html", settings=settings_with_effective_workflow_paths(settings), category_options=CATEGORY_KEY_OPTIONS)
+    return render_template("share.html", settings=_template_safe_settings(settings_with_effective_workflow_paths(settings)), category_options=CATEGORY_KEY_OPTIONS)
 
 @app.route("/api/share/candidates")
 def api_share_candidates():
@@ -2164,18 +3014,20 @@ def api_share_candidates():
 
 @app.route("/api/share/jobs")
 def api_share_jobs():
-    return jsonify({"ok": True, "jobs": list_share_jobs(500)})
+    return jsonify(_share_jobs_payload())
 
 @app.route("/api/share/jobs/stream")
 def api_share_jobs_stream():
-    return _event_stream(lambda: {"jobs": list_share_jobs(500)})
+    return _event_stream(_share_jobs_payload)
 
 
 @app.route("/api/share/review", methods=["POST"])
 def api_share_review():
     payload = request.get_json(silent=True) or {}
-    items = payload.get("items") or []
-    destination_ids = payload.get("destination_ids") or []
+    try:
+        items, destination_ids = _bounded_share_submission(payload)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     review = build_share_submission_review(items, destination_ids, load_settings())
     return jsonify({"ok": True, **review})
 
@@ -2185,26 +3037,49 @@ def api_share_start():
     if draining:
         return draining
     payload = request.get_json(silent=True) or {}
-    items = payload.get("items") or []
-    destination_ids = payload.get("destination_ids") or []
+    try:
+        items, destination_ids = _bounded_share_submission(payload)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     result = queue_share_jobs(items, destination_ids, load_settings())
-    return jsonify({"ok": True, **result})
+    return jsonify({"ok": True, "state": "accepted", **result}), 202
 
 @app.route("/api/share/retry", methods=["POST"])
 def api_share_retry():
+    blocked = reject_if_draining()
+    if blocked:
+        return blocked
     payload = request.get_json(silent=True) or {}
-    job_id = int(payload.get("job_id") or 0)
+    force_outcome_unknown = payload.get("force_outcome_unknown", False)
+    if not isinstance(force_outcome_unknown, bool):
+        return jsonify({"ok": False, "error": "force_outcome_unknown must be a JSON boolean"}), 400
+    try:
+        job_id = int(payload.get("job_id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
+    if job_id <= 0:
+        return jsonify({"ok": False, "error": "A valid job_id is required"}), 400
     job = get_share_job(job_id)
     if not job:
         return jsonify({"ok": False, "error": "Share job not found"}), 404
-    increment_share_retry(job_id)
+    if force_outcome_unknown:
+        if not force_retry_share_outcome_unknown(job_id):
+            return jsonify({"ok": False, "error": "Only outcome_unknown share jobs can be force retried"}), 409
+    elif not increment_share_retry(job_id):
+        return jsonify({"ok": False, "error": "Only failed share jobs can be retried normally"}), 409
     start_share_job_async(job_id, load_settings())
-    return jsonify({"ok": True, "job_id": job_id})
+    response = {"ok": True, "job_id": job_id, "forced": force_outcome_unknown}
+    if force_outcome_unknown:
+        response["warning"] = "The prior upload outcome was unknown; this retry may create a duplicate at the destination."
+    return jsonify(response)
 
 @app.route("/api/share/cancel", methods=["POST"])
 def api_share_cancel():
     payload = request.get_json(silent=True) or {}
-    job_id = int(payload.get("job_id") or 0)
+    try:
+        job_id = int(payload.get("job_id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
     if not job_id:
         return jsonify({"ok": False, "error": "job_id is required"}), 400
     changed = cancel_share_job(job_id, reason="Cancelled by user")
@@ -2220,6 +3095,8 @@ def api_share_import():
     release_name = (request.form.get("release_name", "") or "").strip()
     if not nzb_rar_file or not template_file:
         return jsonify({"ok": False, "error": "NZB RAR and template file are required"}), 400
+    if len(release_name) > 512:
+        return jsonify({"ok": False, "error": "release_name is limited to 512 characters"}), 400
     bundle_id = import_share_bundle(nzb_rar_file, template_file, mediainfo_file, release_name)
     return jsonify({"ok": True, "bundle_id": bundle_id})
 
@@ -2230,6 +3107,8 @@ def api_share_import_bulk():
     mediainfo_files = request.files.getlist("mediainfo_files")
     if not nzb_rar_files or not template_files:
         return jsonify({"ok": False, "error": "RARred NZBs and template files are required"}), 400
+    if len(nzb_rar_files) > 100 or len(template_files) > 100 or len(mediainfo_files) > 100:
+        return jsonify({"ok": False, "error": "Bulk imports are limited to 100 files per field"}), 400
     result = import_share_bundles_bulk(nzb_rar_files, template_files, mediainfo_files)
     return jsonify({"ok": True, **result})
 
@@ -2237,7 +3116,7 @@ def api_share_import_bulk():
 def api_share_candidate_remove():
     payload = request.get_json(silent=True) or {}
     candidate_id = str(payload.get("candidate_id") or "").strip()
-    if not candidate_id:
+    if not candidate_id or len(candidate_id) > 256:
         return jsonify({"ok": False, "error": "candidate_id is required"}), 400
     result = remove_share_candidate(candidate_id, load_settings())
     return jsonify({"ok": True, **result})
@@ -2249,14 +3128,18 @@ def api_share_caps_refresh():
 @app.route("/api/share/destination/test", methods=["POST"])
 def api_share_destination_test():
     payload = request.get_json(silent=True) or {}
-    destination = payload.get("destination") or {}
-    if not isinstance(destination, dict):
-        return jsonify({"ok": False, "error": "Invalid destination payload"}), 400
+    destination_id = str(payload.get("destination_id") or "").strip() if isinstance(payload, dict) else ""
+    if not destination_id or len(destination_id) > 256:
+        return jsonify({"ok": False, "error": "A saved destination_id is required"}), 400
+    destination = next((item for item in get_share_destinations(load_settings()) if str(item.get("id") or "") == destination_id), None)
+    if destination is None:
+        return jsonify({"ok": False, "error": "Saved destination not found"}), 404
     try:
         categories = fetch_destination_caps(destination, timeout=15)
         return jsonify({"ok": True, "count": len(categories), "categories": categories[:50]})
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
+        LOG.warning("Share destination test failed: %s", redact_sensitive_data(str(exc)))
+        return jsonify({"ok": False, "error": "Destination capabilities request failed"}), 400
 
 @app.route("/history")
 def history_page():
@@ -2264,7 +3147,7 @@ def history_page():
 
 @app.route("/history/prepare")
 def history_prepare_page():
-    return render_template("history.html", history=enrich_prepare_history_rows(list_history(500), list_jobs(5000)), prepare_jobs=_prepare_history_jobs(500))
+    return render_template("history.html", history=enrich_prepare_history_rows(list_history(500), list_jobs(500)), prepare_jobs=_prepare_history_jobs(500))
 
 @app.route("/history/clean")
 def history_clean_page():
@@ -2272,15 +3155,29 @@ def history_clean_page():
 
 @app.route("/history/packing")
 def history_packing_page():
-    return render_template("packing_history.html", jobs=enrich_packing_history_rows(list_packing_history(5000)))
+    jobs = enrich_packing_history_rows(list_packing_history(500))
+    return render_template("packing_history.html", jobs=[_public_api_value(job) for job in jobs])
 
 @app.route("/history/posting")
 def history_posting_page():
-    return render_template("posting_history.html", jobs=list_posting_history(5000))
+    return render_template("posting_history.html", jobs=[_public_api_value(job) for job in list_posting_history(500)])
 
 @app.route("/history/share")
 def history_share_page():
-    return render_template("share_history.html", jobs=list_share_history(5000))
+    return render_template("share_history.html", jobs=[_public_api_value(job) for job in list_share_history(500)])
+
+
+def _csv_safe_cell(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.lstrip()
+    if stripped.startswith(("=", "+", "-", "@")) or value.startswith(("\t", "\r", "\n")):
+        return "'" + value
+    return value
+
+
+def _csv_safe_row(values):
+    return [_csv_safe_cell(value) for value in values]
 
 @app.route("/api/history/export.csv")
 def api_history_export():
@@ -2289,7 +3186,7 @@ def api_history_export():
     writer = csv.writer(buf)
     writer.writerow(["id","media_type","source_path","source_rel","dest_path","source_bytes","dest_bytes","chosen_bracket","end_tag","created_at"])
     for r in rows:
-        writer.writerow([r.get("id"), r.get("media_type"), r.get("source_path"), r.get("source_rel"), r.get("dest_path"), r.get("source_bytes"), r.get("dest_bytes"), r.get("chosen_bracket"), r.get("end_tag"), r.get("created_at")])
+        writer.writerow(_csv_safe_row([r.get("id"), r.get("media_type"), r.get("source_path"), r.get("source_rel"), r.get("dest_path"), r.get("source_bytes"), r.get("dest_bytes"), r.get("chosen_bracket"), r.get("end_tag"), r.get("created_at")]))
     return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_history.csv"})
 
 @app.route("/api/clean/logs/export.csv")
@@ -2299,7 +3196,7 @@ def api_clean_logs_export():
     writer = csv.writer(buf)
     writer.writerow(["id","created_at","reason","media_type","target_path","target_kind","dry_run","success","size_bytes","message"])
     for r in rows:
-        writer.writerow([r.get("id"), r.get("created_at"), r.get("reason"), r.get("media_type"), r.get("target_path"), r.get("target_kind"), r.get("dry_run"), r.get("success"), r.get("size_bytes"), r.get("message")])
+        writer.writerow(_csv_safe_row([r.get("id"), r.get("created_at"), r.get("reason"), r.get("media_type"), r.get("target_path"), r.get("target_kind"), r.get("dry_run"), r.get("success"), r.get("size_bytes"), r.get("message")]))
     return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_clean_logs.csv"})
 
 
@@ -2310,7 +3207,7 @@ def api_packing_history_export():
     writer = csv.writer(buf)
     writer.writerow(["id","created_at","started_at","finished_at","job_name","source_path","output_root","status","phase","percent","size_bytes","rar_parts_estimate","par2_percent","archive_token","message"])
     for r in rows:
-        writer.writerow([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("source_path"), r.get("output_root"), r.get("status"), r.get("phase"), r.get("percent"), r.get("size_bytes"), r.get("rar_parts_estimate"), r.get("par2_percent"), r.get("archive_token"), r.get("message")])
+        writer.writerow(_csv_safe_row([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("source_path"), r.get("output_root"), r.get("status"), r.get("phase"), r.get("percent"), r.get("size_bytes"), r.get("rar_parts_estimate"), r.get("par2_percent"), r.get("archive_token"), r.get("message")]))
     return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_packing_history.csv"})
 
 @app.route("/api/posting/history/export.csv")
@@ -2320,7 +3217,7 @@ def api_posting_history_export():
     writer = csv.writer(buf)
     writer.writerow(["id","created_at","started_at","finished_at","job_name","packed_root","posted_root","status","phase","percent","size_bytes","provider_used","nzb_path","message"])
     for r in rows:
-        writer.writerow([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("packed_root"), r.get("posted_root"), r.get("status"), r.get("phase"), r.get("percent"), r.get("size_bytes"), r.get("provider_used"), r.get("nzb_path"), r.get("message")])
+        writer.writerow(_csv_safe_row([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("packed_root"), r.get("posted_root"), r.get("status"), r.get("phase"), r.get("percent"), r.get("size_bytes"), r.get("provider_used"), r.get("nzb_path"), r.get("message")]))
     return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_posting_history.csv"})
 
 
@@ -2331,14 +3228,17 @@ def api_share_history_export():
     writer = csv.writer(buf)
     writer.writerow(["id","created_at","started_at","finished_at","job_name","destination_name","selected_category_label","status","remote_id","remote_guid","message"])
     for r in rows:
-        writer.writerow([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("destination_name"), r.get("selected_category_label"), r.get("status"), r.get("remote_id"), r.get("remote_guid"), r.get("message")])
+        writer.writerow(_csv_safe_row([r.get("id"), r.get("created_at"), r.get("started_at"), r.get("finished_at"), r.get("job_name"), r.get("destination_name"), r.get("selected_category_label"), r.get("status"), r.get("remote_id"), r.get("remote_guid"), r.get("message")]))
     return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=prepac_share_history.csv"})
 
 @app.route("/api/prepare/tv/search")
 def api_prepare_tv_search():
     settings = load_settings()
-    names = search_shows(settings["tv_root"], request.args.get("q", ""))
-    plex_posters = {x["name"]: x.get("poster_url","") for x in search_posters_for_prepare(settings, "tv", request.args.get("q", ""))}
+    query = str(request.args.get("q", "") or "").strip()
+    if len(query) > 256:
+        return jsonify({"ok": False, "error": "Search query is limited to 256 characters"}), 400
+    names = search_shows(settings["tv_root"], query)
+    plex_posters = {x["name"]: x.get("poster_url","") for x in search_posters_for_prepare(settings, "tv", query)}
     results = []
     for n in names:
         local = show_poster(settings["tv_root"], n)
@@ -2347,17 +3247,21 @@ def api_prepare_tv_search():
 
 @app.route("/api/prepare/tv/seasons")
 def api_prepare_tv_seasons():
-    return jsonify({"results": list_seasons(load_settings()["tv_root"], request.args.get("show", ""))})
+    show_name = str(request.args.get("show", "") or "").strip()
+    if not show_name or len(show_name) > 512:
+        return jsonify({"ok": False, "error": "A valid show name is required"}), 400
+    return jsonify({"results": list_seasons(load_settings()["tv_root"], show_name)})
 
 @app.route("/api/prepare/tv/preview", methods=["POST"])
 def api_prepare_tv_preview():
     data = request.get_json(silent=True) or {}
     show_name = str(data.get("show_name") or "").strip()
     season_name = str(data.get("season_name") or "").strip()
-    if not show_name or not season_name:
+    bracket_override = str(data.get("bracket_override") or data.get("chosen_bracket") or "").strip()
+    if not show_name or not season_name or len(show_name) > 512 or len(season_name) > 256 or len(bracket_override) > 256:
         return jsonify({"ok": False, "error": "show_name and season_name are required"}), 400
     try:
-        payload = preview_tv(load_settings(), show_name, season_name, data.get("bracket_override", ""))
+        payload = preview_tv(load_settings(), show_name, season_name, bracket_override)
         payload["ok"] = True
         return jsonify(payload)
     except Exception as e:
@@ -2369,25 +3273,51 @@ def api_prepare_tv_start():
     if blocked:
         return blocked
     payload = request.get_json(silent=True) or {}
-    source_path = str(payload.get("source_path") or "").strip()
-    dest_path = str(payload.get("dest_path") or "").strip()
-    if not source_path or not dest_path:
-        return jsonify({"ok": False, "error": "Invalid preview payload. Rebuild queue preview and try again."}), 400
+    show_name = str(payload.get("show_name") or "").strip()
+    season_name = str(payload.get("season_name") or "").strip()
+    bracket_override = str(payload.get("bracket_override") or payload.get("chosen_bracket") or "").strip()
+    if not show_name or not season_name or len(show_name) > 512 or len(season_name) > 256 or len(bracket_override) > 256:
+        return jsonify({"ok": False, "error": "Valid show_name and season_name values are required."}), 400
     settings = load_settings()
-    # Deduplicate: if this source_path already has a queued or running job, reuse it
-    existing = _find_active_prepare_job(source_path)
-    if existing:
-        return jsonify({"ok": True, "job_id": existing, "duplicate": True})
-    job_id = create_job("tv", source_path, dest_path)
-    add_job_event(job_id, "queued", "TV prepare job queued.", 0)
-    threading.Thread(target=run_prepare_job_when_slot, args=(job_id, "tv", settings, payload), daemon=True).start()
+    try:
+        server_preview = preview_tv(settings, show_name, season_name, bracket_override)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": redact_sensitive_data(str(exc))[:300]}), 400
+    source_path = str(server_preview.get("source_path") or "")
+    dest_path = str(server_preview.get("dest_path") or "")
+    if not source_path or not dest_path:
+        return jsonify({"ok": False, "error": "The selected TV item could not be resolved. Rebuild the preview."}), 409
+    idempotency_key = "prepare:tv:" + hashlib.sha256(f"{source_path}\0{dest_path}".encode("utf-8")).hexdigest()
+    try:
+        job_id, created = create_job(
+            "tv",
+            source_path,
+            dest_path,
+            idempotency_key=idempotency_key,
+            return_created=True,
+            initial_event=("queued", "TV prepare job queued.", 0),
+        )
+    except Exception as exc:
+        return _prepare_queue_unavailable(exc, "TV")
+    if not created:
+        return jsonify({"ok": True, "job_id": job_id, "duplicate": True})
+    worker_payload = dict(server_preview)
+    worker_payload.update({"show_name": show_name, "season_name": season_name, "bracket_override": bracket_override})
+    if not _launch_prepare_worker(job_id, "tv", settings, worker_payload):
+        return jsonify({
+            "ok": False,
+            "error": "Prepare worker could not be started. Submit this item again.",
+        }), 503
     return jsonify({"ok": True, "job_id": job_id})
 
 @app.route("/api/prepare/movie/search")
 def api_prepare_movie_search():
     settings = load_settings()
-    names = search_movies(settings["movie_root"], request.args.get("q", ""))
-    plex_posters = {x["name"]: x.get("poster_url","") for x in search_posters_for_prepare(settings, "movie", request.args.get("q", ""))}
+    query = str(request.args.get("q", "") or "").strip()
+    if len(query) > 256:
+        return jsonify({"ok": False, "error": "Search query is limited to 256 characters"}), 400
+    names = search_movies(settings["movie_root"], query)
+    plex_posters = {x["name"]: x.get("poster_url","") for x in search_posters_for_prepare(settings, "movie", query)}
     results = []
     for n in names:
         local = movie_poster(settings["movie_root"], n)
@@ -2398,10 +3328,11 @@ def api_prepare_movie_search():
 def api_prepare_movie_preview():
     data = request.get_json(silent=True) or {}
     movie_name = str(data.get("movie_name") or "").strip()
-    if not movie_name:
+    bracket_override = str(data.get("bracket_override") or data.get("chosen_bracket") or "").strip()
+    if not movie_name or len(movie_name) > 512 or len(bracket_override) > 256:
         return jsonify({"ok": False, "error": "movie_name is required"}), 400
     try:
-        payload = preview_movie(load_settings(), movie_name, data.get("bracket_override", ""))
+        payload = preview_movie(load_settings(), movie_name, bracket_override)
         payload["ok"] = True
         return jsonify(payload)
     except Exception as e:
@@ -2413,50 +3344,117 @@ def api_prepare_movie_start():
     if blocked:
         return blocked
     payload = request.get_json(silent=True) or {}
-    source_path = str(payload.get("source_path") or "").strip()
-    dest_path = str(payload.get("dest_path") or "").strip()
-    if not source_path or not dest_path:
-        return jsonify({"ok": False, "error": "Invalid preview payload. Rebuild queue preview and try again."}), 400
+    movie_name = str(payload.get("movie_name") or "").strip()
+    bracket_override = str(payload.get("bracket_override") or payload.get("chosen_bracket") or "").strip()
+    if not movie_name or len(movie_name) > 512 or len(bracket_override) > 256:
+        return jsonify({"ok": False, "error": "A valid movie_name is required."}), 400
     settings = load_settings()
-    # Deduplicate: if this source_path already has a queued or running job, reuse it
-    existing = _find_active_prepare_job(source_path)
-    if existing:
-        return jsonify({"ok": True, "job_id": existing, "duplicate": True})
-    job_id = create_job("movie", source_path, dest_path)
-    add_job_event(job_id, "queued", "Movie prepare job queued.", 0)
-    threading.Thread(target=run_prepare_job_when_slot, args=(job_id, "movie", settings, payload), daemon=True).start()
+    try:
+        server_preview = preview_movie(settings, movie_name, bracket_override)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": redact_sensitive_data(str(exc))[:300]}), 400
+    source_path = str(server_preview.get("source_path") or "")
+    dest_path = str(server_preview.get("dest_path") or "")
+    if not source_path or not dest_path:
+        return jsonify({"ok": False, "error": "The selected movie could not be resolved. Rebuild the preview."}), 409
+    idempotency_key = "prepare:movie:" + hashlib.sha256(f"{source_path}\0{dest_path}".encode("utf-8")).hexdigest()
+    try:
+        job_id, created = create_job(
+            "movie",
+            source_path,
+            dest_path,
+            idempotency_key=idempotency_key,
+            return_created=True,
+            initial_event=("queued", "Movie prepare job queued.", 0),
+        )
+    except Exception as exc:
+        return _prepare_queue_unavailable(exc, "Movie")
+    if not created:
+        return jsonify({"ok": True, "job_id": job_id, "duplicate": True})
+    worker_payload = dict(server_preview)
+    worker_payload.update({"movie_name": movie_name, "bracket_override": bracket_override})
+    if not _launch_prepare_worker(job_id, "movie", settings, worker_payload):
+        return jsonify({
+            "ok": False,
+            "error": "Prepare worker could not be started. Submit this item again.",
+        }), 503
     return jsonify({"ok": True, "job_id": job_id})
 
 @app.route("/api/prepare/cancel", methods=["POST"])
 def api_prepare_cancel():
-    data = request.get_json(force=True)
-    job_id = int(data.get("job_id") or 0)
+    data = request.get_json(silent=True) or {}
+    try:
+        job_id = int(data.get("job_id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
     if not job_id:
         return jsonify({"ok": False, "error": "job_id required"}), 400
     changed = cancel_prepare_job(job_id)
     return jsonify({"ok": bool(changed)})
 
+
+@app.route("/api/prepare/outcome-unknown/acknowledge", methods=["POST"])
+def api_prepare_outcome_unknown_acknowledge():
+    return _acknowledge_ambiguous_outcome(
+        "Prepare",
+        acknowledge_prepare_outcome_unknown_for_resubmission,
+    )
+
+
 @app.route("/api/packing/cancel", methods=["POST"])
 def api_packing_cancel():
-    data = request.get_json(force=True)
-    job_id = int(data.get("job_id") or 0)
+    data = request.get_json(silent=True) or {}
+    try:
+        job_id = int(data.get("job_id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
     if not job_id:
         return jsonify({"ok": False, "error": "job_id required"}), 400
     changed = cancel_packing_job(job_id)
-    return jsonify({"ok": bool(changed)})
+    if not changed:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Packing can only be cancelled before it claims and clears its "
+                "output directories"
+            ),
+        }), 409
+    return jsonify({"ok": True})
+
+
+@app.route("/api/packing/outcome-unknown/acknowledge", methods=["POST"])
+def api_packing_outcome_unknown_acknowledge():
+    return _acknowledge_ambiguous_outcome(
+        "Packing",
+        acknowledge_packing_outcome_unknown_for_resubmission,
+    )
+
 
 @app.route("/api/posting/cancel", methods=["POST"])
 def api_posting_cancel():
-    data = request.get_json(force=True)
-    job_id = int(data.get("job_id") or 0)
+    data = request.get_json(silent=True) or {}
+    try:
+        job_id = int(data.get("job_id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
     if not job_id:
         return jsonify({"ok": False, "error": "job_id required"}), 400
     changed = cancel_posting_job(job_id)
     return jsonify({"ok": bool(changed)})
 
+
+@app.route("/api/posting/outcome-unknown/acknowledge", methods=["POST"])
+def api_posting_outcome_unknown_acknowledge():
+    return _acknowledge_ambiguous_outcome(
+        "Posting",
+        acknowledge_posting_outcome_unknown_for_resubmission,
+    )
+
+
 @app.route("/api/jobs")
 def api_jobs():
-    return jsonify(_prepare_active_jobs_payload())
+    payload = _prepare_active_jobs_payload()
+    return jsonify(payload), 200 if payload.get("ok") else 503
 
 @app.route("/api/jobs/stream")
 def api_jobs_stream():
@@ -2466,8 +3464,13 @@ def api_jobs_stream():
 def api_clean_preview():
     settings = load_settings()
     history = list_history(500)
-    filter_reason = request.args.get("reason", "both")
-    filter_type = request.args.get("type", "all")
+    try:
+        filter_reason, filter_type = normalize_clean_filter_scope(
+            request.args.get("reason", "both"),
+            request.args.get("type", "all"),
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify(preview_clean(settings, history, filter_reason, filter_type))
 
 
@@ -2508,6 +3511,7 @@ def _collapse_clean_candidates(candidates):
             primary["title"] = pathlib.Path(show_path).name
             primary["target_path"] = show_path
             primary["target_kind"] = "show_folder"
+            primary["candidate_id"] = clean_candidate_id(primary)
             collapsed.append(primary)
         else:
             collapsed.extend(items)
@@ -2519,16 +3523,36 @@ def _collapse_clean_candidates(candidates):
 def api_clean_delete():
     try:
         settings = load_settings()
-        data = request.get_json(force=True) or {}
+        data = request.get_json(silent=True) or {}
         confirmation = data.get("confirmation", "")
-        candidates = data.get("candidates", [])
+        try:
+            candidate_ids = _bounded_string_list(data, "candidate_ids", max_items=500, max_length=128)
+            if "filter_reason" not in data or "filter_type" not in data:
+                raise ValueError("Clean preview scope is required. Refresh the page and run the scan again.")
+            filter_reason, filter_type = normalize_clean_filter_scope(
+                data.get("filter_reason"),
+                data.get("filter_type"),
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if "dry_run" in data and not isinstance(data.get("dry_run"), bool):
+            return jsonify({"ok": False, "error": "dry_run must be a boolean"}), 400
+        if "use_recycle_bin" in data and not isinstance(data.get("use_recycle_bin"), bool):
+            return jsonify({"ok": False, "error": "use_recycle_bin must be a boolean"}), 400
         dry_run = data.get("dry_run", settings.get("clean_dry_run","true") == "true")
         use_recycle_bin = data.get("use_recycle_bin", settings.get("clean_use_recycle_bin","true") == "true")
         recycle_bin_root = settings.get("recycle_bin_root", "/media/dest/.prepac_recycle")
         if confirmation != "DELETE":
             return jsonify({"ok": False, "error": "Confirmation must equal DELETE."}), 400
-        if not candidates:
-            return jsonify({"ok": False, "error": "No candidates selected."}), 400
+        candidates = resolve_clean_candidate_ids(
+            candidate_ids,
+            settings,
+            list_history(500),
+            filter_reason,
+            filter_type,
+        )
+        if len(candidates) != len(set(candidate_ids)):
+            return jsonify({"ok": False, "error": "One or more clean candidates expired. Refresh the preview and retry."}), 409
 
         effective_candidates = _collapse_clean_candidates(candidates)
         results = []

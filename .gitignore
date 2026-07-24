@@ -1,0 +1,32 @@
+# Local rollback snapshots and Codex control data are never committed.
+backups/
+.agents/
+.codex/
+GITHUB UPLOAD/
+
+# Operator-specific deployment files. Publish the reviewed example instead.
+docker-compose.yml
+
+# Python/runtime caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+.lifecycle-test-data/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Local environments and build output.
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local application state and secrets.
+config/
+*.db
+*.sqlite
+*.sqlite3
+.env

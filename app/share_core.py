@@ -1,25 +1,38 @@
 import hashlib
+import html
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import queue
+import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlencode
 
 import requests
 
 from app.db import load_settings
 from app.posting_jobs import list_posting_history
-from app.secret_utils import resolve_secret
-from app.web_security import normalize_service_base_url
+from app.secret_utils import resolve_secret, secret_source
+from app.web_security import normalize_service_base_url, validate_outbound_url
 from app.workflow_paths import posting_nzb_root, share_import_root, share_watch_root
+from app.path_guardrails import (
+    assert_no_symlinks_in_path,
+    assert_operation_path,
+    assert_paths_disjoint,
+)
+from app.subprocess_utils import run_command_with_output, terminate_process
 from app.share_jobs import (
     add_share_event,
+    begin_share_upload,
+    claim_share_job,
     create_imported_share_bundle,
     create_share_job,
     count_existing_share_duplicates,
@@ -29,10 +42,42 @@ from app.share_jobs import (
     get_share_job_status,
     list_imported_share_bundles,
     list_share_history,
+    mark_share_outcome_unknown,
     update_share_job,
 )
 
 ACTIVE_SHARE_JOB_IDS = set()
+SHARE_SCHEDULED_JOB_IDS = set()
+SHARE_SCHEDULE_LOCK = threading.Lock()
+LOG = logging.getLogger(__name__)
+
+
+def _share_worker_limit():
+    try:
+        configured = int(str(os.environ.get("PREPAC_SHARE_MAX_WORKERS", "4") or "4"))
+    except Exception:
+        configured = 4
+    return max(1, min(32, configured))
+
+
+SHARE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_share_worker_limit(),
+    thread_name_prefix="prepac-share",
+)
+RAR_MAX_ENTRIES = 64
+RAR_MAX_NZB_BYTES = 16 * 1024 * 1024
+RAR_MAX_MEMBER_NAME_BYTES = 4096
+RAR_LIST_TIMEOUT_SECONDS = 30
+RAR_EXTRACT_TIMEOUT_SECONDS = 60
+
+
+class ShareUploadRejected(RuntimeError):
+    """A rejected or untrustworthy response from the remote destination."""
+
+    def __init__(self, message, *, ambiguous=False, diagnostic=""):
+        super().__init__(message)
+        self.ambiguous = bool(ambiguous)
+        self.diagnostic = str(diagnostic or "")
 
 STANDARD_CATEGORY_MAP = {
     "movie_sd": ("2030", "Movies SD"),
@@ -59,6 +104,14 @@ def share_auto_after_posting_enabled(settings=None):
     return str(settings.get("share_auto_after_posting", "true")).lower() == "true"
 
 
+def normalize_share_base_url(value):
+    """Normalize the configured prefix before PrepaC appends ``/api``."""
+    base_url = normalize_service_base_url(value)
+    if base_url.lower().endswith("/api"):
+        base_url = base_url[:-4].rstrip("/")
+    return base_url
+
+
 def get_share_destinations(settings=None):
     settings = settings or _now_settings()
     raw = resolve_secret("share_destinations_json", settings)
@@ -80,7 +133,7 @@ def get_share_destinations(settings=None):
                 entry.setdefault("api_key", "")
                 entry.setdefault("categories_cache", [])
                 try:
-                    entry["base_url"] = normalize_service_base_url(entry.get("base_url", ""))
+                    entry["base_url"] = normalize_share_base_url(entry.get("base_url", ""))
                     entry.pop("base_url_error", None)
                 except Exception as exc:
                     entry["base_url"] = str(entry.get("base_url", "") or "").strip()
@@ -100,10 +153,14 @@ def get_share_destinations(settings=None):
 
 
 def save_share_destinations(destinations, settings=None):
-    from app.db import save_settings
-    current = dict(settings or _now_settings())
-    current["share_destinations_json"] = json.dumps(destinations, ensure_ascii=False, indent=2)
-    save_settings(current)
+    from app.db import save_settings_patch
+    settings = settings or _now_settings()
+    if secret_source("share_destinations_json", settings) in {"env_var", "secret_file"}:
+        # ``destinations`` contains the resolved credentials.  Never copy an
+        # externally managed secret into SQLite merely to cache capabilities.
+        return False
+    save_settings_patch({"share_destinations_json": json.dumps(destinations, ensure_ascii=False, indent=2)})
+    return True
 
 
 def public_share_destinations(settings=None):
@@ -139,10 +196,10 @@ def get_hidden_share_candidate_ids(settings=None):
 
 
 def save_hidden_share_candidate_ids(hidden_ids, settings=None):
-    from app.db import save_settings
-    current = dict(settings or _now_settings())
-    current["share_hidden_candidate_ids_json"] = json.dumps(sorted({str(x) for x in hidden_ids if str(x).strip()}), ensure_ascii=False)
-    save_settings(current)
+    from app.db import save_settings_patch
+    save_settings_patch({
+        "share_hidden_candidate_ids_json": json.dumps(sorted({str(x) for x in hidden_ids if str(x).strip()}), ensure_ascii=False)
+    })
 
 
 def unhide_share_candidate_ids(candidate_ids, settings=None):
@@ -508,8 +565,155 @@ def build_resolved_category_preview(destinations, category_key):
     return results
 
 
+def _bounded_response_bytes(response, max_bytes=1024 * 1024):
+    try:
+        declared = int(str(getattr(response, "headers", {}).get("Content-Length", "0") or "0"))
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > max(1, int(max_bytes)):
+        raise RuntimeError("Destination response is too large")
+    body = bytearray()
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        chunks = iterator(65536)
+    else:
+        content = getattr(response, "content", None)
+        if content is None:
+            content = str(getattr(response, "text", "") or "").encode("utf-8", errors="replace")
+        chunks = [content]
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        body.extend(chunk)
+        if len(body) > max(1, int(max_bytes)):
+            raise RuntimeError("Destination response is too large")
+    return bytes(body)
+
+
+def _safe_remote_error_detail(body, content_type=""):
+    """Return a short, non-HTML description from a destination response."""
+    text = str(body or "").strip()
+    if not text:
+        return ""
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    lowered = text[:512].lower()
+
+    if media_type == "application/json" or lowered.startswith(("{", "[")):
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                for key in ("error", "message", "description", "detail"):
+                    value = payload.get(key)
+                    if isinstance(value, (str, int, float)) and str(value).strip():
+                        text = str(value)
+                        break
+        except (TypeError, ValueError):
+            pass
+    elif "html" in media_type or "<html" in lowered or "<!doctype" in lowered:
+        match = re.search(r"<title\b[^>]*>(.*?)</title>", text, re.I | re.S)
+        if not match:
+            return "destination returned an HTML error page"
+        text = html.unescape(re.sub(r"<[^>]+>", " ", match.group(1)))
+    elif "xml" in media_type or lowered.startswith("<"):
+        if "<!doctype" in lowered or "<!entity" in lowered:
+            return "destination returned an XML error response"
+        try:
+            root = ET.fromstring(text)
+            candidates = [
+                root.attrib.get("description"),
+                root.attrib.get("message"),
+                root.findtext(".//error"),
+                root.findtext(".//message"),
+                root.findtext(".//description"),
+            ]
+            text = next((str(value) for value in candidates if str(value or "").strip()), root.tag)
+        except ET.ParseError:
+            return "destination returned an invalid XML error response"
+
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|token|password|authorization)\b\s*[:=]\s*[^\s,;&]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = "".join(char if ord(char) >= 32 else " " for char in text)
+    return re.sub(r"\s+", " ", text).strip()[:240]
+
+
+def _share_http_error_message(status_code, body="", content_type=""):
+    detail = _safe_remote_error_detail(body, content_type)
+    summary = f"Share upload failed: destination returned HTTP {int(status_code)}"
+    if detail:
+        summary += f" ({detail})"
+    return (
+        summary
+        + ". Verify the saved base URL, nzbadd support and permission, category, "
+        "and the destination server logs."
+    )
+
+
+def _share_response_diagnostic(status_code, body, content_type, detail=""):
+    encoded = str(body or "").encode("utf-8", errors="replace")
+    return json.dumps(
+        {
+            "http_status": int(status_code),
+            "content_type": str(content_type or "").split(";", 1)[0].strip().lower()[:80],
+            "response_bytes": len(encoded),
+            "response_sha256": hashlib.sha256(encoded).hexdigest(),
+            "reason": str(detail or "")[:300],
+        },
+        sort_keys=True,
+    )
+
+
+def _share_protocol_error(body, content_type=""):
+    """Return a destination-declared error, or an ambiguity reason."""
+    text = str(body or "").strip()
+    if not text:
+        return "", ""
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    lowered = text[:512].lower()
+    if "html" in media_type or "<html" in lowered or "<!doctype html" in lowered:
+        return "", _safe_remote_error_detail(text, content_type)
+    if media_type == "application/json" or lowered.startswith(("{", "[")):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return "", "destination returned invalid JSON"
+        if isinstance(payload, dict) and (
+            payload.get("ok") is False or payload.get("success") is False or payload.get("error")
+        ):
+            return _safe_remote_error_detail(text, content_type), ""
+        return "", ""
+    if "xml" in media_type or lowered.startswith("<"):
+        if "<!doctype" in lowered or "<!entity" in lowered:
+            return "", "destination returned XML with a forbidden declaration"
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return "", "destination returned invalid XML"
+        for node in root.iter():
+            if str(node.tag).rsplit("}", 1)[-1].lower() != "error":
+                continue
+            code = str(node.attrib.get("code", "") or "").strip()
+            description = (
+                str(node.attrib.get("description", "") or "").strip()
+                or str(node.attrib.get("message", "") or "").strip()
+                or str(node.text or "").strip()
+                or "destination reported an error"
+            )
+            detail = _safe_remote_error_detail(description, "text/plain")
+            return f"{code}: {detail}".strip(": "), ""
+    return "", ""
+
+
 def fetch_destination_caps(destination, timeout=30):
-    base_url = normalize_service_base_url(destination.get("base_url", ""))
+    base_url = validate_outbound_url(
+        normalize_share_base_url(destination.get("base_url", "")),
+        allow_private=bool(destination.get("allow_private_network", True)),
+    )
     api_key = str(destination.get("api_key", "") or "").strip()
     if not base_url or not api_key:
         raise RuntimeError("Destination base_url and api_key are required")
@@ -517,9 +721,20 @@ def fetch_destination_caps(destination, timeout=30):
     auth = None
     if destination.get("basic_auth") and (destination.get("username") or destination.get("password")):
         auth = (destination.get("username", ""), destination.get("password", ""))
-    r = requests.get(url, timeout=timeout, auth=auth)
-    r.raise_for_status()
-    root = ET.fromstring(r.text)
+    r = requests.get(url, timeout=timeout, auth=auth, allow_redirects=False, stream=True)
+    try:
+        if 300 <= r.status_code < 400:
+            raise RuntimeError("Destination redirects are not allowed; configure the final URL")
+        if r.status_code < 200 or r.status_code >= 300:
+            raise RuntimeError(f"Destination returned HTTP {int(r.status_code)}")
+        caps_body = _bounded_response_bytes(r)
+    finally:
+        close = getattr(r, "close", None)
+        if callable(close):
+            close()
+    if b"<!DOCTYPE" in caps_body.upper() or b"<!ENTITY" in caps_body.upper():
+        raise RuntimeError("Destination capabilities XML contains a forbidden declaration")
+    root = ET.fromstring(caps_body)
     categories = []
     for cat in root.findall(".//category"):
         cat_id = str(cat.attrib.get("id", "") or "")
@@ -558,9 +773,9 @@ def refresh_share_caps(settings=None):
             destination["categories_cache"] = categories
             result["status"] = "ok"
             result["count"] = len(categories)
-        except Exception as exc:
+        except Exception:
             result["status"] = "error"
-            result["message"] = str(exc)
+            result["message"] = "Destination capabilities request failed"
         results.append(result)
     save_share_destinations(destinations, settings)
     return results
@@ -589,7 +804,7 @@ def _first_existing_rar(job_dir: Path, nzb_root: Path):
         if key in seen:
             continue
         seen.add(key)
-        if candidate.exists() and candidate.is_file():
+        if candidate.exists() and candidate.is_file() and not candidate.is_symlink():
             return candidate
     return None
 
@@ -636,7 +851,7 @@ def _scan_share_watch_candidates(settings, hidden_ids, shared_by_source, seen_ar
 
     results = []
     for job_dir in sorted(root.iterdir()):
-        if not job_dir.is_dir():
+        if not job_dir.is_dir() or job_dir.is_symlink():
             continue
         template = job_dir / "template.txt"
         if not template.exists():
@@ -766,21 +981,44 @@ def build_share_candidates(settings=None):
     return results
 
 
+def _safe_upload_name(file_obj, default_name, allowed_suffixes):
+    name = Path(getattr(file_obj, "filename", "") or default_name).name
+    if not name or name in {".", ".."} or len(name) > 240:
+        raise RuntimeError("Upload filename is invalid")
+    if Path(name).suffix.lower() not in set(allowed_suffixes):
+        raise RuntimeError("Upload filename has an unsupported extension")
+    return name
+
+
+def _private_file(path: Path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def import_share_bundle(nzb_rar_file, template_file, mediainfo_file=None, release_name="", matched_by="", match_score=0):
     settings = _now_settings()
-    base = share_import_root(settings)
+    base = assert_operation_path(
+        share_import_root(settings), settings, "share_import", "share import root", allow_root=True,
+    )
     base.mkdir(parents=True, exist_ok=True)
+    assert_no_symlinks_in_path(base, "share import root")
     token = hashlib.sha1(os.urandom(24)).hexdigest()[:12]
-    target = base / token
-    target.mkdir(parents=True, exist_ok=True)
-    nzb_rar_path = target / Path(nzb_rar_file.filename or "archive.rar").name
-    template_path = target / Path(template_file.filename or "template.txt").name
+    target = assert_operation_path(base / token, settings, "share_import", "share import bundle")
+    target.mkdir(parents=True, exist_ok=False, mode=0o700)
+    assert_no_symlinks_in_path(target, "share import bundle")
+    nzb_rar_path = target / _safe_upload_name(nzb_rar_file, "archive.rar", {".rar"})
+    template_path = target / _safe_upload_name(template_file, "template.txt", {".txt"})
     nzb_rar_file.save(str(nzb_rar_path))
     template_file.save(str(template_path))
+    _private_file(nzb_rar_path)
+    _private_file(template_path)
     mediainfo_path = ""
     if mediainfo_file and getattr(mediainfo_file, "filename", ""):
-        p = target / Path(mediainfo_file.filename).name
+        p = target / _safe_upload_name(mediainfo_file, "mediainfo.txt", {".txt", ".xml", ".nfo"})
         mediainfo_file.save(str(p))
+        _private_file(p)
         mediainfo_path = str(p)
     rel = (release_name or "").strip() or nzb_rar_path.stem
     info = parse_template_info(template_path)
@@ -971,26 +1209,198 @@ def generate_metadata_xml(candidate, template_info):
     return ET.tostring(root, encoding="utf-8", xml_declaration=True, short_empty_elements=False).decode("utf-8") + "\n"
 
 
-def _extract_nzb_from_rar(rar_path: Path, workdir: Path):
-    workdir.mkdir(parents=True, exist_ok=True)
-    commands = [
-        ["rar", "x", "-idq", str(rar_path), str(workdir)],
-        ["unrar", "x", "-idq", str(rar_path), str(workdir)],
-    ]
-    success = False
-    for cmd in commands:
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            success = True
-            break
-        except Exception:
+def _parse_rar_technical_listing(text):
+    """Parse the stable ``rar/unrar lt`` key/value record format."""
+    records = []
+    current = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current.get("name"):
+                records.append(current)
+            current = {}
             continue
-    if not success:
-        raise RuntimeError("Could not extract NZB from RAR archive")
-    nzbs = list(workdir.rglob("*.nzb"))
-    if not nzbs:
-        raise RuntimeError("Could not locate extracted NZB file")
-    return nzbs[0]
+        match = re.match(r"^(Name|Type|Size|Packed size|Attributes|Redir)\s*:\s*(.*)$", line, re.I)
+        if not match:
+            continue
+        key = match.group(1).lower().replace(" ", "_")
+        # A second Name starts a new record even when the tool omits blanks.
+        if key == "name" and current.get("name"):
+            records.append(current)
+            current = {}
+        current[key] = match.group(2).strip()
+    if current.get("name"):
+        records.append(current)
+    return records
+
+
+def _safe_rar_member_name(value):
+    name = str(value or "").replace("\\", "/")
+    if not name or "\x00" in name or any(ord(char) < 32 for char in name):
+        raise RuntimeError("RAR member name contains invalid control characters")
+    if len(name.encode("utf-8", errors="surrogatepass")) > RAR_MAX_MEMBER_NAME_BYTES:
+        raise RuntimeError("RAR member name exceeds the safe length limit")
+    return name
+
+
+def _rar_declared_size(record):
+    raw = str(record.get("size", "0") or "0").replace(",", "").strip()
+    match = re.match(r"^(\d+)", raw)
+    return int(match.group(1)) if match else 0
+
+
+def _validated_nzb_member(records):
+    if not records or len(records) > RAR_MAX_ENTRIES:
+        raise RuntimeError("RAR entry count is outside the safe limit")
+    nzb_records = []
+    regular_files = 0
+    declared_total = 0
+    for record in records:
+        name = _safe_rar_member_name(record.get("name"))
+        item_type = str(record.get("type", "") or "").strip().lower()
+        attributes = str(record.get("attributes", "") or "").strip().lower()
+        redir = str(record.get("redir", "") or "").strip()
+        is_directory = item_type in {"directory", "folder"} or attributes.startswith("d")
+        if redir or "link" in item_type or "symlink" in attributes:
+            raise RuntimeError("RAR links and redirected entries are not allowed")
+        if is_directory:
+            continue
+        if item_type not in {"file", ""}:
+            raise RuntimeError("RAR contains a non-regular entry")
+        regular_files += 1
+        declared_size = _rar_declared_size(record)
+        declared_total += declared_size
+        if PurePosixPath(name).suffix.lower() == ".nzb":
+            nzb_records.append((name, declared_size))
+    if regular_files != 1 or len(nzb_records) != 1:
+        raise RuntimeError("RAR must contain exactly one regular NZB file")
+    name, size = nzb_records[0]
+    if size <= 0 or size > RAR_MAX_NZB_BYTES or declared_total > RAR_MAX_NZB_BYTES:
+        raise RuntimeError("RAR NZB size is outside the safe limit")
+    return name, size
+
+
+def _list_rar_nzb(rar_path: Path):
+    errors = []
+    for tool in ("rar", "unrar"):
+        try:
+            rc, output = run_command_with_output(
+                [tool, "lt", "-c-", "-p-", str(rar_path)],
+                start_new_session=True,
+                runtime_timeout_seconds=RAR_LIST_TIMEOUT_SECONDS,
+                inactivity_timeout_seconds=RAR_LIST_TIMEOUT_SECONDS,
+                max_output_bytes=2 * 1024 * 1024,
+                fail_on_output_limit=True,
+            )
+        except FileNotFoundError:
+            continue
+        if rc != 0:
+            errors.append(f"{tool} exited with {rc}")
+            continue
+        records = _parse_rar_technical_listing(output)
+        member_name, declared_size = _validated_nzb_member(records)
+        return tool, member_name, declared_size
+    detail = "; ".join(errors) if errors else "rar/unrar executable not found"
+    raise RuntimeError(f"Could not inspect RAR archive: {detail}")
+
+
+def _stream_rar_member(tool, rar_path: Path, _member_name: str, output_path: Path, expected_size: int):
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        # The listing already proved there is exactly one regular file. Printing
+        # the archive without a member selector prevents an archive-controlled
+        # name from being interpreted as an option or wildcard and never writes
+        # the stored path to disk.
+        [tool, "p", "-inul", "-p-", str(rar_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=False,
+        **popen_kwargs,
+    )
+    chunks = queue.Queue(maxsize=64)
+
+    def reader():
+        try:
+            while True:
+                chunk = proc.stdout.read(65536) if proc.stdout else b""
+                if not chunk:
+                    break
+                chunks.put(chunk)
+        finally:
+            chunks.put(None)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    written = 0
+    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.part")
+    try:
+        with open(temporary, "xb") as handle:
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
+            while True:
+                if time.monotonic() - started > RAR_EXTRACT_TIMEOUT_SECONDS:
+                    raise RuntimeError("RAR extraction exceeded the safe timeout")
+                try:
+                    chunk = chunks.get(timeout=0.25)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        continue
+                    continue
+                if chunk is None:
+                    break
+                written += len(chunk)
+                if written > min(RAR_MAX_NZB_BYTES, int(expected_size)):
+                    raise RuntimeError("Extracted NZB exceeds the safe size limit")
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        rc = proc.wait(timeout=5)
+        if rc != 0 or written <= 0:
+            raise RuntimeError(f"RAR extraction failed with exit code {rc}")
+        if written != int(expected_size):
+            raise RuntimeError("Extracted NZB size does not match the RAR listing")
+        os.replace(temporary, output_path)
+    except Exception:
+        terminate_process(proc, graceful_timeout=0.5)
+        raise
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        thread.join(timeout=1.0)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _extract_nzb_from_rar(rar_path: Path, workdir: Path):
+    rar_path = Path(rar_path)
+    if not rar_path.exists() or not rar_path.is_file():
+        raise RuntimeError("RAR archive was not found")
+    assert_no_symlinks_in_path(rar_path, "RAR archive")
+    workdir.mkdir(parents=True, exist_ok=False)
+    try:
+        os.chmod(workdir, 0o700)
+    except OSError:
+        pass
+    assert_no_symlinks_in_path(workdir, "RAR extraction directory")
+    assert_paths_disjoint(rar_path, workdir, "RAR archive", "RAR extraction directory")
+    tool, member_name, declared_size = _list_rar_nzb(rar_path)
+    output_path = workdir / "payload.nzb"
+    _stream_rar_member(tool, rar_path, member_name, output_path, declared_size)
+    assert_no_symlinks_in_path(output_path, "extracted NZB")
+    return output_path
 
 
 def _build_candidate_for_job(job):
@@ -1009,14 +1419,18 @@ def _build_candidate_for_job(job):
     }
 
 
-def _persist_share_artifacts(job, nfo_path, xml_path):
+def _persist_share_artifacts(job, nfo_path, xml_path, settings=None):
     try:
+        settings = settings or _now_settings()
         rar_path = Path(job.get("nzb_rar_path") or "")
         base_dir = rar_path.parent if rar_path.parent.exists() else Path(job.get("template_path") or "").parent
         if not str(base_dir):
             return "", ""
-        target_dir = base_dir / "_share"
+        target_dir = assert_operation_path(
+            base_dir / "_share", settings, "share_archive", "share artifact directory",
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
+        assert_no_symlinks_in_path(target_dir, "share artifact directory")
         stem = rar_path.stem or Path(job.get("job_name") or job.get("release_name") or "share_artifact").stem or "share_artifact"
         final_nfo = target_dir / f"{stem}.nfo"
         final_xml = target_dir / f"{stem}.xml"
@@ -1029,6 +1443,8 @@ def _persist_share_artifacts(job, nfo_path, xml_path):
 
 def run_share_job(job_id, settings=None):
     settings = settings or _now_settings()
+    if not claim_share_job(job_id):
+        return
     job = get_share_job(job_id)
     if not job:
         return
@@ -1039,14 +1455,22 @@ def run_share_job(job_id, settings=None):
         return
     ACTIVE_SHARE_JOB_IDS.add(int(job_id))
     try:
-        update_share_job(job_id, status="running", started_at=__import__("datetime").datetime.now().isoformat(timespec="seconds"))
+        archive_path = assert_operation_path(
+            job.get("nzb_rar_path"), settings, "share_archive", "share RAR archive",
+            require_exists=True, require_directory=False,
+        )
+        template_path = assert_operation_path(
+            job.get("template_path"), settings, "share_template", "share template",
+            require_exists=True, require_directory=False,
+        )
+        assert_paths_disjoint(archive_path, template_path, "share RAR archive", "share template")
         if get_share_job_status(job_id).lower() == "cancelled":
             return
         add_share_event(job_id, "prepare", "Preparing share payload", 5)
-        template_info = parse_template_info(Path(job.get("template_path") or ""))
+        template_info = parse_template_info(template_path)
         with tempfile.TemporaryDirectory(prefix="prepac_share_") as td:
             workdir = Path(td)
-            extracted_nzb = _extract_nzb_from_rar(Path(job["nzb_rar_path"]), workdir / "extract")
+            extracted_nzb = _extract_nzb_from_rar(archive_path, workdir / "extract")
             if get_share_job_status(job_id).lower() == "cancelled":
                 return
             add_share_event(job_id, "prepare", "Extracted NZB from RAR", 15)
@@ -1059,7 +1483,10 @@ def run_share_job(job_id, settings=None):
                 return
             add_share_event(job_id, "upload", "Submitting NZB to destination", 35)
             api_key = str(destination.get("api_key", "") or "").strip()
-            base_url = normalize_service_base_url(destination.get("base_url", ""))
+            base_url = validate_outbound_url(
+                normalize_share_base_url(destination.get("base_url", "")),
+                allow_private=bool(destination.get("allow_private_network", True)),
+            )
             cat_id = str(job.get("selected_category_id") or "")
             query = {
                 "t": "nzbadd",
@@ -1069,6 +1496,7 @@ def run_share_job(job_id, settings=None):
             }
             url = f"{base_url}/api?" + urlencode(query)
             files = {}
+            r = None
             try:
                 files = {"file": (extracted_nzb.name, open(extracted_nzb, "rb"), "application/x-nzb")}
                 if destination.get("include_nfo", True):
@@ -1079,18 +1507,81 @@ def run_share_job(job_id, settings=None):
                 if destination.get("basic_auth") and (destination.get("username") or destination.get("password")):
                     auth = (destination.get("username", ""), destination.get("password", ""))
                 timeout = int(str(settings.get("share_request_timeout", "120") or "120"))
-                r = requests.post(url, files=files, timeout=timeout, auth=auth)
-                body = r.text
+                if not begin_share_upload(job_id):
+                    raise RuntimeError("Share job cancelled before upload")
+                r = requests.post(
+                    url, files=files, timeout=timeout, auth=auth,
+                    allow_redirects=False, stream=True,
+                )
+                response_status = int(r.status_code)
+                content_type = str(getattr(r, "headers", {}).get("Content-Type", "") or "")
+                if 300 <= r.status_code < 400:
+                    reason = "Destination redirects are not allowed; configure the final URL"
+                    raise ShareUploadRejected(
+                        _share_http_error_message(
+                            response_status,
+                            reason,
+                            "text/plain",
+                        ),
+                        ambiguous=True,
+                        diagnostic=_share_response_diagnostic(
+                            response_status, "", content_type, reason,
+                        ),
+                    )
+                if response_status < 200 or response_status >= 300:
+                    try:
+                        response_body = _bounded_response_bytes(
+                            r, max_bytes=64 * 1024,
+                        ).decode("utf-8", errors="replace")
+                    except RuntimeError:
+                        response_body = "Destination error response exceeded the safe size limit"
+                        content_type = "text/plain"
+                    safe_detail = _safe_remote_error_detail(response_body, content_type)
+                    raise ShareUploadRejected(
+                        _share_http_error_message(
+                            response_status, response_body, content_type,
+                        ),
+                        ambiguous=response_status == 408 or response_status >= 500,
+                        diagnostic=_share_response_diagnostic(
+                            response_status, response_body, content_type, safe_detail,
+                        ),
+                    )
+                body = _bounded_response_bytes(r).decode("utf-8", errors="replace")
+                declared_error, ambiguous_reason = _share_protocol_error(body, content_type)
+                if declared_error:
+                    message = (
+                        "Share upload failed: destination rejected the request"
+                        f" ({declared_error}). Verify destination permissions and settings."
+                    )
+                    raise ShareUploadRejected(
+                        message,
+                        diagnostic=_share_response_diagnostic(
+                            response_status, body, content_type, declared_error,
+                        ),
+                    )
+                if ambiguous_reason:
+                    message = (
+                        "Share upload response could not be verified"
+                        f" ({ambiguous_reason})."
+                    )
+                    raise ShareUploadRejected(
+                        message,
+                        ambiguous=True,
+                        diagnostic=_share_response_diagnostic(
+                            response_status, body, content_type, ambiguous_reason,
+                        ),
+                    )
             finally:
                 for _, file_tuple in files.items():
                     try:
                         file_tuple[1].close()
                     except Exception:
                         pass
+                close = getattr(r, "close", None)
+                if callable(close):
+                    close()
             if get_share_job_status(job_id).lower() == "cancelled":
                 return
-            if not r.ok:
-                raise RuntimeError(f"Share upload failed: HTTP {r.status_code} - {body[:500]}")
             remote_id = ""
             remote_guid = ""
             try:
@@ -1099,7 +1590,7 @@ def run_share_job(job_id, settings=None):
                 remote_guid = xroot.attrib.get("guid", "") or xroot.findtext(".//item/guid") or ""
             except Exception:
                 pass
-            persisted_nfo_path, persisted_xml_path = _persist_share_artifacts(job, nfo_path, xml_path)
+            persisted_nfo_path, persisted_xml_path = _persist_share_artifacts(job, nfo_path, xml_path, settings)
             update_fields = {"raw_response": body[:4000], "remote_id": remote_id, "remote_guid": remote_guid}
             if persisted_nfo_path:
                 update_fields["generated_nfo_path"] = persisted_nfo_path
@@ -1110,17 +1601,68 @@ def run_share_job(job_id, settings=None):
                 return
             add_share_event(job_id, "complete", "Destination accepted share upload", 100)
             finish_share(job_id, True, "Share complete")
+    except ShareUploadRejected as exc:
+        LOG.warning(
+            "Share job %s received an unusable destination response: %s; diagnostic=%s",
+            job_id,
+            exc,
+            exc.diagnostic,
+        )
+        if exc.diagnostic:
+            try:
+                update_share_job(job_id, raw_response=exc.diagnostic[:4000])
+            except Exception:
+                LOG.exception("Could not persist the rejected response for Share job %s", job_id)
+        status = get_share_job_status(job_id).lower()
+        if status == "cancelled":
+            pass
+        elif exc.ambiguous:
+            mark_share_outcome_unknown(
+                job_id,
+                f"{exc} The destination may already have accepted the upload. "
+                "Verify it before using Force retry.",
+            )
+        else:
+            finish_share(job_id, False, str(exc))
+            add_share_event(job_id, "failed", str(exc), None)
     except Exception as exc:
-        finish_share(job_id, False, str(exc))
-        add_share_event(job_id, "failed", str(exc), None)
+        LOG.exception("Share job %s failed", job_id)
+        status = get_share_job_status(job_id).lower()
+        if status == "uploading":
+            mark_share_outcome_unknown(
+                job_id,
+                "Upload response was not safely completed; the destination may have accepted it. "
+                "Verify the remote destination before using manual force retry.",
+            )
+        elif status != "cancelled":
+            finish_share(job_id, False, str(exc))
+            add_share_event(job_id, "failed", str(exc), None)
     finally:
         ACTIVE_SHARE_JOB_IDS.discard(int(job_id))
 
 
 def start_share_job_async(job_id, settings=None):
     settings = settings or _now_settings()
-    threading.Thread(target=run_share_job, args=(job_id, settings), daemon=True).start()
-    return job_id
+    normalized_job_id = int(job_id)
+    with SHARE_SCHEDULE_LOCK:
+        if normalized_job_id in SHARE_SCHEDULED_JOB_IDS or normalized_job_id in ACTIVE_SHARE_JOB_IDS:
+            return normalized_job_id
+        SHARE_SCHEDULED_JOB_IDS.add(normalized_job_id)
+
+    def _run_scheduled():
+        try:
+            run_share_job(normalized_job_id, settings)
+        finally:
+            with SHARE_SCHEDULE_LOCK:
+                SHARE_SCHEDULED_JOB_IDS.discard(normalized_job_id)
+
+    try:
+        SHARE_EXECUTOR.submit(_run_scheduled)
+    except Exception:
+        with SHARE_SCHEDULE_LOCK:
+            SHARE_SCHEDULED_JOB_IDS.discard(normalized_job_id)
+        raise
+    return normalized_job_id
 
 
 def queue_share_jobs(request_items, destination_ids, settings=None):
@@ -1154,7 +1696,8 @@ def queue_share_jobs(request_items, destination_ids, settings=None):
                 })
                 continue
             job_hash = hashlib.sha256(f"{dest_id}|{candidate.get('job_name', '')}|{nzb_hash}".encode()).hexdigest()
-            job_id = create_share_job(
+            job_id, created = create_share_job(
+                return_created=True,
                 source_type=candidate.get("source_type", ""),
                 source_ref_id=candidate.get("source_ref_id", ""),
                 posting_job_id=candidate.get("posting_job_id"),
@@ -1173,9 +1716,20 @@ def queue_share_jobs(request_items, destination_ids, settings=None):
                 nzb_hash=nzb_hash,
                 job_hash=job_hash,
             )
+            if not created:
+                skipped.append({"candidate_id": item.get("candidate_id"), "destination_id": dest_id, "reason": "Active share already exists"})
+                continue
             start_share_job_async(job_id, settings)
             queued.append({"job_id": job_id, "candidate_id": item.get("candidate_id"), "destination_id": dest_id})
-    return {"queued": queued, "skipped": skipped}
+    return {
+        "accepted": bool(queued),
+        "queued_count": len(queued),
+        "skipped_count": len(skipped),
+        "jobs": queued,
+        "skipped": skipped,
+        # Kept for API compatibility with clients released before v1.5.0.
+        "queued": queued,
+    }
 
 
 def build_share_submission_review(request_items, destination_ids, settings=None):

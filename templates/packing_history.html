@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% block title %}Packing history · PrepaC{% endblock %}
+{% block page_label %}Packing history{% endblock %}
 {% block content %}
+<section class="page-header"><div><span class="eyebrow">Stage 02 history</span><h1>Packing history</h1><p>Archive output, parity data, and packing durations.</p></div><a class="button secondary" href="{{ url_for('api_packing_history_export') }}">Download CSV</a></section>
 <section class="card">
-  <h2>Packing History</h2>
-  <p><a href="{{ url_for('api_packing_history_export') }}">Download CSV</a></p>
+  <div class="section-heading"><div><h2>Packed jobs</h2><p>Expand a row to inspect paths and events.</p></div></div>
   {% if jobs %}
   <table>
     <tr><th>Date</th><th>Job</th><th>Status</th><th>RAR Size</th><th>RAR Parts</th><th>RAR Time</th><th>PAR2 Size</th><th>PAR2 Time</th><th>Token</th></tr>
@@ -28,7 +30,7 @@
     {% endfor %}
   </table>
   {% else %}
-  <p>No packing history yet.</p>
+  <div class="empty-state"><strong>No packing history</strong></div>
   {% endif %}
 </section>
 {% endblock %}

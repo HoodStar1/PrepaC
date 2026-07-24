@@ -1,123 +1,240 @@
-# PrepaC
+# PrepaC 1.5.0
 
-PrepaC is a self-hosted web app for preparing, packing, posting, sharing, and cleaning NZB release jobs from one interface.
+PrepaC is a self-hosted web app for preparing, packing, posting, sharing, and
+cleaning media release jobs from one place.
 
 ## What it does
 
-PrepaC organizes the workflow into clear stages:
-- **Prepare**: create working jobs from TV or movie source folders
-- **Packing**: build release output from prepared jobs
-- **Posting**: upload packed jobs with your configured providers
-- **Share**: submit NZBs to Newznab-compatible destinations
-- **Clean**: review and remove processed content
+- **Prepare** creates working jobs from TV or movie folders.
+- **Packing** creates RAR and PAR2 release files.
+- **Posting** uploads packed jobs through your configured providers.
+- **Share** submits NZBs to supported Newznab-style destinations.
+- **Clean** lets you review and remove processed content safely.
 
-## Main features
+PrepaC also includes provider priority rules, single and mass Share import,
+Share history and retry controls, and optional Plex cleanup support.
 
-- TV and movie preparation flows
-- Packing and posting job management
-- Dynamic posting provider management in Settings
-- Per-provider small-job priority routing with “Prioritize jobs up to (GB)” for providers after Provider 1
-- Share destinations with category detection and manual override
-- Single import and mass import for Share
-- Generated NFO and metadata XML for Share submissions
-- Active Share job controls with cancel or remove actions
-- Share history and retry support
-- Optional Plex integration for cleanup workflows
-- Docker-based deployment
+## Supported systems
 
-## Requirements
+| Installation | Supported system |
+| --- | --- |
+| Docker | Linux AMD64 |
+| Direct Linux | Linux x86-64 with Python 3.13 or 3.14 |
+| Direct Windows | Windows x64 with Python 3.13 or 3.14 |
 
-- Docker and Docker Compose
-- Persistent storage for `/config`
-- Your own source, destination, and output paths
-- Posting provider credentials if you want to use Posting
-- Newznab-compatible destination details if you want to use Share
+Docker is the easiest option. macOS and ARM64 are not supported.
 
-## Quick start
+## Install with Docker
 
-1. Clone this repository.
-2. Review `docker-compose.example.yml` or `docker-compose.yml`.
-3. If you want a standalone GitHub/Unraid Docker update-source folder, see [`docker/README.md`](docker/README.md).
-4. Make sure `/config` is persistent.
-5. Build and start the app:
+### What you need
+
+- Docker
+- Docker Compose
+- Enough free space for the media and working folders
+
+### Installation
+
+1. Clone or download this repository.
+2. Open a terminal in the PrepaC folder.
+3. Create your private Compose file:
 
 ```bash
+cp docker-compose.example.yml docker-compose.yml
+```
+
+On Windows, copy the file in File Explorer instead.
+
+4. Edit `docker-compose.yml` and change the folder paths if needed.
+
+The `/config` folder stores your settings and database. Keep it persistent.
+Media folders are shown inside the container as `/media/...`.
+
+5. Check and start PrepaC:
+
+```bash
+docker compose config
 docker compose up -d --build
 ```
 
-6. Open the app in your browser:
+6. Open:
 
 ```text
 http://localhost:1234
 ```
 
+To view logs:
+
+```bash
+docker compose logs --tail=200 -f prepac
+```
+
+## Install directly on Linux
+
+Docker is recommended. A direct Linux installation requires:
+
+- Python 3.13 or 3.14
+- FFmpeg and ffprobe
+- MediaInfo
+- RAR
+- PAR2
+- Node.js and Nyuu
+- rsync is optional
+
+Install those tools with your Linux package manager, then run:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --require-hashes -r requirements-linux.txt
+python -m pip install --no-deps .
+prepac --check
+prepac
+```
+
+Open `http://localhost:1234`.
+
+The default settings folder is `~/.config/prepac`. To use another folder:
+
+```bash
+prepac --config-dir /path/to/prepac-config
+```
+
+## Install directly on Windows
+
+A direct Windows installation requires:
+
+- 64-bit Python 3.13 or 3.14
+- FFmpeg and ffprobe
+- MediaInfo
+- RAR
+- PAR2
+- Node.js and Nyuu
+
+Make sure every tool can be run from PowerShell, then run:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install --require-hashes -r requirements-windows.txt
+python -m pip install --no-deps .
+prepac --check
+prepac
+```
+
+Open `http://localhost:1234`.
+
+The default settings folder is `%LOCALAPPDATA%\PrepaC`. To use another folder:
+
+```powershell
+prepac --config-dir "D:\PrepaC\Config"
+```
+
 ## First-time setup
 
-1. Create the first admin account.
+1. Create the first administrator account.
 2. Open **Settings**.
-3. Configure your paths.
-4. Configure one or more posting providers if you want to use Posting.
-5. Configure Share destinations if you want to use Share.
+3. Set the TV, movie, destination, and workflow folders.
+4. Add posting providers if you use Posting.
+5. Add a Share destination if you use Share.
+6. Add Plex only if you want Plex-assisted cleanup.
+7. Run a small test job before processing a large queue.
+8. Back up the complete config folder after setup.
 
-## How to use PrepaC
+## Share setup and errors
 
-### Prepare
-Scan your TV or movie roots and create working jobs.
+### Destination address
 
-### Packing
-Build release output from prepared jobs.
+Enter the destination's main address, normally the part before `/api`.
+PrepaC 1.5.0 also removes one trailing `/api` automatically.
 
-### Posting
-Start uploads from packed jobs. For providers after Provider 1, use **Prioritize jobs up to (GB)** to prefer smaller jobs on specific providers first. Set the value to **0** to keep that provider in the same default availability pool as Provider 1.
+The destination must support the nonstandard Newznab upload command
+`t=nzbadd`. A successful connection or category check does not prove that
+uploads are supported.
 
-### Share
-Submit successful posting output or import RARred NZB + template bundles for submission. Active Share jobs can be cancelled or removed from the Share screen, and completed or cancelled jobs are available in Share History.
+### RAR contains an unsafe member path
 
-### Clean
-Review deletion candidates before removing content.
+This PrepaC error is fixed in 1.5.0.
 
-## Important notes
+PrepaC checks that the RAR contains exactly one normal NZB file, then reads that
+file without extracting its stored folder name. Older archives containing
+absolute paths, `../`, brackets, wildcards, or names beginning with `-` are
+therefore handled safely.
 
-- Keep `/config` persistent across upgrades.
-- Share uploads depend on the limits and rules of the destination indexer.
-- Some Share destinations may rate-limit uploads or API usage.
-- Share mass import can pair files by filename and by template content.
-- If a Share candidate is removed, re-importing the same bundle creates a fresh candidate again.
+### Share returns HTTP 500
 
-## Security and Compatibility Controls
+HTTP 500 is returned by the destination server or its reverse proxy. PrepaC
+1.5.0:
 
-PrepaC is designed for self-hosted Docker environments. Security hardening is configurable so LAN and HTTP-only setups remain supported.
+- no longer displays the destination's raw HTML error page;
+- fixes addresses that accidentally end in `/api`;
+- keeps uncertain uploads as **Outcome unknown** instead of retrying them
+  automatically.
 
-- Session cookie mode (`PREPAC_SESSION_COOKIE_MODE`):
-	- `legacy` (default): preserves previous behavior (`PREPAC_SESSION_COOKIE_SECURE`, default false)
-	- `auto`: secure cookies for HTTPS requests; can trust proxy headers when `PREPAC_TRUST_PROXY_HEADERS=true`
-	- `always`: always secure cookies (recommended for HTTPS-only deployments)
-	- `never`: always non-secure cookies (HTTP-only local/LAN installs)
-- Reverse proxy header trust (`PREPAC_TRUST_PROXY_HEADERS`):
-	- `false` (default): ignore `X-Forwarded-Proto` and `X-Forwarded-Host` for generated external URLs
-	- `true`: trust forwarded proto and host from your reverse proxy
-- Share import upload cap (`PREPAC_SHARE_IMPORT_MAX_MB`, default `512`):
-	- Limits single and bulk Share import request size
-	- Increase only if your import bundles genuinely require it
-- Metrics scrape token (`PREPAC_METRICS_TOKEN`):
-	- When unset: `/metrics` keeps existing authenticated behavior.
-	- When set: `/metrics` accepts `X-Prepac-Metrics-Token` header or `?token=...` for non-interactive scraping.
-- Auth abuse controls:
-	- `PREPAC_AUTH_RATE_WINDOW_SECONDS` (default `300`)
-	- `PREPAC_AUTH_RATE_MAX_ATTEMPTS` (default `20`)
-	- `PREPAC_AUTH_LOCKOUT_SECONDS` (default `600`)
-	- Applies to sign-in and password reset attempts per user/IP key.
-- Prepare permissions mode (`prepare_permissions_mode` setting or `PREPAC_PREPARE_PERMISSIONS_MODE` env):
-	- `legacy_open` (default): dirs `777`, files `666` for backward compatibility.
-	- `shared_safe`: dirs `775`, files `664`.
-	- `owner_strict`: dirs `750`, files `640`.
+If HTTP 500 continues:
 
-### Self-hosted hardening guidance
+1. Check the destination's own logs at the same time as the upload.
+2. Confirm the API key is allowed to upload with `t=nzbadd`.
+3. Confirm the selected category accepts uploads.
+4. For a small disposable test, turn off optional NFO, MediaInfo, and metadata
+   fields in the Share destination settings.
+5. Check the destination before using **Force retry**. The first upload may
+   already have arrived.
 
-- If using reverse proxy TLS, prefer `PREPAC_SESSION_COOKIE_MODE=always`.
-- Keep mount scopes minimal and avoid broad host mounts when possible.
-- For non-root container operation, verify ownership/permissions of mounted paths before switching runtime user.
+PrepaC cannot correct a server-side 500 response when the destination does not
+support or permit NZB uploads.
+
+## Update PrepaC
+
+Always stop PrepaC and copy the complete config folder before updating.
+
+### Docker
+
+Replace or update the repository files, keep your private
+`docker-compose.yml`, then run:
+
+```bash
+docker compose up -d --build --force-recreate prepac
+```
+
+PrepaC is built from the local files. `docker compose pull` does not update it.
+
+### Linux or Windows
+
+Replace the source files, activate the existing virtual environment, reinstall
+the matching requirements file, and run:
+
+```text
+python -m pip install --no-deps .
+prepac --check
+```
+
+Then start PrepaC normally.
+
+## Remove PrepaC
+
+For Docker:
+
+```bash
+docker compose down
+```
+
+Delete the application folder when you no longer need it. Delete the config
+folder only if you also want to permanently remove all settings and history.
+
+For a direct installation, stop PrepaC and remove the application folder and
+virtual environment. The config folder can be kept for a future installation.
+
+## Help
+
+- Health check: `http://localhost:1234/health`
+- Docker logs: `docker compose logs --tail=200 prepac`
+- More help is available in the `docs` folder.
+
+Never publish `docker-compose.yml`, the config folder, databases, logs,
+passwords, API keys, or tokens.
 
 ## License
 
-Licensed under the GNU General Public License v3.0. See the `LICENSE` file for details.
+PrepaC is licensed under the GNU General Public License v3.0. See `LICENSE`.

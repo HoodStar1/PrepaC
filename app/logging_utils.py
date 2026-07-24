@@ -4,6 +4,13 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from app.data_sanitizer import redact_sensitive_data
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive_data(super().format(record))
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -11,14 +18,14 @@ class JsonFormatter(logging.Formatter):
             "ts": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": redact_sensitive_data(record.getMessage()),
         }
         for attr in ("event", "job_id", "job_kind", "path", "status", "phase"):
             value = getattr(record, attr, None)
             if value not in (None, ""):
-                payload[attr] = value
+                payload[attr] = redact_sensitive_data(str(value))
         if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
+            payload["exc_info"] = redact_sensitive_data(self.formatException(record.exc_info))
         return json.dumps(payload, ensure_ascii=False)
 
 
@@ -36,6 +43,6 @@ def setup_logging() -> None:
     if use_json:
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+        handler.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
     root.addHandler(handler)
     logging.captureWarnings(True)
