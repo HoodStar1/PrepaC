@@ -39,7 +39,7 @@ def list_seasons(tv_root, show_name):
         if (name.startswith("Season ") and len(name) >= 9) or lk == "specials": out.append(name)
     return sorted(out)
 
-def preview_tv(settings, show_name, season_name, bracket_override=""):
+def preview_tv(settings, show_name, season_name, bracket_override="", bracket_is_resolved=False):
     show_name = _safe_child_name(show_name, "show name")
     season_name = _safe_child_name(season_name, "season name")
     show_path = Path(settings["tv_root"]) / show_name
@@ -68,9 +68,10 @@ def preview_tv(settings, show_name, season_name, bracket_override=""):
     season_tag = f"S{season_num}"
     tags = detect_tags(str(files[0]))
     bracket = bracket_override.strip()
-    if not bracket:
+    if not bracket and not bracket_is_resolved:
         bracket = detect_bracket_info_from_filenames([p.name for p in files])
         bracket = merge_bracket_with_detected_hdr(bracket, tags, "tv")
+    queue_bracket = bracket
     dest_show = sanitize_show_name(show_name)
     folder, _, chosen_bracket = enforce_name_length(dest_show, bracket, settings["end_tag"], int(settings["max_name_len"]), season_tag)
     dest_path = prepare_root(settings) / folder
@@ -84,5 +85,6 @@ def preview_tv(settings, show_name, season_name, bracket_override=""):
         raise ValueError(str(exc)) from exc
     dest_path = str(dest_path)
     return {"media_type":"tv","show_name":show_name,"season_name":season_name,"source_path":str(season_path),"source_rel":f"{show_name}/{season_name}",
-            "season_tag":season_tag,"video_files":[str(p) for p in files],"detected_tags":tags,"chosen_bracket":chosen_bracket,
+            "season_tag":season_tag,"video_files":[str(p) for p in files],"detected_tags":tags,"queue_bracket":queue_bracket,
+            "bracket_is_resolved":True,"chosen_bracket":chosen_bracket,
             "dest_folder":folder,"dest_path":dest_path,"path_warn":len(dest_path) > int(settings["win_path_warn"])}

@@ -17,6 +17,7 @@ from flask import Flask, jsonify, redirect, render_template, request, url_for, f
 from flask.sessions import SecureCookieSessionInterface
 from urllib.parse import urlencode, urlparse
 from jsonschema import validate, ValidationError as JsonSchemaValidationError
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from app.db import (
@@ -33,6 +34,7 @@ from app.db import (
 )
 from app.jobs import create_job, add_job_event, list_jobs, list_jobs_by_status, try_claim_prepare_slot, cancel_prepare_job, register_prepare_worker, unregister_prepare_worker, set_job_status, prepare_should_stop, acknowledge_prepare_outcome_unknown_for_resubmission, fail_prepare_job_if_active
 from app.history_db import list_history, delete_prepared_by_id
+from app.helpers import human_bytes
 from app.clean_actions import list_clean_actions
 from app.prepare_tv import search_shows, list_seasons, preview_tv
 from app.prepare_movie import search_movies, preview_movie
@@ -51,7 +53,7 @@ from app.posting_jobs import list_posting_jobs, list_posting_jobs_by_status, lis
 from app.secret_utils import SECRET_SPECS, masked_secret_value, secret_source, resolve_secret
 from app.share_core import build_resolved_category_preview, build_share_candidates, build_share_submission_review, CATEGORY_KEY_OPTIONS, get_share_destinations, import_share_bundle, import_share_bundles_bulk, list_share_history, normalize_share_base_url, public_share_destinations, queue_share_jobs, refresh_share_caps, start_share_job_async, fetch_destination_caps, remove_share_candidate
 from app.share_jobs import get_share_job, list_share_jobs, increment_share_retry, force_retry_share_outcome_unknown, cancel_share_job
-from app.path_guardrails import assert_no_parent_traversal, assert_path_within_roots, build_allowed_roots
+from app.path_guardrails import assert_no_parent_traversal, assert_operation_pair, assert_path_within_roots, build_allowed_roots
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime
 from app.version import APP_NAME, APP_VERSION, BUILD_NUMBER, FULL_VERSION, DISPLAY_VERSION, BUILD_DISPLAY
@@ -888,12 +890,10 @@ def prettyjson(v):
 @app.template_filter("humansize")
 def humansize_filter(num_bytes):
     try:
-        gb = float(num_bytes or 0) / (1024**3)
+        value = max(0, int(num_bytes or 0))
     except Exception:
-        gb = 0.0
-    if gb >= 1024:
-        return f"{gb/1024:.2f} TB"
-    return f"{gb:.2f} GB"
+        value = 0
+    return human_bytes(value)
 
 @app.template_filter("humanduration")
 def humanduration_filter(seconds):
@@ -1021,6 +1021,162 @@ def _prepare_queue_unavailable(exc, media_type):
         "ok": False,
         "error": "Prepare queue is temporarily unavailable. Try again in a few seconds.",
     }), 503
+
+
+_PREPARE_BATCH_LIMIT = 50
+_PREPARE_PREVIEW_TOKEN_MAX_AGE_SECONDS = 3600
+_PREPARE_PREVIEW_TOKEN_SALT = "prepac-prepare-preview-v1"
+
+
+def _prepare_child_name(value, label, max_length):
+    value = str(value or "").strip()
+    if (
+        not value
+        or len(value) > int(max_length)
+        or value in {".", ".."}
+        or pathlib.Path(value).name != value
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError(f"A valid {label} is required.")
+    return value
+
+
+def _prepare_preview_token(preview):
+    media_type = str(preview.get("media_type") or "").strip().lower()
+    data = {
+        "version": 1,
+        "media_type": media_type,
+        "source_path": str(preview.get("source_path") or ""),
+        "dest_path": str(preview.get("dest_path") or ""),
+        "queue_bracket": str(preview.get("queue_bracket") or ""),
+        "bracket_is_resolved": preview.get("bracket_is_resolved") is True,
+    }
+    if media_type == "tv":
+        data.update({
+            "show_name": str(preview.get("show_name") or ""),
+            "season_name": str(preview.get("season_name") or ""),
+        })
+    elif media_type == "movie":
+        data["movie_name"] = str(preview.get("movie_name") or "")
+    else:
+        raise ValueError("Prepare preview has an unsupported media type.")
+    if not data["source_path"] or not data["dest_path"] or not data["bracket_is_resolved"]:
+        raise ValueError("Prepare preview is incomplete.")
+    return URLSafeTimedSerializer(
+        app.secret_key,
+        salt=_PREPARE_PREVIEW_TOKEN_SALT,
+    ).dumps(data)
+
+
+def _load_prepare_preview_token(value):
+    token = str(value or "").strip()
+    if not token or len(token) > 16384:
+        raise ValueError("Build a new Prepare preview before starting.")
+    try:
+        data = URLSafeTimedSerializer(
+            app.secret_key,
+            salt=_PREPARE_PREVIEW_TOKEN_SALT,
+        ).loads(token, max_age=_PREPARE_PREVIEW_TOKEN_MAX_AGE_SECONDS)
+    except SignatureExpired as exc:
+        raise ValueError("The Prepare preview expired. Build a new preview.") from exc
+    except BadSignature as exc:
+        raise ValueError("The Prepare preview is invalid. Build a new preview.") from exc
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("The Prepare preview is invalid. Build a new preview.")
+    return data
+
+
+def _create_prepare_queue_entry(settings, media_type, payload):
+    """Persist one lightweight selection without repeating media probes."""
+    if not isinstance(payload, dict):
+        raise ValueError("Each Prepare item must be an object.")
+
+    preview = _load_prepare_preview_token(payload.get("preview_token"))
+    requested_media_type = str(media_type or "").strip().lower()
+    media_type = str(preview.get("media_type") or "").strip().lower()
+    if requested_media_type and requested_media_type != media_type:
+        raise ValueError("Prepare item kind does not match its preview.")
+    queue_bracket = str(preview.get("queue_bracket") or "").strip()
+    if len(queue_bracket) > 256 or preview.get("bracket_is_resolved") is not True:
+        raise ValueError("The Prepare preview is invalid. Build a new preview.")
+    source_value = str(preview.get("source_path") or "")
+    destination_value = str(preview.get("dest_path") or "")
+    if (
+        not source_value
+        or not destination_value
+        or len(source_value) > 8192
+        or len(destination_value) > 8192
+    ):
+        raise ValueError("The Prepare preview paths are invalid. Build a new preview.")
+
+    if media_type == "tv":
+        show_name = _prepare_child_name(preview.get("show_name"), "show name", 512)
+        season_name = _prepare_child_name(preview.get("season_name"), "season name", 256)
+        source_operation = "prepare_tv_source"
+        source_label = "TV season"
+        initial_message = "TV prepare job queued."
+        worker_payload = {
+            "show_name": show_name,
+            "season_name": season_name,
+            "queue_bracket": queue_bracket,
+            "bracket_is_resolved": True,
+        }
+    elif media_type == "movie":
+        movie_name = _prepare_child_name(preview.get("movie_name"), "movie name", 512)
+        source_operation = "prepare_movie_source"
+        source_label = "movie"
+        initial_message = "Movie prepare job queued."
+        worker_payload = {
+            "movie_name": movie_name,
+            "queue_bracket": queue_bracket,
+            "bracket_is_resolved": True,
+        }
+    else:
+        raise ValueError("Prepare item kind must be tv or movie.")
+
+    try:
+        source_path, destination_path = assert_operation_pair(
+            source_value,
+            destination_value,
+            settings,
+            source_operation,
+            "prepare_destination",
+            source_label=source_label,
+            destination_label="prepare destination",
+        )
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    if not source_path.is_dir():
+        raise ValueError(f"The selected {source_label} is not a directory.")
+    worker_payload.update({
+        "expected_source_path": str(source_path),
+        "expected_dest_path": str(destination_path),
+    })
+
+    idempotency_key = (
+        f"prepare:{media_type}:"
+        + hashlib.sha256(
+            f"{source_path}\0{destination_path}".encode("utf-8")
+        ).hexdigest()
+    )
+    job_id, created = create_job(
+        media_type,
+        str(source_path),
+        str(destination_path),
+        idempotency_key=idempotency_key,
+        return_created=True,
+        initial_event=("queued", initial_message, 0),
+    )
+    result = {
+        "ok": True,
+        "job_id": job_id,
+        "duplicate": not created,
+    }
+    launch = None
+    if created:
+        launch = (job_id, media_type, settings, worker_payload)
+    return result, launch
 
 
 def _launch_prepare_worker(job_id, media_type, settings, worker_payload):
@@ -1171,17 +1327,25 @@ def run_prepare_job_when_slot(job_id, media_type, settings, payload):
     finally:
         unregister_prepare_worker(job_id)
 
-def _job_duration_seconds(started_at, finished_at):
+def _valid_job_duration_seconds(started_at, finished_at):
     if not started_at or not finished_at:
-        return 0
+        return None
     try:
         started = parse_local_timestamp(started_at)
         finished = parse_local_timestamp(finished_at)
         if not started or not finished:
-            return 0
-        return max(0, int((finished - started).total_seconds()))
+            return None
+        seconds = int((finished - started).total_seconds())
+        return seconds if seconds >= 0 else None
     except Exception:
+        return None
+
+
+def _job_duration_seconds(started_at, finished_at):
+    duration = _valid_job_duration_seconds(started_at, finished_at)
+    if duration is None:
         return 0
+    return duration
 
 def enrich_prepare_history_rows(history_rows, jobs):
     done_jobs = [j for j in jobs if str(j.get("status","")).lower() == "done"]
@@ -1220,7 +1384,6 @@ def summarize_clean_logs(logs):
         is_success = str(l.get("success", "")).lower() == "true"
         size = int(l.get("size_bytes", 0) or 0)
         msg = str(l.get("message","")).lower()
-        summary["bytes_total"] += size
         if "recycle" in msg:
             summary["recycle_actions"] += 1
         if is_dry:
@@ -1228,11 +1391,12 @@ def summarize_clean_logs(logs):
             summary["bytes_dry_run"] += size
         else:
             summary["real_runs"] += 1
-            summary["bytes_real"] += size
-        if is_success:
-            summary["successes"] += 1
-        else:
-            summary["failures"] += 1
+            if is_success:
+                summary["successes"] += 1
+                summary["bytes_total"] += size
+                summary["bytes_real"] += size
+            else:
+                summary["failures"] += 1
     return summary
 
 
@@ -1258,24 +1422,26 @@ def summarize_prepare_stats(history, jobs):
 
 
 
+def _packing_output_bytes(job):
+    return (
+        int(job.get("rar_size_bytes", 0) or 0)
+        + int(job.get("par2_size_bytes", 0) or 0)
+    )
+
+
 def summarize_packing_stats(packing_jobs):
     completed = [j for j in packing_jobs if str(j.get("status","")).lower() == "done"]
-    total_bytes = sum(int(j.get("size_bytes", 0) or 0) for j in completed)
+    total_bytes = sum(_packing_output_bytes(j) for j in completed)
     durations = []
     largest = 0
     for j in completed:
-        largest = max(largest, int(j.get("size_bytes", 0) or 0))
-        s = j.get("started_at")
-        f = j.get("finished_at")
-        if s and f:
-            try:
-
-                started = parse_local_timestamp(s)
-                finished = parse_local_timestamp(f)
-                if started and finished:
-                    durations.append((finished - started).total_seconds())
-            except Exception:
-                pass
+        largest = max(largest, _packing_output_bytes(j))
+        duration = _valid_job_duration_seconds(
+            j.get("started_at"),
+            j.get("finished_at"),
+        )
+        if duration is not None:
+            durations.append(duration)
     avg_seconds = int(sum(durations)/len(durations)) if durations else 0
     return {
         "total_jobs": len(completed),
@@ -1291,17 +1457,12 @@ def summarize_posting_stats(posting_jobs):
     largest = 0
     for j in completed:
         largest = max(largest, int(j.get("size_bytes", 0) or 0))
-        s = j.get("started_at")
-        f = j.get("finished_at")
-        if s and f:
-            try:
-
-                started = parse_local_timestamp(s)
-                finished = parse_local_timestamp(f)
-                if started and finished:
-                    durations.append((finished - started).total_seconds())
-            except Exception:
-                pass
+        duration = _valid_job_duration_seconds(
+            j.get("started_at"),
+            j.get("finished_at"),
+        )
+        if duration is not None:
+            durations.append(duration)
     avg_seconds = int(sum(durations)/len(durations)) if durations else 0
     return {
         "total_jobs": len(completed),
@@ -1409,6 +1570,236 @@ def summarize_share_stats(share_jobs):
         "imported_jobs": imported_jobs,
         "posting_jobs": posting_jobs,
     }
+
+
+_DASHBOARD_STAT_KEYS = (
+    "prepare.completed_jobs",
+    "prepare.prepared_items",
+    "prepare.tv_items",
+    "prepare.movie_items",
+    "prepare.source_bytes",
+    "prepare.prepared_bytes",
+    "packing.completed_jobs",
+    "packing.output_bytes",
+    "packing.largest_output",
+    "packing.avg_duration",
+    "posting.completed_jobs",
+    "posting.posted_bytes",
+    "posting.largest_job",
+    "posting.avg_duration",
+    "share.all_jobs",
+    "share.successful",
+    "share.failed",
+    "share.destinations_used",
+    "clean.actions",
+    "clean.actual_actions",
+    "clean.successful",
+    "clean.removed_bytes",
+)
+_DASHBOARD_STATS_CACHE_TTL_SECONDS = 10.0
+_DASHBOARD_STATS_CACHE_LOCK = threading.Lock()
+_DASHBOARD_STATS_CACHE = {"expires_at": 0.0, "payload": None}
+
+
+def _dashboard_average_duration(conn, table_name):
+    if table_name not in {"packing_jobs", "posting_jobs"}:
+        raise ValueError("Unsupported dashboard duration source")
+    rows = conn.execute(
+        f"SELECT started_at, finished_at FROM {table_name} WHERE status='done'"
+    ).fetchall()
+    durations = []
+    for row in rows:
+        duration = _valid_job_duration_seconds(row["started_at"], row["finished_at"])
+        if duration is not None:
+            durations.append(duration)
+    return int(sum(durations) / len(durations)) if durations else 0
+
+
+def _dashboard_all_time_stats():
+    """Read every dashboard total from one consistent SQLite snapshot."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        prepare_items = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_prepared_items,
+                COALESCE(SUM(CASE WHEN LOWER(media_type)='tv' THEN 1 ELSE 0 END), 0) AS tv_items,
+                COALESCE(SUM(CASE WHEN LOWER(media_type)='movie' THEN 1 ELSE 0 END), 0) AS movie_items,
+                COALESCE(SUM(source_bytes), 0) AS source_bytes_total,
+                COALESCE(SUM(dest_bytes), 0) AS dest_bytes_total
+            FROM prepared_items
+            """
+        ).fetchone()
+        prepare_jobs = conn.execute(
+            "SELECT COUNT(*) AS total_prepare_jobs FROM prepare_jobs WHERE status='done'"
+        ).fetchone()
+        packing = conn.execute(
+            """
+            WITH completed AS (
+                SELECT
+                    COALESCE(rar_size_bytes, 0) + COALESCE(par2_size_bytes, 0) AS output_bytes
+                FROM packing_jobs
+                WHERE status='done'
+            )
+            SELECT
+                COUNT(*) AS total_jobs,
+                COALESCE(SUM(output_bytes), 0) AS total_bytes,
+                COALESCE(MAX(output_bytes), 0) AS largest_bytes,
+                COALESCE(SUM(CASE WHEN output_bytes <= 0 THEN 1 ELSE 0 END), 0) AS unmeasured_jobs
+            FROM completed
+            """
+        ).fetchone()
+        posting = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_jobs,
+                COALESCE(SUM(size_bytes), 0) AS total_bytes,
+                COALESCE(MAX(size_bytes), 0) AS largest_bytes
+            FROM posting_jobs
+            WHERE status='done'
+            """
+        ).fetchone()
+        share = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_jobs,
+                COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END), 0) AS done_jobs,
+                COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), 0) AS failed_jobs,
+                COALESCE(SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END), 0) AS queued_jobs,
+                COALESCE(SUM(CASE WHEN status IN ('running','uploading') THEN 1 ELSE 0 END), 0) AS running_jobs,
+                COALESCE(SUM(CASE WHEN status='outcome_unknown' THEN 1 ELSE 0 END), 0) AS attention_jobs,
+                COALESCE(SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END), 0) AS cancelled_jobs,
+                COUNT(DISTINCT COALESCE(
+                    NULLIF(TRIM(destination_id), ''),
+                    NULLIF(TRIM(destination_name), '')
+                )) AS destination_count,
+                COALESCE(SUM(CASE WHEN source_type='imported' THEN 1 ELSE 0 END), 0) AS imported_jobs,
+                COALESCE(SUM(CASE WHEN source_type='posting' THEN 1 ELSE 0 END), 0) AS posting_jobs
+            FROM share_jobs
+            """
+        ).fetchone()
+        clean = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_actions,
+                COALESCE(SUM(CASE WHEN LOWER(dry_run)='true' THEN 1 ELSE 0 END), 0) AS dry_runs,
+                COALESCE(SUM(CASE WHEN LOWER(dry_run)!='true' THEN 1 ELSE 0 END), 0) AS real_runs,
+                COALESCE(SUM(CASE
+                    WHEN LOWER(dry_run)!='true' AND LOWER(success)='true' THEN 1 ELSE 0
+                END), 0) AS successes,
+                COALESCE(SUM(CASE
+                    WHEN LOWER(dry_run)!='true' AND LOWER(success)!='true' THEN 1 ELSE 0
+                END), 0) AS failures,
+                COALESCE(SUM(CASE
+                    WHEN LOWER(dry_run)='true' THEN 0
+                    WHEN json_valid(details_json) THEN
+                        CASE
+                            WHEN json_type(details_json, '$.logical_bytes_removed') IN ('integer', 'real')
+                            THEN MAX(0, CAST(json_extract(details_json, '$.logical_bytes_removed') AS INTEGER))
+                            WHEN LOWER(success)='true' THEN COALESCE(size_bytes, 0)
+                            ELSE 0
+                        END
+                    WHEN LOWER(success)='true' THEN COALESCE(size_bytes, 0)
+                    ELSE 0
+                END), 0) AS bytes_total,
+                COALESCE(SUM(CASE
+                    WHEN LOWER(dry_run)='true' THEN size_bytes ELSE 0
+                END), 0) AS bytes_dry_run
+            FROM clean_actions
+            """
+        ).fetchone()
+        return {
+            "prepare": {
+                "total_prepare_jobs": int(prepare_jobs["total_prepare_jobs"] or 0),
+                "total_prepared_items": int(prepare_items["total_prepared_items"] or 0),
+                "tv_items": int(prepare_items["tv_items"] or 0),
+                "movie_items": int(prepare_items["movie_items"] or 0),
+                "source_bytes_total": int(prepare_items["source_bytes_total"] or 0),
+                "dest_bytes_total": int(prepare_items["dest_bytes_total"] or 0),
+            },
+            "packing": {
+                "total_jobs": int(packing["total_jobs"] or 0),
+                "total_bytes": int(packing["total_bytes"] or 0),
+                "largest_bytes": int(packing["largest_bytes"] or 0),
+                "unmeasured_jobs": int(packing["unmeasured_jobs"] or 0),
+                "avg_seconds": _dashboard_average_duration(conn, "packing_jobs"),
+            },
+            "posting": {
+                "total_jobs": int(posting["total_jobs"] or 0),
+                "total_bytes": int(posting["total_bytes"] or 0),
+                "largest_bytes": int(posting["largest_bytes"] or 0),
+                "avg_seconds": _dashboard_average_duration(conn, "posting_jobs"),
+            },
+            "share": {key: int(share[key] or 0) for key in (
+                "total_jobs", "done_jobs", "failed_jobs", "queued_jobs",
+                "running_jobs", "attention_jobs", "cancelled_jobs",
+                "destination_count", "imported_jobs", "posting_jobs",
+            )},
+            "clean": {
+                "total_actions": int(clean["total_actions"] or 0),
+                "dry_runs": int(clean["dry_runs"] or 0),
+                "real_runs": int(clean["real_runs"] or 0),
+                "successes": int(clean["successes"] or 0),
+                "failures": int(clean["failures"] or 0),
+                "bytes_total": int(clean["bytes_total"] or 0),
+                "bytes_dry_run": int(clean["bytes_dry_run"] or 0),
+                "bytes_real": int(clean["bytes_total"] or 0),
+            },
+        }
+    finally:
+        conn.close()
+
+
+def _dashboard_stats_display(stats):
+    def number(value):
+        return f"{int(value or 0):,}"
+
+    return {
+        "prepare.completed_jobs": number(stats["prepare"]["total_prepare_jobs"]),
+        "prepare.prepared_items": number(stats["prepare"]["total_prepared_items"]),
+        "prepare.tv_items": number(stats["prepare"]["tv_items"]),
+        "prepare.movie_items": number(stats["prepare"]["movie_items"]),
+        "prepare.source_bytes": humansize_filter(stats["prepare"]["source_bytes_total"]),
+        "prepare.prepared_bytes": humansize_filter(stats["prepare"]["dest_bytes_total"]),
+        "packing.completed_jobs": number(stats["packing"]["total_jobs"]),
+        "packing.output_bytes": humansize_filter(stats["packing"]["total_bytes"]),
+        "packing.largest_output": humansize_filter(stats["packing"]["largest_bytes"]),
+        "packing.avg_duration": humanduration_filter(stats["packing"]["avg_seconds"]),
+        "posting.completed_jobs": number(stats["posting"]["total_jobs"]),
+        "posting.posted_bytes": humansize_filter(stats["posting"]["total_bytes"]),
+        "posting.largest_job": humansize_filter(stats["posting"]["largest_bytes"]),
+        "posting.avg_duration": humanduration_filter(stats["posting"]["avg_seconds"]),
+        "share.all_jobs": number(stats["share"]["total_jobs"]),
+        "share.successful": number(stats["share"]["done_jobs"]),
+        "share.failed": number(stats["share"]["failed_jobs"]),
+        "share.destinations_used": number(stats["share"]["destination_count"]),
+        "clean.actions": number(stats["clean"]["total_actions"]),
+        "clean.actual_actions": number(stats["clean"]["real_runs"]),
+        "clean.successful": number(stats["clean"]["successes"]),
+        "clean.removed_bytes": humansize_filter(stats["clean"]["bytes_total"]),
+    }
+
+
+def _dashboard_stats_payload():
+    now = time.monotonic()
+    with _DASHBOARD_STATS_CACHE_LOCK:
+        cached = _DASHBOARD_STATS_CACHE["payload"]
+        if cached is not None and now < _DASHBOARD_STATS_CACHE["expires_at"]:
+            return cached
+        stats = _dashboard_all_time_stats()
+        payload = {
+            "ok": True,
+            "stats": stats,
+            "display": _dashboard_stats_display(stats),
+        }
+        _DASHBOARD_STATS_CACHE["payload"] = payload
+        _DASHBOARD_STATS_CACHE["expires_at"] = time.monotonic() + _DASHBOARD_STATS_CACHE_TTL_SECONDS
+        return payload
+
+
+def _dashboard_unavailable_display():
+    return {key: "Unavailable" for key in _DASHBOARD_STAT_KEYS}
 
 
 def summarize_running_jobs(prepare_jobs, packing_jobs, posting_jobs):
@@ -1531,34 +1922,13 @@ def _dashboard_running_payload():
 def _prepare_active_jobs_payload():
     try:
         active_jobs = list_jobs_by_status(["queued", "running", "finalizing", "outcome_unknown"], 500)
-        try:
-            recent_window_seconds = max(10, int(str(os.environ.get("PREPAC_PREPARE_RECENT_TERMINAL_SECONDS", "120") or "120")))
-        except Exception:
-            recent_window_seconds = 120
-        terminal_jobs = list_jobs_by_status(["done", "failed", "cancelled"], 200)
-        now_dt = local_now()
-        recent_terminal_jobs = []
-        for job in terminal_jobs:
-            last_activity = _latest_job_activity(job)
-            if not last_activity:
-                continue
-            age_seconds = int((now_dt - last_activity).total_seconds())
-            if age_seconds < 0 or age_seconds > recent_window_seconds:
-                continue
-            item = dict(job)
-            item["recent_terminal"] = True
-            item["seconds_since_terminal"] = age_seconds
-            recent_terminal_jobs.append(item)
         active_jobs.sort(key=lambda j: int(j.get("id") or 0))
-        recent_terminal_jobs.sort(key=lambda j: int(j.get("id") or 0), reverse=True)
-        jobs = active_jobs + recent_terminal_jobs
     except Exception as exc:
         LOG.warning("Prepare job listing failed: %s", redact_sensitive_data(str(exc)))
         return {"jobs": [], "ok": False, "error": "Prepare jobs could not be listed"}
     return {
-        "jobs": jobs,
+        "jobs": active_jobs,
         "ok": True,
-        "recent_terminal_window_seconds": recent_window_seconds,
     }
 
 def _prepare_history_jobs(limit=500):
@@ -2276,53 +2646,62 @@ def change_recovery_secret_page():
 def dashboard():
     settings = load_settings()
     try:
-        all_jobs = list_jobs(500)
+        dashboard_stats = _dashboard_stats_payload()
     except Exception as exc:
-        LOG.error("Dashboard prepare jobs read failed: %s", exc)
-        all_jobs = []
+        LOG.error(
+            "Dashboard statistics read failed (%s): %s",
+            type(exc).__name__,
+            redact_sensitive_data(str(exc))[:300],
+            exc_info=True,
+        )
+        dashboard_stats = {
+            "ok": False,
+            "stats": {
+                "prepare": {},
+                "packing": {},
+                "posting": {},
+                "share": {},
+                "clean": {},
+            },
+            "display": _dashboard_unavailable_display(),
+        }
     try:
-        all_history = list_history(500)
+        all_history = list_history(10)
     except Exception as exc:
         LOG.error("Dashboard prepare history read failed: %s", exc)
         all_history = []
     try:
-        all_clean_logs = list_clean_actions(500)
+        all_clean_logs = list_clean_actions(10)
     except Exception as exc:
         LOG.error("Dashboard clean log read failed: %s", exc)
         all_clean_logs = []
     try:
-        all_packing_jobs = list_packing_jobs(500)
+        all_packing_jobs = list_packing_jobs(10)
     except Exception as exc:
         LOG.error("Dashboard packing jobs read failed: %s", exc)
         all_packing_jobs = []
     try:
-        all_posting_jobs = list_posting_jobs(500)
+        all_posting_jobs = list_posting_jobs(10)
     except Exception as exc:
         LOG.error("Dashboard posting jobs read failed: %s", exc)
         all_posting_jobs = []
     try:
-        all_share_jobs = list_share_history(500)
+        current_running = _dashboard_running_payload()["running"]
     except Exception as exc:
-        LOG.error("Dashboard share history read failed: %s", exc)
-        all_share_jobs = []
-    clean_summary = summarize_clean_logs(all_clean_logs)
-    prepare_summary = summarize_prepare_stats(all_history, all_jobs)
-    packing_summary = summarize_packing_stats(all_packing_jobs)
-    posting_summary = summarize_posting_stats(all_posting_jobs)
-    share_summary = summarize_share_stats(all_share_jobs)
-    current_running = summarize_running_jobs(all_jobs, all_packing_jobs, all_posting_jobs)
+        LOG.error("Dashboard active jobs read failed: %s", exc)
+        current_running = []
     recent_actions = build_recent_actions(all_history, all_clean_logs, all_packing_jobs, all_posting_jobs, 10)
+    summaries = dashboard_stats["stats"]
     return render_template(
         "dashboard.html",
         settings=_template_safe_settings(settings),
-        jobs=all_jobs[:10],
-        history=all_history[:10],
-        clean_logs=all_clean_logs[:10],
-        clean_summary=clean_summary,
-        prepare_summary=prepare_summary,
-        packing_summary=packing_summary,
-        posting_summary=posting_summary,
-        share_summary=share_summary,
+        clean_summary=summaries["clean"],
+        prepare_summary=summaries["prepare"],
+        packing_summary=summaries["packing"],
+        posting_summary=summaries["posting"],
+        share_summary=summaries["share"],
+        dashboard_display=dashboard_stats["display"],
+        dashboard_stats_ok=dashboard_stats.get("ok") is True,
         current_running=current_running,
         recent_actions=recent_actions,
     )
@@ -2335,6 +2714,22 @@ def api_dashboard_running():
 @app.route("/api/dashboard/running/stream")
 def api_dashboard_running_stream():
     return _event_stream(_dashboard_running_payload)
+
+
+@app.route("/api/dashboard/stats")
+def api_dashboard_stats():
+    try:
+        return jsonify(_dashboard_stats_payload())
+    except Exception as exc:
+        LOG.warning(
+            "Dashboard statistics refresh failed (%s): %s",
+            type(exc).__name__,
+            redact_sensitive_data(str(exc))[:300],
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Dashboard statistics are temporarily unavailable.",
+        }), 503
 
 
 HELP_TOPICS = [
@@ -3262,10 +3657,85 @@ def api_prepare_tv_preview():
         return jsonify({"ok": False, "error": "show_name and season_name are required"}), 400
     try:
         payload = preview_tv(load_settings(), show_name, season_name, bracket_override)
+        payload["preview_token"] = _prepare_preview_token(payload)
         payload["ok"] = True
         return jsonify(payload)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/prepare/start", methods=["POST"])
+def api_prepare_start():
+    blocked = reject_if_draining()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "A JSON object is required."}), 400
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "error": "At least one Prepare item is required."}), 400
+    if len(items) > _PREPARE_BATCH_LIMIT:
+        return jsonify({
+            "ok": False,
+            "error": f"A maximum of {_PREPARE_BATCH_LIMIT} Prepare items can be queued at once.",
+        }), 400
+
+    try:
+        settings = load_settings()
+    except Exception as exc:
+        return _prepare_queue_unavailable(exc, "batch")
+    results = []
+    launches = []
+    for index, item in enumerate(items):
+        media_type = str(item.get("kind") or "").strip().lower() if isinstance(item, dict) else ""
+        try:
+            result, launch = _create_prepare_queue_entry(settings, media_type, item)
+            result["index"] = index
+            results.append(result)
+            if launch:
+                launches.append((result, launch))
+        except ValueError as exc:
+            results.append({
+                "index": index,
+                "ok": False,
+                "error": redact_sensitive_data(str(exc))[:300],
+            })
+        except Exception as exc:
+            LOG.error(
+                "Unable to persist Prepare batch item %s (%s): %s",
+                index,
+                type(exc).__name__,
+                redact_sensitive_data(str(exc))[:300],
+                exc_info=True,
+            )
+            results.append({
+                "index": index,
+                "ok": False,
+                "error": "Prepare queue is temporarily unavailable. Try again in a few seconds.",
+            })
+
+    for result, launch in launches:
+        if not _launch_prepare_worker(*launch):
+            result.update({
+                "ok": False,
+                "duplicate": False,
+                "error": "Prepare worker could not be started. Submit this item again.",
+            })
+
+    queued = sum(1 for item in results if item.get("ok") and not item.get("duplicate"))
+    duplicates = sum(1 for item in results if item.get("ok") and item.get("duplicate"))
+    failed = sum(1 for item in results if not item.get("ok"))
+    response = {
+        "ok": True,
+        "requested": len(items),
+        "queued": queued,
+        "duplicates": duplicates,
+        "failed": failed,
+        "results": results,
+    }
+    return jsonify(response), 202 if queued else 200
+
 
 @app.route("/api/prepare/tv/start", methods=["POST"])
 def api_prepare_tv_start():
@@ -3333,6 +3803,7 @@ def api_prepare_movie_preview():
         return jsonify({"ok": False, "error": "movie_name is required"}), 400
     try:
         payload = preview_movie(load_settings(), movie_name, bracket_override)
+        payload["preview_token"] = _prepare_preview_token(payload)
         payload["ok"] = True
         return jsonify(payload)
     except Exception as e:

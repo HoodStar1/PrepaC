@@ -43,6 +43,6 @@
   <div class="action-toolbar action-toolbar-bottom"><button type="button" id="previewBtn" disabled>Build queue preview</button><button type="button" id="clearQueueBtn" class="secondary" disabled>Clear queue</button><button type="button" id="startBtn" disabled>Start queue jobs</button></div>
 </section>
 
-<section class="card" aria-labelledby="prepare-active-title"><div class="section-heading"><div><h2 id="prepare-active-title">Active prepare jobs</h2><p>Queued, running, finalizing, recovery-attention, and recently finished work.</p></div><span class="status-chip success">Live</span></div><div id="prepareJobs" aria-live="polite"><div class="loading-state"><strong>Loading jobs</strong></div></div></section>
+<section class="card" aria-labelledby="prepare-active-title"><div class="section-heading"><div><h2 id="prepare-active-title">Active prepare jobs</h2><p>Queued, running, finalizing, and recovery-attention work.</p></div><span class="status-chip success">Live</span></div><div id="prepareJobs" aria-live="polite"><div class="loading-state"><strong>Loading jobs</strong></div></div></section>
 {% endblock %}
 {% block scripts %}<script src="{{ url_for('static', filename='js/prepare.js') }}?v={{ build_number }}" defer></script>{% endblock %}

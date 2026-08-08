@@ -254,25 +254,46 @@ def _copy_files_with_python(job_id, source_root: Path, dest_root: Path, files):
     return True
 
 
+def _assert_preview_identity(validated, payload):
+    """Fail closed if the reviewed paths changed before the worker claimed them."""
+    expected_source = payload.get("expected_source_path") or payload.get("source_path")
+    expected_destination = payload.get("expected_dest_path") or payload.get("dest_path")
+
+    def normalized(value):
+        return os.path.normcase(os.path.abspath(str(value)))
+
+    if expected_source and normalized(validated.get("source_path", "")) != normalized(expected_source):
+        raise RuntimeError("Prepare source changed after preview; build a new preview.")
+    if expected_destination and normalized(validated.get("dest_path", "")) != normalized(expected_destination):
+        raise RuntimeError("Prepare destination changed after preview; build a new preview.")
+    return validated
+
+
 def _validated_tv_payload(settings, payload):
     from app.prepare_tv import preview_tv
 
-    return preview_tv(
+    queue_bracket = payload.get("queue_bracket") if "queue_bracket" in payload else payload.get("chosen_bracket", "")
+    validated = preview_tv(
         settings,
         payload.get("show_name", ""),
         payload.get("season_name", ""),
-        payload.get("chosen_bracket", ""),
+        queue_bracket,
+        bracket_is_resolved=payload.get("bracket_is_resolved") is True,
     )
+    return _assert_preview_identity(validated, payload)
 
 
 def _validated_movie_payload(settings, payload):
     from app.prepare_movie import preview_movie
 
-    return preview_movie(
+    queue_bracket = payload.get("queue_bracket") if "queue_bracket" in payload else payload.get("chosen_bracket", "")
+    validated = preview_movie(
         settings,
         payload.get("movie_name", ""),
-        payload.get("chosen_bracket", ""),
+        queue_bracket,
+        bracket_is_resolved=payload.get("bracket_is_resolved") is True,
     )
+    return _assert_preview_identity(validated, payload)
 
 def _chmod_chown(dest_path, settings):
     perm = _permission_pair(settings)

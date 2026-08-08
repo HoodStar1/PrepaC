@@ -1,10 +1,16 @@
 {% extends "base.html" %}
+{% macro dashboard_stat(label, key) -%}
+<div class="stat"><span class="stat-label">{{ label }}</span><div class="stat-value" data-dashboard-stat="{{ key }}">{{ dashboard_display[key] }}</div></div>
+{%- endmacro %}
 {% block title %}Dashboard · PrepaC{% endblock %}
 {% block page_label %}Operational overview{% endblock %}
 {% block content %}
 <section class="page-header">
   <div><span class="eyebrow">Command center</span><h1>Dashboard</h1><p>Current workflow activity, totals, and recent actions in one view.</p></div>
-  <div class="actions"><a class="button secondary" href="{{ url_for('history_page') }}">View history</a><a class="button" href="{{ url_for('prepare_page') }}">Prepare media</a></div>
+  <div class="actions">
+    <span id="dashboardStatsStatus" class="status-chip {{ 'success' if dashboard_stats_ok else 'warning' }}" role="status" aria-live="polite">{{ 'Totals current' if dashboard_stats_ok else 'Totals unavailable' }}</span>
+    <a class="button secondary" href="{{ url_for('history_page') }}">View history</a><a class="button" href="{{ url_for('prepare_page') }}">Prepare media</a>
+  </div>
 </section>
 
 <section class="card" aria-labelledby="running-title">
@@ -28,50 +34,50 @@
 
 <div class="grid two">
   <section class="card">
-    <div class="section-heading"><div><span class="eyebrow">Stage 01</span><h2>Prepare</h2></div><a href="{{ url_for('history_prepare_page') }}">History</a></div>
+    <div class="section-heading"><div><span class="eyebrow">Stage 01</span><h2>Prepare</h2><p>Completed work and current prepared records.</p></div><a href="{{ url_for('history_prepare_page') }}">History</a></div>
     <div class="stat-grid">
-      <div class="stat"><span class="stat-label">Jobs</span><div class="stat-value">{{ prepare_summary.total_prepare_jobs }}</div></div>
-      <div class="stat"><span class="stat-label">Items</span><div class="stat-value">{{ prepare_summary.total_prepared_items }}</div></div>
-      <div class="stat"><span class="stat-label">TV</span><div class="stat-value">{{ prepare_summary.tv_items }}</div></div>
-      <div class="stat"><span class="stat-label">Movies</span><div class="stat-value">{{ prepare_summary.movie_items }}</div></div>
-      <div class="stat"><span class="stat-label">Source data</span><div class="stat-value">{{ prepare_summary.source_bytes_total|humansize }}</div></div>
-      <div class="stat"><span class="stat-label">Prepared data</span><div class="stat-value">{{ prepare_summary.dest_bytes_total|humansize }}</div></div>
+      {{ dashboard_stat('Completed jobs', 'prepare.completed_jobs') }}
+      {{ dashboard_stat('Prepared records', 'prepare.prepared_items') }}
+      {{ dashboard_stat('TV records', 'prepare.tv_items') }}
+      {{ dashboard_stat('Movie records', 'prepare.movie_items') }}
+      {{ dashboard_stat('Source data', 'prepare.source_bytes') }}
+      {{ dashboard_stat('Prepared data', 'prepare.prepared_bytes') }}
     </div>
   </section>
   <section class="card">
-    <div class="section-heading"><div><span class="eyebrow">Stage 02</span><h2>Packing</h2></div><a href="{{ url_for('history_packing_page') }}">History</a></div>
+    <div class="section-heading"><div><span class="eyebrow">Stage 02</span><h2>Packing</h2><p>Measured RAR and PAR2 output from completed jobs. Jobs without recorded output sizes are excluded.</p></div><a href="{{ url_for('history_packing_page') }}">History</a></div>
     <div class="stat-grid">
-      <div class="stat"><span class="stat-label">Packed jobs</span><div class="stat-value">{{ packing_summary.total_jobs }}</div></div>
-      <div class="stat"><span class="stat-label">Packed data</span><div class="stat-value">{{ packing_summary.total_bytes|humansize }}</div></div>
-      <div class="stat"><span class="stat-label">Largest job</span><div class="stat-value">{{ packing_summary.largest_bytes|humansize }}</div></div>
-      <div class="stat"><span class="stat-label">Average time</span><div class="stat-value">{{ packing_summary.avg_seconds|humanduration }}</div></div>
+      {{ dashboard_stat('Completed jobs', 'packing.completed_jobs') }}
+      {{ dashboard_stat('Measured output', 'packing.output_bytes') }}
+      {{ dashboard_stat('Largest output', 'packing.largest_output') }}
+      {{ dashboard_stat('Average time', 'packing.avg_duration') }}
     </div>
   </section>
   <section class="card">
-    <div class="section-heading"><div><span class="eyebrow">Stage 03</span><h2>Posting</h2></div><a href="{{ url_for('history_posting_page') }}">History</a></div>
+    <div class="section-heading"><div><span class="eyebrow">Stage 03</span><h2>Posting</h2><p>Completed uploads.</p></div><a href="{{ url_for('history_posting_page') }}">History</a></div>
     <div class="stat-grid">
-      <div class="stat"><span class="stat-label">Posted jobs</span><div class="stat-value">{{ posting_summary.total_jobs }}</div></div>
-      <div class="stat"><span class="stat-label">Posted data</span><div class="stat-value">{{ posting_summary.total_bytes|humansize }}</div></div>
-      <div class="stat"><span class="stat-label">Largest job</span><div class="stat-value">{{ posting_summary.largest_bytes|humansize }}</div></div>
-      <div class="stat"><span class="stat-label">Average time</span><div class="stat-value">{{ posting_summary.avg_seconds|humanduration }}</div></div>
+      {{ dashboard_stat('Completed jobs', 'posting.completed_jobs') }}
+      {{ dashboard_stat('Posted data', 'posting.posted_bytes') }}
+      {{ dashboard_stat('Largest job', 'posting.largest_job') }}
+      {{ dashboard_stat('Average time', 'posting.avg_duration') }}
     </div>
   </section>
   <section class="card">
-    <div class="section-heading"><div><span class="eyebrow">Stage 04</span><h2>Share</h2></div><a href="{{ url_for('history_share_page') }}">History</a></div>
+    <div class="section-heading"><div><span class="eyebrow">Stage 04</span><h2>Share</h2><p>The job total also includes active, cancelled, and recovery-attention work.</p></div><a href="{{ url_for('history_share_page') }}">History</a></div>
     <div class="stat-grid">
-      <div class="stat"><span class="stat-label">Share jobs</span><div class="stat-value">{{ share_summary.total_jobs }}</div></div>
-      <div class="stat"><span class="stat-label">Successful</span><div class="stat-value">{{ share_summary.done_jobs }}</div></div>
-      <div class="stat"><span class="stat-label">Failed</span><div class="stat-value">{{ share_summary.failed_jobs }}</div></div>
-      <div class="stat"><span class="stat-label">Destinations</span><div class="stat-value">{{ share_summary.destination_count }}</div></div>
+      {{ dashboard_stat('All jobs', 'share.all_jobs') }}
+      {{ dashboard_stat('Successful', 'share.successful') }}
+      {{ dashboard_stat('Failed', 'share.failed') }}
+      {{ dashboard_stat('Destinations used', 'share.destinations_used') }}
     </div>
   </section>
   <section class="card">
-    <div class="section-heading"><div><span class="eyebrow">Maintenance</span><h2>Clean</h2></div><a href="{{ url_for('history_clean_page') }}">History</a></div>
+    <div class="section-heading"><div><span class="eyebrow">Maintenance</span><h2>Clean</h2><p>The action total includes dry runs. Data removed uses the recorded amount from actual actions.</p></div><a href="{{ url_for('history_clean_page') }}">History</a></div>
     <div class="stat-grid">
-      <div class="stat"><span class="stat-label">Actions</span><div class="stat-value">{{ clean_summary.total_actions }}</div></div>
-      <div class="stat"><span class="stat-label">Real runs</span><div class="stat-value">{{ clean_summary.real_runs }}</div></div>
-      <div class="stat"><span class="stat-label">Successes</span><div class="stat-value">{{ clean_summary.successes }}</div></div>
-      <div class="stat"><span class="stat-label">Processed</span><div class="stat-value">{{ clean_summary.bytes_total|humansize }}</div></div>
+      {{ dashboard_stat('All actions', 'clean.actions') }}
+      {{ dashboard_stat('Actual actions', 'clean.actual_actions') }}
+      {{ dashboard_stat('Successful actions', 'clean.successful') }}
+      {{ dashboard_stat('Data removed', 'clean.removed_bytes') }}
     </div>
   </section>
   <section class="card">

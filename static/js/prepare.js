@@ -7,6 +7,8 @@
   let activeShow = null;
   let queueItems = [];
   let previewData = [];
+  let queueBusy = false;
+  const queueSubmissionErrors = new Map();
 
   const queueBox = document.getElementById('queueBox');
   const jobsBox = document.getElementById('prepareJobs');
@@ -38,9 +40,19 @@
   };
 
   const syncQueueButtons = () => {
-    previewButton.disabled = queueItems.length === 0;
-    clearButton.disabled = queueItems.length === 0;
-    startButton.disabled = previewData.length === 0 || previewData.some((item) => !item || item.ok === false);
+    const previewReady = queueItems.length > 0
+      && previewData.length === queueItems.length
+      && previewData.every((item, index) => (
+        queueItems[index]
+        && item
+        && item.ok !== false
+        && typeof item.preview_token === 'string'
+        && item.preview_token.length > 0
+      ));
+    previewButton.disabled = queueBusy || queueItems.length === 0;
+    clearButton.disabled = queueBusy || queueItems.length === 0;
+    startButton.disabled = queueBusy || !previewReady;
+    document.getElementById('bracketOverride').disabled = queueBusy;
     document.getElementById('queueCount').textContent = `${queueItems.length} item${queueItems.length === 1 ? '' : 's'}`;
   };
 
@@ -49,15 +61,19 @@
     const card = P.el('article', { className: 'job queue-job' });
     card.append(P.el('div', { className: 'queue-media' }, P.safeImage(item.poster_url, item.label || '', 'queue-poster small')));
     const content = P.el('div', { className: 'queue-content' });
-    const remove = P.button('Remove', { className: 'mini-remove' });
+    const remove = P.button('Remove', { className: 'mini-remove', disabled: queueBusy });
     remove.addEventListener('click', () => removeQueueItem(index));
     content.append(P.el('div', { className: 'queue-header-row' }, [P.el('strong', { text: item.label || 'Queue item' }), remove]));
+    const queueError = queueSubmissionErrors.get(item);
+    if (queueError) content.append(P.el('div', { className: 'flash error', text: queueError }));
     if (!preview) content.append(P.el('p', { className: 'muted', text: 'Preview not built yet.' }));
     else if (preview.ok === false) content.append(P.el('div', { className: 'flash error', text: preview.error || 'Preview failed.' }));
     else {
       const important = P.el('div', { className: 'queue-important' });
       [['Chosen bracket', preview.chosen_bracket || ''], ['Destination folder', preview.dest_folder || ''], ['Destination path', preview.dest_path || ''], ['Detected tags', JSON.stringify(preview.detected_tags?.detected_tags || [])]].forEach(([label, value]) => important.append(P.el('div', {}, [P.el('strong', { text: label }), P.el('code', { text: value })])));
-      content.append(important, P.jsonDetails('Full preview', preview));
+      const visiblePreview = { ...preview };
+      delete visiblePreview.preview_token;
+      content.append(important, P.jsonDetails('Full preview', visiblePreview));
     }
     card.append(content);
     return card;
@@ -74,7 +90,9 @@
   };
 
   function removeQueueItem(index) {
+    if (queueBusy) return;
     const removed = queueItems[index];
+    queueSubmissionErrors.delete(removed);
     queueItems.splice(index, 1);
     previewData = [];
     if (removed?.kind === 'tv') {
@@ -89,8 +107,10 @@
   }
 
   const clearQueue = () => {
+    if (queueBusy) return;
     queueItems = [];
     previewData = [];
+    queueSubmissionErrors.clear();
     selectedShows.forEach((data) => data.seasons.clear());
     selectedMovies.clear();
     renderSeasons(activeShow);
@@ -124,6 +144,7 @@
       const button = P.button(season, { className: `linkbtn ${data.seasons.has(season) ? 'selected-item' : ''}` });
       button.setAttribute('aria-pressed', String(data.seasons.has(season)));
       button.addEventListener('click', () => {
+        if (queueBusy) return;
         const selected = data.seasons.has(season);
         if (selected) {
           data.seasons.delete(season);
@@ -202,6 +223,7 @@
         choose.dataset.movieName = item.name || '';
         choose.setAttribute('aria-pressed', String(selectedMovies.has(item.name)));
         choose.addEventListener('click', () => {
+          if (queueBusy) return;
           if (selectedMovies.has(item.name)) {
             selectedMovies.delete(item.name);
             queueItems = queueItems.filter((entry) => !(entry.kind === 'movie' && entry.movie_name === item.name));
@@ -226,67 +248,117 @@
   };
 
   const buildPreview = async () => {
-    if (!queueItems.length) return;
+    if (queueBusy || !queueItems.length) return;
+    const submittedItems = queueItems.slice();
+    queueBusy = true;
+    queueSubmissionErrors.clear();
     P.setBusy(previewButton, true, 'Building…');
     previewData = [];
     renderQueue();
     const bracket = document.getElementById('bracketOverride').value;
-    for (const [index, item] of queueItems.entries()) {
-      previewStatus.textContent = `Building preview ${index + 1} of ${queueItems.length}…`;
-      const movie = item.kind === 'movie';
-      try {
-        const payload = movie ? { movie_name: item.movie_name, bracket_override: bracket } : { show_name: item.show_name, season_name: item.season_name, bracket_override: bracket };
-        previewData.push(await P.requestJSON(`/api/prepare/${movie ? 'movie' : 'tv'}/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }));
-      } catch (error) { previewData.push({ ok: false, error: error.message }); }
+    try {
+      for (const [index, item] of submittedItems.entries()) {
+        previewStatus.textContent = `Building preview ${index + 1} of ${submittedItems.length}…`;
+        const movie = item.kind === 'movie';
+        try {
+          const payload = movie ? { movie_name: item.movie_name, bracket_override: bracket } : { show_name: item.show_name, season_name: item.season_name, bracket_override: bracket };
+          const preview = await P.requestJSON(`/api/prepare/${movie ? 'movie' : 'tv'}/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          if (!preview?.preview_token) throw new Error('The server did not return a start token. Rebuild after updating PrepaC.');
+          previewData.push(preview);
+        } catch (error) { previewData.push({ ok: false, error: error.message }); }
+        renderQueue();
+      }
+      const failures = previewData.filter((item) => item?.ok === false).length;
+      previewStatus.textContent = failures ? `${previewData.length - failures} previews ready; ${failures} failed.` : `${previewData.length} previews ready to start.`;
+    } finally {
+      queueBusy = false;
+      P.setBusy(previewButton, false);
       renderQueue();
     }
-    const failures = previewData.filter((item) => item?.ok === false).length;
-    previewStatus.textContent = failures ? `${previewData.length - failures} previews ready; ${failures} failed.` : `${previewData.length} previews ready to start.`;
-    P.setBusy(previewButton, false);
-    syncQueueButtons();
   };
 
   const startJobs = async () => {
-    if (!previewData.length) return;
-    P.setBusy(startButton, true, 'Starting…');
+    if (
+      queueBusy
+      || !queueItems.length
+      || previewData.length !== queueItems.length
+      || previewData.some((item) => !item?.preview_token || item.ok === false)
+    ) {
+      previewStatus.textContent = 'The queue changed or its preview is incomplete. Build a new preview before starting.';
+      syncQueueButtons();
+      return;
+    }
+    const submittedItems = queueItems.slice();
+    const submittedPreviews = previewData.slice();
+    queueBusy = true;
+    queueSubmissionErrors.clear();
+    P.setBusy(startButton, true, 'Queueing…');
+    renderQueue();
     let started = 0, skipped = 0;
     const errors = [];
-    const completedIndexes = new Set();
-    const bracketOverride = document.getElementById('bracketOverride').value;
-    for (const [index, preview] of previewData.entries()) {
-      const item = queueItems[index];
-      if (!item || !preview || preview.ok === false) { errors.push(`${item?.label || 'Item'}: ${preview?.error || 'Preview failed'}`); continue; }
-      try {
-        const payload = item.kind === 'tv'
-          ? { show_name: item.show_name, season_name: item.season_name, bracket_override: bracketOverride }
-          : { movie_name: item.movie_name, bracket_override: bracketOverride };
-        const data = await P.requestJSON(`/api/prepare/${item.kind}/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        if (data.duplicate) skipped += 1; else started += 1;
-        completedIndexes.add(index);
-      } catch (error) { errors.push(`${item.label}: ${error.message}`); }
+    const completedItems = new Set();
+    const submissions = submittedPreviews.map((preview, index) => ({
+      kind: submittedItems[index].kind,
+      preview_token: preview.preview_token
+    }));
+    previewStatus.textContent = `Queueing ${submissions.length} item${submissions.length === 1 ? '' : 's'}…`;
+    try {
+      const data = await P.requestJSON('/api/prepare/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: submissions })
+      });
+      const handledIndexes = new Set();
+      (Array.isArray(data.results) ? data.results : []).forEach((result) => {
+        const index = Number(result?.index);
+        if (!Number.isInteger(index) || index < 0 || index >= submittedItems.length || handledIndexes.has(index)) return;
+        handledIndexes.add(index);
+        const item = submittedItems[index];
+        if (result.ok) {
+          if (result.duplicate) skipped += 1; else started += 1;
+          completedItems.add(item);
+        } else {
+          const message = result.error || 'Could not queue item';
+          queueSubmissionErrors.set(item, message);
+          errors.push(`${item.label || 'Item'}: ${message}`);
+        }
+      });
+      submissions.forEach((_item, index) => {
+        if (handledIndexes.has(index)) return;
+        const item = submittedItems[index];
+        const message = 'No queue result was returned. Retry after checking Active prepare jobs.';
+        queueSubmissionErrors.set(item, message);
+        errors.push(`${item.label || 'Item'}: ${message}`);
+      });
+    } catch (error) {
+      const message = `Queue request failed: ${error.message}`;
+      submittedItems.forEach((item) => {
+        if (!completedItems.has(item)) queueSubmissionErrors.set(item, message);
+      });
+      errors.push(message);
     }
-    completedIndexes.forEach((index) => {
-      const item = queueItems[index];
+    completedItems.forEach((item) => {
+      queueSubmissionErrors.delete(item);
       if (item?.kind === 'tv') selectedShows.get(item.show_name)?.seasons.delete(item.season_name);
       else if (item?.kind === 'movie') selectedMovies.delete(item.movie_name);
     });
-    queueItems = queueItems.filter((_, index) => !completedIndexes.has(index));
-    previewData = previewData.filter((_, index) => !completedIndexes.has(index));
+    const previewByItem = new Map(submittedItems.map((item, index) => [item, submittedPreviews[index]]));
+    queueItems = queueItems.filter((item) => !completedItems.has(item));
+    previewData = queueItems.map((item) => previewByItem.get(item));
+    queueBusy = false;
+    P.setBusy(startButton, false);
     renderSeasons(activeShow);
     renderMovieSelectionStates();
     renderShowSelectionStates();
     updateSummaries();
     renderQueue();
-    previewStatus.textContent = `${started} queued${skipped ? `, ${skipped} already active` : ''}${errors.length ? `, ${errors.length} failed: ${errors.at(-1)}` : ''}.`;
-    P.setBusy(startButton, false);
-    syncQueueButtons();
+    previewStatus.textContent = `${started} queued${skipped ? `, ${skipped} already active` : ''}${errors.length ? `, ${errors.length} failed. Review the highlighted items` : ''}.`;
     await refreshJobs();
   };
 
   const renderJobs = (data) => {
     const jobs = data.jobs || [];
-    if (!jobs.length) { P.state(jobsBox, 'empty', 'No active or recent jobs', 'New Prepare work will appear here.'); return; }
-    const windowSeconds = Number(data.recent_terminal_window_seconds || 120);
+    if (!jobs.length) { P.state(jobsBox, 'empty', 'No active jobs', 'New Prepare work will appear here.'); return; }
     const fragment = document.createDocumentFragment();
     jobs.forEach((job) => {
       const status = String(job.status || '').toLowerCase();
@@ -296,7 +368,6 @@
       const meta = P.el('div', { className: 'job-meta' });
       [['Source', job.source_path || '', true], ['Destination', job.dest_path || '', true], ['Phase', job.phase || ''], ['Progress', job.percent == null ? '—' : `${job.percent}%`]].forEach(([label, value, code]) => meta.append(P.el('div', {}, [P.el('strong', { text: label }), code ? P.el('code', { text: value }) : value])));
       card.append(meta, P.paragraph('Message', job.message || ''));
-      if (job.recent_terminal) card.append(P.el('p', { className: 'muted', text: `Finished ${job.seconds_since_terminal ?? '?'} seconds ago; recent window ${windowSeconds} seconds.` }));
       if (['queued', 'running'].includes(status)) {
         const stop = P.button('Stop job', { className: 'danger small' });
         stop.addEventListener('click', async () => {

@@ -1,4 +1,4 @@
-# PrepaC 1.5.0
+# PrepaC 1.5.1
 
 PrepaC is a self-hosted web app for preparing, packing, posting, sharing, and
 cleaning media release jobs from one place.
